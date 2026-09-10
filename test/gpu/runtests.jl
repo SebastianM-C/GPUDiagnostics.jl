@@ -1,9 +1,11 @@
 # Real-hardware tests: the conformance suite plus the vendor paths the CPU tests cannot reach.
 # Not part of `Pkg.test` (no GPU in CI); run by hand on a box with a GPU:
 #
-#     GPUDIAGNOSTICS_GPU=cuda julia --project=test/gpu -e 'using Pkg; Pkg.instantiate(); include("test/gpu/runtests.jl")'
+#     GPUDIAGNOSTICS_GPU=cuda julia --project=test/gpu -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); include("test/gpu/runtests.jl")'
 #     GPUDIAGNOSTICS_GPU=rocm …
 #
+# `Pkg.resolve()` first: the env dev-tracks the package, and a manifest resolved before a dependency
+# was added to Project.toml is not refreshed by `instantiate` alone.
 # One vendor per process (loading both vendor packages is not the point). The kernel under
 # test is a small KA kernel with a hot loop, so the resource report, the native / IR mix and
 # the FP64 issue floor all have something to say.
