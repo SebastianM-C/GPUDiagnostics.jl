@@ -8,7 +8,7 @@
 # `rocprof_command` builds that wrapper around a `Cmd` (under `timeout -k`, because a counter
 # request the hardware refuses aborts rocprofv3 with SIGABRT and leaves the profiled child hung),
 # `rocprof_counters` parses the output for one kernel into a `RocprofCounters` table, and
-# `rocprof_derived` / `rocprof_summary` / `rocprof_manifest_section` reduce it: medians with
+# `rocprof_derived` / `rocprof_summary` (and `diagnostics_dict`) reduce it: medians with
 # spreads across dispatches plus derived metrics with the normalisation rocprofv3's OWN
 # derived-metric definitions use on gfx942 (`rocprofv3 --list-avail`, rocprofv3 1.1.0):
 #
@@ -224,12 +224,7 @@ Base.show(io::IO, rc::RocprofCounters) = print(io, "RocprofCounters(", rc.name, 
 
 _kernel_head(name::AbstractString) = String(first(split(name, '('; limit = 2)))
 
-function _median(v::AbstractVector{<:Real})
-    isempty(v) && return NaN
-    s = sort(Float64[x for x in v])
-    n = length(s)
-    return isodd(n) ? s[(n + 1) ÷ 2] : (s[n ÷ 2] + s[n ÷ 2 + 1]) / 2
-end
+_median(v::AbstractVector{<:Real}) = isempty(v) ? NaN : Float64(Statistics.median(v))
 # Spread across dispatches relative to the median: (max − min) / |median|, 0 for a constant.
 function _rel_spread(v::AbstractVector{<:Real})
     m = _median(v)
@@ -497,15 +492,3 @@ function rocprof_summary(rc::RocprofCounters)
     return out
 end
 
-"""
-    rocprof_manifest_section(dir; name = nothing, kernel = nothing, slots = nothing,
-                             n_cu = nothing, n_xcd = nothing, wave_size = nothing, prefix = "rocprof_")
-        -> Dict{String, Any}
-
-[`rocprof_summary`](@ref) of [`rocprof_counters`](@ref)`(dir; …)` with every key prefixed
-(`rocprof_td_busy`, `rocprof_SQ_WAVES_median`, …) — ready to `merge!` into a flat run-manifest
-table (e.g. next to the [`gpu_telemetry_stats`](@ref) keys of the same run)."""
-function rocprof_manifest_section(dir::AbstractString; prefix::AbstractString = "rocprof_", kwargs...)
-    rc = rocprof_counters(dir; kwargs...)
-    return Dict{String, Any}(prefix * k => v for (k, v) in rocprof_summary(rc))
-end

@@ -700,6 +700,75 @@ end
         @test :fp64_contract ∉ IR_FP64_CLASSES
     end
 
+    @testset "report layer: diagnostics_dict, show, Tables.jl" begin
+        # LaunchTimer on the CPU backend
+        timer = LaunchTimer()
+        lane = launch_lane(timer, CPU())
+        for _ in 1:3
+            e0 = launch_tick(timer, CPU()); sleep(0.001); launch_tock!(timer, lane, CPU(), e0)
+        end
+        d = diagnostics_dict(timer; prefix = "kernel_")
+        @test d["gpudiagnostics_schema"] == GPUDIAGNOSTICS_SCHEMA && d["kernel_devices"] == [1] && d["kernel_launches"] == [3]
+        @test d["kernel_median_s"][1] > 0 && d["kernel_s"][1] ≥ d["kernel_max_s"][1] ≥ d["kernel_first_s"][1] > 0
+        @test occursin("3 launches on 1 device", sprint(show, timer)) && occursin("median_s", sprint(show, MIME"text/plain"(), timer))
+        @test isempty(launch_times(LaunchTimer())) && occursin("no launches", sprint(show, MIME"text/plain"(), LaunchTimer()))
+        @test collect(keys(diagnostics_dict(LaunchTimer()))) == ["gpudiagnostics_schema"]
+
+        # instruction mix / IR mix / floor structs
+        amd = "k:\n\ts_load_b64 s[0:1], s[4:5], 0x0\n.LBB0_1:\n\tv_fma_f64 v[0:1], v[2:3], v[4:5], v[6:7]\n\tv_add_f64 v[0:1], v[0:1], v[2:3]\n\ts_cbranch_scc1 .LBB0_1\n\ts_endpgm\n"
+        m = instruction_mix(amd, :amd)
+        @test m isa InstructionMix && m.hot_loop isa MixLoop && m.loops isa Vector{MixLoop}
+        dm = diagnostics_dict(m; prefix = "kernel_mix_")
+        @test dm["kernel_mix_total"] == m.total && dm["kernel_mix_fp64_fma"] == 1 && dm["kernel_mix_hot_loop_total"] == m.hot_loop.total
+        @test dm["kernel_mix_hot_loop_confidence"] == String(m.hot_loop_confidence) && dm["kernel_mix_vendor"] == "amd"
+        @test !haskey(dm, "kernel_mix_llvm_loops_agree")   # missing ⇒ omitted
+        @test all(v isa Union{Int, Float64, Bool, String} for v in values(dm))
+        @test occursin("hot loop .LBB0_1", sprint(show, MIME"text/plain"(), m)) && occursin("InstructionMix(amd", sprint(show, m))
+        ck = CompiledKernel("gpu_k", "sig", 256, nothing)
+        struct FakeReportGPU <: Backend end
+        GPUDiagnostics.supports(::FakeReportGPU, ::Val{:native_mix}) = true
+        GPUDiagnostics.supports(::FakeReportGPU, ::Val{:ir_mix}) = true
+        GPUDiagnostics.backend_kernel_machine_code(::FakeReportGPU, c::CompiledKernel, target) =
+            (; text = amd, vendor = :amd, isa = "gfx1100", native = true, registers = missing)
+        GPUDiagnostics.backend_kernel_ir_counts(::FakeReportGPU, c::CompiledKernel, target) =
+            (; functions = Dict("k" => GPUDiagnostics.IRCounts(ntuple(i -> i, length(IR_CLASSES)))), isa = "gfx1100")
+        km = kernel_instruction_mix(FakeReportGPU(), ck)
+        @test km isa KernelInstructionMix && km.ir isa IRMix && km.counts == m.counts && km.hot_loop.total == m.hot_loop.total
+        @test :counts in propertynames(km) && ismissing(km.registers)
+        dk = diagnostics_dict(km; prefix = "kernel_mix_")
+        @test dk["kernel_mix_target"] == "gfx1100" && dk["kernel_mix_native"] === true && dk["kernel_mix_name"] == "gpu_k"
+        @test !haskey(dk, "kernel_mix_registers") && !haskey(dk, "kernel_mix_ir_total")   # IR keys live in their own dict
+        di = diagnostics_dict(km.ir; prefix = "kernel_ir_")
+        @test di["kernel_ir_fp64_fma"] == 1 && di["kernel_ir_total"] == km.ir.total && di["kernel_ir_target"] == "gfx1100"
+        @test occursin("not in the listing", sprint(show, MIME"text/plain"(), km)) && occursin("IRMix (optimized", sprint(show, MIME"text/plain"(), km))
+        fl = fp64_issue_floor(m; n_slots = 10, peak_fp64_flops = 4.0, kernel_time_s = 1.0)
+        @test fl isa FP64IssueFloor
+        df = diagnostics_dict(fl; prefix = "floor_")
+        @test df["floor_scope"] == "hot_loop" && df["floor_fp64_per_slot"] == 2 && df["floor_kernel_time_s"] == 1.0 && haskey(df, "floor_assumptions")
+        @test !haskey(diagnostics_dict(fp64_issue_floor(m; n_slots = 10, peak_fp64_flops = 4.0)), "kernel_time_s")
+        @test occursin("% of the launch", sprint(show, fl)) && occursin("assumptions:", sprint(show, MIME"text/plain"(), fl))
+
+        # KernelResources
+        r = KernelResources("k", "sig", 256, 24, 0, 0, missing, 1024, KernelOccupancy(2, 16, 64, 32, 2048, 65536, 0.25), Dict{String, Any}("vgpr_count" => 24))
+        dr = diagnostics_dict(r; prefix = "kernel_")
+        @test dr["kernel_registers"] == 24 && dr["kernel_occupancy"] == 0.25 && dr["kernel_active_blocks_per_sm"] == 2 && dr["kernel_isa_vgpr_count"] == 24
+        @test !haskey(dr, "kernel_const_mem_bytes")
+        rno = KernelResources("k", "sig", 256, missing, 0, 0, missing, 1024, missing, Dict{String, Any}())
+        @test !any(startswith(k, "kernel_active") || k == "kernel_occupancy" || k == "kernel_registers" for k in keys(diagnostics_dict(rno; prefix = "kernel_")))
+
+        # GPUTelemetry: dict + Tables.jl
+        tel = GPUDiagnostics._empty_telemetry(0.5, :none; columns = [:t_rel_s, :device, :power_W, :compute_util])
+        tel = GPUTelemetry(tel.columns, [0.0 1 100.0 0.9; 0.5 1 120.0 NaN; 1.0 1 110.0 0.7], 3, 0.5, 1.5, 0.1, false, nothing, :none)
+        dt = diagnostics_dict(tel; prefix = "sampler_")
+        @test dt["sampler_ticks"] == 3 && dt["sampler_first_sample_s"] == 0.1 && dt["sampler_power_W_mean"] == 110.0 && dt["sampler_counters"] == "none"
+        @test !haskey(diagnostics_dict(GPUDiagnostics._empty_telemetry(0.5, :none)), "first_sample_s")
+        @test occursin("3 ticks", sprint(show, MIME"text/plain"(), tel)) && occursin("power_W_mean", sprint(show, MIME"text/plain"(), tel))
+        @test GPUDiagnostics.Tables.istable(tel) && GPUDiagnostics.Tables.columnnames(tel) == tel.columns
+        @test GPUDiagnostics.Tables.getcolumn(tel, :power_W) == [100.0, 120.0, 110.0] && GPUDiagnostics.Tables.getcolumn(tel, 2) == [1, 1, 1]
+        @test GPUDiagnostics.Tables.schema(tel).names == Tuple(tel.columns)
+        @test [r.power_W for r in GPUDiagnostics.Tables.rows(tel)] == [100.0, 120.0, 110.0]
+    end
+
     @testset "rocprofv3 counters: CSV parser, normalisation, command wrapper" begin
         fx = joinpath(@__DIR__, "fixtures", "rocprof")   # trimmed real MI300X collections (3 sets)
         S = 401 * 401 * 1666   # slots of one dispatch of the fixture cell (pixels × window samples)
@@ -807,11 +876,11 @@ end
         @test s["insts_per_slot_vmem_rd"] == d["insts_per_slot_vmem_rd"] && s["counters"] == rc.counters
         @test_throws ArgumentError rocprof_summary(w0)   # the summary carries the derived metrics
         @test !haskey(rocprof_summary(rocprof_counters(fx; name = "sq1", n_xcd = 8)), "n_cu")   # unknown device values are omitted
-        ms = rocprof_manifest_section(fx; name = "sq2", kernel = "forindices", slots = S)
+        ms = diagnostics_dict(rocprof_counters(fx; name = "sq2", kernel = "forindices", slots = S); prefix = "rocprof_")
         @test ms["rocprof_insts_per_slot_vmem_rd"] == d["insts_per_slot_vmem_rd"] && ms["rocprof_dispatches"] == 3
-        @test all(startswith(k, "rocprof_") for k in keys(ms))
+        @test all(startswith(k, "rocprof_") || k == "gpudiagnostics_schema" for k in keys(ms))
         @test all(v isa Union{Real, String, Vector{String}} for v in values(ms))
-        @test rocprof_manifest_section(fx; name = "c2a", prefix = "hw_")["hw_td_busy"] ≈ e["td_busy"]
+        @test diagnostics_dict(rocprof_counters(fx; name = "c2a"); prefix = "hw_")["hw_td_busy"] ≈ e["td_busy"]
 
         # the wrapper: timeout -k, rocprofv3 flags, counters from a set or a list, env/dir preserved
         @test rocprof_available() == (Sys.which("rocprofv3") !== nothing)

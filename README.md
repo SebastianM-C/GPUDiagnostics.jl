@@ -185,6 +185,21 @@ Gotchas: CUDA.jl's `code_sass` loads the module on the current device (via CUPTI
 AMDGPU.jl caches the OCLC ISA-version device library under an ISA-agnostic key; the extension evicts
 it around a cross-compile so gfx942 links `oclc_isa_version_942`, not the current device's.
 
+## Report layer: manifests and readable summaries
+
+```julia
+merge!(manifest["gpu"], diagnostics_dict(kernel_resources(backend, ck); prefix = "kernel_"),
+                        diagnostics_dict(m; prefix = "kernel_mix_"), diagnostics_dict(m.ir; prefix = "kernel_ir_"),
+                        diagnostics_dict(timer; prefix = "kernel_"), diagnostics_dict(telem; prefix = "sampler_"))
+r                                   # every result type prints as a small table (show)
+using DataFrames; DataFrame(telem)  # GPUTelemetry is a Tables.jl column table
+```
+
+`diagnostics_dict` gives a flat `Dict{String, Any}` of TOML-safe scalars under stable keys: keys are
+additive and never renamed, a value the backend could not report is omitted rather than written as a
+sentinel, and every dict carries `gpudiagnostics_schema`. The IR counts are a separate dict so the
+`kernel_mix_` and `kernel_ir_` families stay apart.
+
 ## AMD hardware counters (rocprofv3)
 
 ```julia
@@ -193,6 +208,7 @@ run(cmd)
 rc = rocprof_counters("prof"; name = "cell", slots = n_work_items * n_iterations_per_item)  # one user kernel ⇒ auto-selected
 rocprof_derived(rc)            # per-slot instruction counts, unit-busy fractions, achieved occupancy, clock
 rocprof_summary(rc)            # flat Dict: medians + spreads across dispatches + the derived metrics
+diagnostics_dict(rc; prefix = "rocprof_")   # the same, prefixed and schema-tagged for a manifest
 ```
 
 There is no in-process counter API on AMD, so the wrapper runs the workload under `rocprofv3 --pmc`
