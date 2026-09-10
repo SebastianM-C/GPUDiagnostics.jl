@@ -189,3 +189,12 @@ counters: `GRBM_GUI_ACTIVE` is summed over the dies, so every per-cycle rate div
 - [CUDA.jl's `@profile`](https://cuda.juliagpu.org/stable/development/profiling/) and
   [AMDGPU.jl's `@roc` profiling](https://amdgpu.juliagpu.org/stable/profiling/) — the vendor packages'
   own integrated profilers, for per-kernel timelines of a single session.
+
+## Provenance
+
+This package was written with the help of [Claude Code](https://claude.com/claude-code) and was
+developed and tested against the needs of
+[ElectronDynamicsModels.jl](https://github.com/SebastianM-C/ElectronDynamicsModels.jl), where it
+started as an in-repo sub-package. Design decisions, validation on real hardware and the
+measurements quoted above are the maintainer's; expect rough edges outside the paths that
+project exercises.
