@@ -858,7 +858,7 @@ end
 """    backend_kernel_ir_counts(backend, ck::CompiledKernel, target) -> (; functions, isa)
 
 Backend hook (`:ir_mix`, required of every GPU backend): the optimized LLVM IR of `ck`'s
-GPUCompiler job for `target`, walked with [`GPUDiagnostics._ir_counts`](@ref) into
+GPUCompiler job for `target`, walked with the LLVM.jl-based `_ir_counts` helper into
 `functions::Dict{String, IRCounts}` plus the `isa` string the job compiled for."""
 backend_kernel_ir_counts(b::KA.Backend, ck::CompiledKernel, target) =
     throw(BackendUnsupported(b, :ir_mix, :kernel_ir_mix))
