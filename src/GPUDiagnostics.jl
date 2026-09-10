@@ -6,6 +6,9 @@ the KA `Backend`; the CUDA.jl / AMDGPU.jl package extensions supply the vendor m
 on demand when the vendor package is in the session, and the KA `CPU` backend gets host
 fallbacks so the plumbing (and its tests) run without a GPU.
 
+- **Capabilities** — `supports(backend, :feature)` / `capabilities(backend)` say which of the
+  subsystems below a backend implements (`FEATURES`); an entry point of an undeclared feature
+  throws `BackendUnsupported` naming the feature and, when known, the package to load.
 - **Device API** — `gpu_device_count`, `gpu_device`, `gpu_device!`, `gpu_name`, `gpu_arch`,
   `gpu_sm_count`, `gpu_max_threads_per_sm`, `gpu_memory_info`, `gpu_power`, `gpu_utilization`,
   `thread_fill_occupancy`. KernelAbstractions has no device management of its own.
@@ -51,7 +54,8 @@ import KernelAbstractions as KA
 using KernelAbstractions: Backend, @kernel, @index, @Const
 using LinearAlgebra: LinearAlgebra
 
-export gpu_device_count, gpu_device, gpu_device!, gpu_name, gpu_arch,
+export FEATURES, supports, capabilities, BackendUnsupported,
+    gpu_device_count, gpu_device, gpu_device!, gpu_name, gpu_arch,
     gpu_sm_count, gpu_max_threads_per_sm, gpu_memory_info, gpu_power, gpu_utilization,
     thread_fill_occupancy,
     gpu_event, gpu_elapsed, LaunchTimer, launch_times, launch_lane, launch_tick, launch_tock!,
@@ -64,6 +68,7 @@ export gpu_device_count, gpu_device, gpu_device!, gpu_name, gpu_arch,
     ROCPROF_COUNTER_SETS, RocprofCounters, rocprof_available, rocprof_command, rocprof_counters,
     rocprof_median, rocprof_derived, rocprof_summary, rocprof_manifest_section
 
+include("capabilities.jl")   # supports/capabilities trait + BackendUnsupported; declared per backend by ext/
 include("device_api.jl")   # generics + CPU fallbacks + LaunchTimer; vendor methods in ext/
 include("sampler.jl")      # gpu_sample sources, the telemetry child, with_gpu_sampler, gpu_telemetry_stats
 include("peakflops.jl")    # FMA-chain FP64 peak probe

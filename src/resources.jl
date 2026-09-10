@@ -48,6 +48,7 @@ there on its first call). `pattern` (a `Regex` or `AbstractString`) keeps only e
 its driver: `compiled_kernels(backend; pattern = r"_my_driver!")`. The CPU backend compiles
 nothing and returns an empty vector. Pass entries to [`kernel_resources`](@ref)."""
 function compiled_kernels(backend::KA.Backend; pattern::Union{Regex, AbstractString, Nothing} = nothing)
+    _require(backend, :kernel_inventory, :compiled_kernels)
     ks = _compiled_kernels(backend)
     pattern === nothing && return ks
     return filter(k -> occursin(pattern, k.name) || occursin(pattern, k.signature), ks)
@@ -55,9 +56,7 @@ end
 
 # Vendor hook: the raw inventory (ext/ supplies the CUDA/AMDGPU methods).
 _compiled_kernels(::KA.CPU) = CompiledKernel[]
-_compiled_kernels(b::KA.Backend) = error(
-    "compiled_kernels: no GPU vendor extension loaded for ", typeof(b), " — load CUDA.jl or AMDGPU.jl"
-)
+_compiled_kernels(b::KA.Backend) = throw(BackendUnsupported(b, :kernel_inventory, :compiled_kernels))
 
 """
     kernel_resources(backend, ck::CompiledKernel; block_size = something(ck.workgroup_size, 256))
@@ -106,6 +105,7 @@ the compiler for a few seconds.
 """
 function kernel_resources(backend::KA.Backend, ck::CompiledKernel;
         block_size::Integer = something(ck.workgroup_size, 256))
+    _require(backend, :resources, :kernel_resources)
     block_size > 0 || throw(ArgumentError("kernel_resources: block_size must be > 0 (got $block_size)"))
     attrs = _kernel_attributes(backend, ck.kernel)          # registers, local/shared/const bytes, max threads
     occ = _kernel_occupancy(backend, ck.kernel, Int(block_size))   # active blocks/SM + device capacities
@@ -127,9 +127,6 @@ function kernel_resources(backend::KA.Backend, ck::CompiledKernel;
 end
 kernel_resources(backend::KA.Backend, pattern::Union{Regex, AbstractString}; kwargs...) =
     [kernel_resources(backend, ck; kwargs...) for ck in compiled_kernels(backend; pattern)]
-kernel_resources(::KA.CPU, ck::CompiledKernel; kwargs...) = error(
-    "kernel_resources: the CPU backend compiles no GPU kernels"
-)
 
 # Vendor hooks (ext/): attributes of a compiled kernel object, the runtime's occupancy
 # calculator + the device capacities it is measured against, and the optional ISA figures.

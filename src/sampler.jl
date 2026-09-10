@@ -104,9 +104,8 @@ Vendor hook (implemented by the CUDA.jl / AMDGPU.jl extensions): resolve the (1-
 on NVIDIA (`nvml:GPU-<uuid>=<device>`; the child loads the listed `packages`, i.e. CUDA.jl, for
 the NVML bindings only), amdgpu sysfs paths on AMD (`sysfs:…`, no packages). `counters` is
 `:auto` or `:none`. The vendor runtime is touched only here, in the parent."""
-gpu_sampler_sources(b::Backend, ::AbstractVector{<:Integer}, ::Symbol) = error(
-    "gpu_sampler_sources: no GPU vendor extension loaded for ", typeof(b), " — load CUDA.jl or AMDGPU.jl"
-)
+gpu_sampler_sources(b::Backend, ::AbstractVector{<:Integer}, ::Symbol) =
+    throw(BackendUnsupported(b, :telemetry, :gpu_sampler_sources))
 
 const _SOURCE_CACHE = Dict{Tuple{DataType, Int, Symbol}, SamplerSource}()
 const _SOURCE_LOCK = ReentrantLock()

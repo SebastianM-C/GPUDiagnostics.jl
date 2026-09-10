@@ -9,6 +9,7 @@ using Aqua
 
 # A KA backend with no vendor extension — exercises the "load CUDA.jl or AMDGPU.jl" fallbacks.
 struct NoVendorBackend <: Backend end
+include("conformance.jl")
 
 # Stand-in for the LLVM.jl surface `GPUDiagnostics._ir_counts` uses (see the IR walker testset).
 module FakeLLVM
@@ -50,6 +51,25 @@ end
         Aqua.test_all(GPUDiagnostics)
     end
 
+    @testset "capabilities: trait, BackendUnsupported, conformance" begin
+        @test FEATURES isa Tuple && allunique(FEATURES) && all(f -> f isa Symbol, FEATURES)
+        @test capabilities(CPU()) == [:devices, :events, :fp64_peak, :kernel_inventory]
+        @test isempty(capabilities(NoVendorBackend()))
+        @test supports(CPU(), :events) && !supports(CPU(), :telemetry) && !supports(CPU(), :no_such_feature)
+        e = try gpu_power(CPU()); catch err; err; end
+        @test e isa BackendUnsupported && e.feature == :telemetry && e.entry == :gpu_power && e.backend === CPU()
+        msg = sprint(showerror, e)
+        @test occursin("gpu_power: CPU does not support :telemetry", msg) && !occursin("load", msg)
+        # a known vendor backend type with nothing declared ⇒ the message names the package
+        struct CUDABackend <: Backend end
+        msg2 = sprint(showerror, BackendUnsupported(CUDABackend(), :telemetry, :gpu_power))
+        @test occursin("load CUDA.jl to enable its extension", msg2)
+        msg3 = sprint(showerror, BackendUnsupported(CPU(), :bogus, :f))
+        @test occursin("not a GPUDiagnostics feature", msg3)
+        conformance(CPU())
+        conformance(NoVendorBackend())
+    end
+
     @testset "device API: CPU fallbacks + vendor-less errors" begin
         @test gpu_device_count(CPU()) == 1
         @test gpu_device(CPU()) == 1
@@ -58,11 +78,11 @@ end
         @test gpu_arch(CPU()) == "cpu"
         for f in (gpu_device_count, gpu_device, gpu_name, gpu_power, gpu_utilization,
                 gpu_memory_info, gpu_sm_count, gpu_max_threads_per_sm, gpu_arch)
-            @test_throws ErrorException f(NoVendorBackend())
+            @test_throws BackendUnsupported f(NoVendorBackend())
         end
-        @test_throws ErrorException gpu_device!(NoVendorBackend(), 1)
-        @test_throws ErrorException gpu_event(NoVendorBackend())
-        @test_throws ErrorException thread_fill_occupancy(CPU(), 1024)   # no SM count on the host
+        @test_throws BackendUnsupported gpu_device!(NoVendorBackend(), 1)
+        @test_throws BackendUnsupported gpu_event(NoVendorBackend())
+        @test_throws BackendUnsupported thread_fill_occupancy(CPU(), 1024)   # no SM count on the host
     end
 
     @testset "device events + LaunchTimer (CPU backend = host clock)" begin
@@ -92,9 +112,9 @@ end
 
     @testset "telemetry: sources, gpu_sample, child protocol, with_gpu_sampler, stats" begin
         # vendor-less / CPU: capability errors are clear, with_gpu_sampler degrades to unsampled
-        @test_throws ErrorException gpu_sampler_sources(NoVendorBackend(), [1], :auto)
-        @test_throws ErrorException gpu_sample(NoVendorBackend(), 1)
-        @test_throws ErrorException gpu_sampler_sources(CPU(), [1], :auto)
+        @test_throws BackendUnsupported gpu_sampler_sources(NoVendorBackend(), [1], :auto)
+        @test_throws BackendUnsupported gpu_sample(NoVendorBackend(), 1)
+        @test_throws BackendUnsupported gpu_sampler_sources(CPU(), [1], :auto)
         @test_throws ArgumentError with_gpu_sampler(() -> 1, CPU(), 0.1; counters = :bogus)
         @test_throws ArgumentError with_gpu_sampler(() -> 1, CPU(), 0.0)
         @test_throws ArgumentError gpu_sample(CPU(), 1; counters = :sometimes)
@@ -219,7 +239,7 @@ end
         end
         @test r == 7 && telem.ticks == 0 && !isfile(trace2) && !isfile(trace2 * ".stderr") && telem.window >= 2.5
         Base.delete_method(only(methods(GPUDiagnostics.gpu_sampler_sources, (CPU, AbstractVector{<:Integer}, Symbol))))
-        @test_throws ErrorException gpu_sampler_sources(CPU(), [1], :auto)
+        @test_throws BackendUnsupported gpu_sampler_sources(CPU(), [1], :auto)
         empty!(GPUDiagnostics._SOURCE_CACHE)
     end
 
@@ -241,8 +261,8 @@ end
         @test compiled_kernels(CPU()) == CompiledKernel[]
         @test isempty(compiled_kernels(CPU(); pattern = r"anything"))
         @test kernel_resources(CPU(), r"anything") == []
-        @test_throws ErrorException kernel_resources(CPU(), CompiledKernel("k", "sig", 256, nothing))
-        @test_throws ErrorException compiled_kernels(NoVendorBackend())
+        @test_throws BackendUnsupported kernel_resources(CPU(), CompiledKernel("k", "sig", 256, nothing))
+        @test_throws BackendUnsupported compiled_kernels(NoVendorBackend())
 
         # static workgroup size from a KA kernel signature (what mkcontext + StaticSize produce)
         CI1 = CartesianIndices{1, Tuple{Base.OneTo{Int}}}
@@ -327,6 +347,9 @@ end
 
         # kernel_resources arithmetic on a fake GPU backend: occupancy = active warps / capacity
         struct FakeGPU <: Backend end
+        for f in (:kernel_inventory, :resources, :occupancy)
+            @eval GPUDiagnostics.supports(::FakeGPU, ::Val{$(QuoteNode(f))}) = true
+        end
         GPUDiagnostics._compiled_kernels(::FakeGPU) = [ck]
         GPUDiagnostics._kernel_attributes(::FakeGPU, k::FakeKernel) =
             (; registers = 123, local_mem_bytes = 584, shared_mem_bytes = 65536, const_mem_bytes = -1, max_threads_per_block = 1024)
@@ -574,6 +597,8 @@ end
         # kernel_instruction_mix through the vendor hook (fake backend: AMD text natively, SASS for a target)
         ck = CompiledKernel("gpu_k", "Tuple{CompilerMetadata{…StaticSize{(256,)}…}}", 256, nothing)
         struct FakeMixGPU <: Backend end
+        GPUDiagnostics.supports(::FakeMixGPU, ::Val{:native_mix}) = true
+        GPUDiagnostics.supports(::FakeMixGPU, ::Val{:ir_mix}) = true
         GPUDiagnostics._kernel_machine_code(::FakeMixGPU, c::CompiledKernel, target) = target === nothing ?
             (; text = amd, vendor = :amd, isa = "gfx1100", native = true, registers = 10) :
             (; text = sass, vendor = :nvidia, isa = String(target), native = false, registers = 124)
@@ -586,8 +611,8 @@ end
         @test kernel_instruction_mix(FakeMixGPU(), ck; ir = false).ir === nothing
         irm = kernel_ir_mix(FakeMixGPU(), ck; target = "gfx942")
         @test irm.target == "gfx942" && irm.counts == km.ir.counts
-        @test_throws ErrorException kernel_ir_mix(CPU(), ck)
-        @test_throws ErrorException kernel_ir_mix(NoVendorBackend(), ck)
+        @test_throws BackendUnsupported kernel_ir_mix(CPU(), ck)
+        @test_throws BackendUnsupported kernel_ir_mix(NoVendorBackend(), ck)
         @test km.total == 22 && km.counts == m.counts && km.hot_loop.header == ".LBB0_1"
         buf = IOBuffer()
         km2 = kernel_instruction_mix(FakeMixGPU(), ck; target = "sm_90", dump = buf)
@@ -596,8 +621,8 @@ end
         kernel_instruction_mix(FakeMixGPU(), ck; target = :sm_90, dump = path)
         @test read(path, String) == sass
         rm(path)
-        @test_throws ErrorException kernel_instruction_mix(CPU(), ck)
-        @test_throws ErrorException kernel_instruction_mix(NoVendorBackend(), ck)
+        @test_throws BackendUnsupported kernel_instruction_mix(CPU(), ck)
+        @test_throws BackendUnsupported kernel_instruction_mix(NoVendorBackend(), ck)
     end
 
     @testset "typed IR walker on a stand-in LLVM.jl module" begin

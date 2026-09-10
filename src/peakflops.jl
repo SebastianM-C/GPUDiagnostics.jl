@@ -66,6 +66,7 @@ units: this is the ceiling for scalar FP64 code. Costs about
 """
 function measure_peak_fp64_flops(backend::Backend; n_threads::Integer = 2^20, workgroup::Integer = 256,
         trials::Integer = 5, target_seconds::Real = 0.2)
+    _require(backend, :fp64_peak, :measure_peak_fp64_flops)
     n_threads > 0 && workgroup > 0 && trials > 0 && target_seconds > 0 ||
         throw(ArgumentError("measure_peak_fp64_flops: n_threads, workgroup, trials, target_seconds must be > 0"))
     seed = Adapt.adapt(backend, Float64.(0:(n_threads - 1)))

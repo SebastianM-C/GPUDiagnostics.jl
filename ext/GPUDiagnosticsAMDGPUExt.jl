@@ -14,6 +14,13 @@ import LLVM
 const GD = GPUDiagnostics
 
 # AMDGPU device ids are already 1-based (HIPDevice(id=1, …)), matching the common API — no offset.
+# Everything but GPM-style in-sample counters (no in-process counter API on AMD; the
+# hardware counters go through rocprofv3, the `:hw_counters` path).
+for f in (:devices, :device_props, :events, :telemetry, :fp64_peak,
+        :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix, :hw_counters)
+    @eval GD.supports(::ROCBackend, ::Val{$(QuoteNode(f))}) = true
+end
+
 GD.gpu_device_count(::ROCBackend) = length(AMDGPU.devices())
 GD.gpu_device(::ROCBackend) = AMDGPU.device_id(AMDGPU.device())
 function GD.gpu_device!(::ROCBackend, i::Integer)

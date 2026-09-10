@@ -15,6 +15,13 @@ const GD = GPUDiagnostics
 # NVML handle for the current CUDA device (NVML indexes by UUID, not the CUDA ordinal).
 _nvml() = NVML.Device(CUDA.uuid(CUDA.device()))
 
+# Everything but the AMD-only counter path. GPM counters are a per-device runtime question
+# (Hopper+ and recent consumer drivers); the FEATURE is the sampler knowing how to ask.
+for f in (:devices, :device_props, :events, :telemetry, :telemetry_counters, :fp64_peak,
+        :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix)
+    @eval GD.supports(::CUDABackend, ::Val{$(QuoteNode(f))}) = true
+end
+
 GD.gpu_device_count(::CUDABackend) = length(CUDA.devices())
 GD.gpu_device(::CUDABackend) = CUDA.deviceid(CUDA.device()) + 1          # 0-based CUDA → 1-based API
 function GD.gpu_device!(::CUDABackend, i::Integer)
