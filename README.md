@@ -118,9 +118,10 @@ documented in their docstrings, not exported.
 ```julia
 cks = compiled_kernels(backend; pattern = r"_my_driver!")   # kernels this process compiled
 r = kernel_resources(backend, only(cks))                    # at the kernel's static workgroup size
-r.registers, r.local_mem_bytes, r.shared_mem_bytes           # per-thread regs, spill/stack bytes, LDS/block
-r.active_blocks_per_sm, r.occupancy                          # the runtime's occupancy calculator
+r.registers, r.local_mem_bytes, r.shared_mem_bytes           # per-thread regs, spill/stack bytes, LDS/block (missing if unreported)
+r.occupancy.active_blocks_per_sm, r.occupancy.fraction       # the runtime's occupancy calculator (missing without one)
 r.isa                                                        # AMD: sgpr/vgpr/spill counts, compiler occupancy
+r                                                            # prints as a small table
 ```
 
 Both vendor packages cache every kernel instance the process compiles, so the inventory reaches

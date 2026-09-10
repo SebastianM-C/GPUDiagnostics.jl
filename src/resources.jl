@@ -39,6 +39,94 @@ end
 Base.show(io::IO, ck::CompiledKernel) = print(io, "CompiledKernel(", ck.name, ", workgroup_size = ",
     ck.workgroup_size, ", ", length(ck.signature), "-char signature)")
 
+"""
+    KernelOccupancy
+
+The occupancy block of a [`KernelResources`](@ref): the vendor occupancy calculator's
+`active_blocks_per_sm` at the report's block size, converted to `active_warps_per_sm` (waves
+on AMD) and divided by the device's `max_warps_per_sm` into `fraction` ∈ (0, 1] — the
+theoretical occupancy the launch can reach, accounting for registers, shared memory and
+block-size granularity together. `warp_size`, `max_threads_per_sm` and `shared_mem_per_sm` are
+the device capacities it is measured against (`shared_mem_per_sm ÷ shared_mem_bytes` blocks is
+the shared-memory bound). SM = CU / WGP on AMD.
+"""
+struct KernelOccupancy
+    active_blocks_per_sm::Int
+    active_warps_per_sm::Int
+    max_warps_per_sm::Int
+    warp_size::Int
+    max_threads_per_sm::Int
+    shared_mem_per_sm::Int
+    fraction::Float64
+end
+
+"""
+    KernelResources
+
+The compile-time resource report of [`kernel_resources`](@ref) for one kernel at one block size:
+
+- `name`, `signature`, `block_size` — identification and the block size the occupancy is for;
+- `registers` — architectural registers per thread (NVIDIA registers; AMD VGPRs);
+- `local_mem_bytes` — per-thread stack/spill memory (NVIDIA local memory; AMD scratch, the
+  private segment). Non-zero means register spills or a stack frame: every access is a
+  global-memory round trip;
+- `shared_mem_bytes` — static shared memory (LDS) per block the kernel descriptor RESERVES,
+  whether or not the source declares any (LLVM's AMDGPU backend promotes private arrays it
+  cannot keep in registers to LDS, sized for the kernel's maximum block size);
+- `const_mem_bytes`, `max_threads_per_block` — as reported by the runtime;
+- `occupancy` — a [`KernelOccupancy`](@ref), or `missing` when the backend has no occupancy
+  calculator (`:occupancy` capability) or reports no resident-warp capacity;
+- `isa` — a `Dict{String, Any}` of extra figures read from the compiled code where the vendor
+  exposes them (see [`kernel_resources`](@ref)).
+
+Every count the runtime cannot report is `missing`.
+"""
+struct KernelResources
+    name::String
+    signature::String
+    block_size::Int
+    registers::Union{Missing, Int}
+    local_mem_bytes::Union{Missing, Int}
+    shared_mem_bytes::Union{Missing, Int}
+    const_mem_bytes::Union{Missing, Int}
+    max_threads_per_block::Union{Missing, Int}
+    occupancy::Union{Missing, KernelOccupancy}
+    isa::Dict{String, Any}
+end
+
+_fmt_missing(x) = ismissing(x) ? "— (not reported)" : string(x)
+
+Base.show(io::IO, r::KernelResources) = print(io, "KernelResources(", r.name, " @ block ", r.block_size,
+    ": regs ", _fmt_missing(r.registers), ", local ", _fmt_missing(r.local_mem_bytes), " B, shared ",
+    _fmt_missing(r.shared_mem_bytes), " B, occupancy ",
+    ismissing(r.occupancy) ? "—" : string(round(r.occupancy.fraction; digits = 3)), ")")
+
+function Base.show(io::IO, ::MIME"text/plain", r::KernelResources)
+    println(io, "KernelResources: ", r.name, " at block size ", r.block_size)
+    rows = (
+        "registers" => _fmt_missing(r.registers),
+        "local_mem_bytes" => _fmt_missing(r.local_mem_bytes),
+        "shared_mem_bytes" => _fmt_missing(r.shared_mem_bytes),
+        "const_mem_bytes" => _fmt_missing(r.const_mem_bytes),
+        "max_threads_per_block" => _fmt_missing(r.max_threads_per_block),
+    )
+    for (k, v) in rows
+        println(io, "  ", rpad(k, 22), v)
+    end
+    o = r.occupancy
+    if ismissing(o)
+        println(io, "  ", rpad("occupancy", 22), "— (no occupancy calculator)")
+    else
+        println(io, "  ", rpad("occupancy", 22), o.active_warps_per_sm, "/", o.max_warps_per_sm, " warps per SM = ",
+            round(o.fraction; digits = 3), "  (", o.active_blocks_per_sm, " blocks/SM, warp size ", o.warp_size, ")")
+    end
+    if !isempty(r.isa)
+        ks = sort!(collect(keys(r.isa)))
+        print(io, "  ", rpad("isa", 22), join((k * " = " * repr(r.isa[k]) for k in ks), ", "))
+    end
+    return nothing
+end
+
 """    compiled_kernels(backend; pattern = nothing) -> Vector{CompiledKernel}
 
 Inventory of the kernels THIS PROCESS has compiled for `backend`'s vendor runtime, from the
@@ -69,25 +157,9 @@ backend_compiled_kernels(b::KA.Backend) = throw(BackendUnsupported(b, :kernel_in
 Compile-time resource report of a compiled kernel (see [`compiled_kernels`](@ref)), and the
 theoretical occupancy the vendor runtime computes from it for a launch of `block_size`
 threads per block (default: the kernel's static KernelAbstractions workgroup size, else 256).
-Returns a NamedTuple:
+Returns a [`KernelResources`](@ref) (registers, local/spill and shared memory, `const_mem_bytes`,
+`max_threads_per_block`, a [`KernelOccupancy`](@ref) block or `missing`), plus:
 
-- `name`, `signature`, `block_size` — identification and the block size the occupancy is for;
-- `registers` — architectural registers per thread (NVIDIA registers; AMD VGPRs);
-- `local_mem_bytes` — per-thread stack/spill memory (NVIDIA local memory; AMD scratch, the
-  private segment). Non-zero means register spills or a stack frame: every access is a
-  global-memory round trip;
-- `shared_mem_bytes` — static shared memory (LDS) per block the kernel descriptor RESERVES,
-  whether or not the source declares any (LLVM's AMDGPU backend promotes private arrays it
-  cannot keep in registers to LDS, sized for the kernel's maximum block size);
-- `const_mem_bytes`, `max_threads_per_block` — as reported by the runtime; `missing` when it
-  does not report one (HIP implements no const-size attribute);
-- `active_blocks_per_sm`, `active_warps_per_sm`, `max_warps_per_sm`, `warp_size`,
-  `occupancy` — the vendor occupancy calculator's resident blocks per SM (CU / WGP on AMD)
-  at `block_size`, converted to warps (waves) and divided by the device's resident-warp
-  capacity: `occupancy` ∈ (0, 1] is the theoretical occupancy the launch can reach. It
-  accounts for registers, shared memory and block-size granularity together;
-- `max_threads_per_sm`, `shared_mem_per_sm` — device capacities, for attributing the limiter
-  (`shared_mem_per_sm ÷ shared_mem_bytes` blocks is the shared-memory bound);
 - `isa` — a `Dict{String, Any}` of extra figures read from the compiled code where the
   vendor exposes them: on AMD, `sgpr_count`, `vgpr_count`, `agpr_count` (CDNA), the
   `sgpr_spill_count`/`vgpr_spill_count`, `scratch_bytes`, `lds_bytes`,
@@ -112,22 +184,21 @@ function kernel_resources(backend::KA.Backend, ck::CompiledKernel;
     _require(backend, :resources, :kernel_resources)
     block_size > 0 || throw(ArgumentError("kernel_resources: block_size must be > 0 (got $block_size)"))
     attrs = map(_reported, backend_kernel_attributes(backend, ck.kernel))   # registers, local/shared/const bytes, max threads
-    occ = backend_kernel_occupancy(backend, ck.kernel, Int(block_size))   # active blocks/SM + device capacities
-    isa = backend_kernel_isa_info(backend, ck)                     # vendor extras (may be empty)
-    warps_per_block = cld(Int(block_size), occ.warp_size)
-    max_warps = occ.max_threads_per_sm ÷ occ.warp_size
-    active_warps = occ.active_blocks_per_sm * warps_per_block
-    return (;
-        name = ck.name, signature = ck.signature, block_size = Int(block_size),
-        registers = attrs.registers, local_mem_bytes = attrs.local_mem_bytes,
-        shared_mem_bytes = attrs.shared_mem_bytes, const_mem_bytes = attrs.const_mem_bytes,
-        max_threads_per_block = attrs.max_threads_per_block,
-        active_blocks_per_sm = occ.active_blocks_per_sm, active_warps_per_sm = active_warps,
-        max_warps_per_sm = max_warps, warp_size = occ.warp_size,
-        occupancy = max_warps > 0 ? active_warps / max_warps : missing,
-        max_threads_per_sm = occ.max_threads_per_sm, shared_mem_per_sm = occ.shared_mem_per_sm,
-        isa,
-    )
+    isa = backend_kernel_isa_info(backend, ck)                              # vendor extras (may be empty)
+    occupancy = if supports(backend, Val(:occupancy))
+        occ = backend_kernel_occupancy(backend, ck.kernel, Int(block_size))   # active blocks/SM + device capacities
+        warps_per_block = cld(Int(block_size), occ.warp_size)
+        max_warps = occ.max_threads_per_sm ÷ occ.warp_size
+        active_warps = occ.active_blocks_per_sm * warps_per_block
+        max_warps > 0 ?
+            KernelOccupancy(occ.active_blocks_per_sm, active_warps, max_warps, occ.warp_size,
+                occ.max_threads_per_sm, occ.shared_mem_per_sm, active_warps / max_warps) :
+            missing
+    else
+        missing
+    end
+    return KernelResources(ck.name, ck.signature, Int(block_size), attrs.registers, attrs.local_mem_bytes,
+        attrs.shared_mem_bytes, attrs.const_mem_bytes, attrs.max_threads_per_block, occupancy, isa)
 end
 kernel_resources(backend::KA.Backend, pattern::Union{Regex, AbstractString}; kwargs...) =
     [kernel_resources(backend, ck; kwargs...) for ck in compiled_kernels(backend; pattern)]

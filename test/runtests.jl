@@ -371,20 +371,32 @@ end
         @test r.block_size == 128                      # defaults to the static workgroup size
         @test r.registers == 123 && r.local_mem_bytes == 584 && r.shared_mem_bytes == 65536
         @test ismissing(r.const_mem_bytes) && r.max_threads_per_block == 1024   # HIP's −1 ⇒ missing
-        @test r.active_blocks_per_sm == 1 && r.warp_size == 32 && r.max_warps_per_sm == 64
-        @test r.active_warps_per_sm == 4 && r.occupancy ≈ 4 / 64
+        @test r isa KernelResources && r.occupancy isa KernelOccupancy
+        @test r.occupancy.active_blocks_per_sm == 1 && r.occupancy.warp_size == 32 && r.occupancy.max_warps_per_sm == 64
+        @test r.occupancy.active_warps_per_sm == 4 && r.occupancy.fraction ≈ 4 / 64
+        txt = sprint(show, MIME"text/plain"(), r)
+        @test occursin("registers", txt) && occursin("4/64 warps per SM", txt) && occursin("const_mem_bytes       — (not reported)", txt)
+        @test occursin("vgpr_count = 123", txt) && occursin("KernelResources(", sprint(show, r))
         @test r.isa["vgpr_count"] == 123 && r.name == ck.name && r.signature == ck.signature
         r2 = kernel_resources(FakeGPU(), ck; block_size = 1024)
-        @test r2.active_warps_per_sm == 32 && r2.occupancy ≈ 0.5
+        @test r2.occupancy.active_warps_per_sm == 32 && r2.occupancy.fraction ≈ 0.5
         @test_throws ArgumentError kernel_resources(FakeGPU(), ck; block_size = 0)
         struct FakeNoOccGPU <: Backend end
         GPUDiagnostics.supports(::FakeNoOccGPU, ::Val{:resources}) = true
         GPUDiagnostics.backend_kernel_attributes(::FakeNoOccGPU, k::FakeKernel) =
             (; registers = missing, local_mem_bytes = 0, shared_mem_bytes = 0, const_mem_bytes = missing, max_threads_per_block = 1024)
-        GPUDiagnostics.backend_kernel_occupancy(::FakeNoOccGPU, k::FakeKernel, block_size::Int) =
-            (; active_blocks_per_sm = 0, warp_size = 32, max_threads_per_sm = 0, shared_mem_per_sm = 0)
-        r3 = kernel_resources(FakeNoOccGPU(), ck)
+        r3 = kernel_resources(FakeNoOccGPU(), ck)      # no :occupancy capability ⇒ the hook is never called
         @test ismissing(r3.registers) && ismissing(r3.const_mem_bytes) && ismissing(r3.occupancy)
+        @test occursin("no occupancy calculator", sprint(show, MIME"text/plain"(), r3))
+        # :occupancy declared but the runtime reports no capacity ⇒ missing too
+        struct FakeZeroCapGPU <: Backend end
+        GPUDiagnostics.supports(::FakeZeroCapGPU, ::Val{:resources}) = true
+        GPUDiagnostics.supports(::FakeZeroCapGPU, ::Val{:occupancy}) = true
+        GPUDiagnostics.backend_kernel_attributes(::FakeZeroCapGPU, k::FakeKernel) =
+            (; registers = 1, local_mem_bytes = 0, shared_mem_bytes = 0, const_mem_bytes = 0, max_threads_per_block = 1024)
+        GPUDiagnostics.backend_kernel_occupancy(::FakeZeroCapGPU, k::FakeKernel, block_size::Int) =
+            (; active_blocks_per_sm = 0, warp_size = 32, max_threads_per_sm = 0, shared_mem_per_sm = 0)
+        @test ismissing(kernel_resources(FakeZeroCapGPU(), ck).occupancy)
         @test length(kernel_resources(FakeGPU(), "StaticSize")) == 1
     end
 
