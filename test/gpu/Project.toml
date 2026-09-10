@@ -1,0 +1,10 @@
+[deps]
+AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+GPUDiagnostics = "5ccc9b3c-1187-41e2-9266-b19f02873332"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+GPUDiagnostics = {path = "../.."}
