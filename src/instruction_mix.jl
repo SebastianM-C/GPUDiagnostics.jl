@@ -88,6 +88,107 @@ end
 _add_counts(a::MixCounts, b::MixCounts) = MixCounts(ntuple(i -> a[i] + b[i], length(MIX_CLASSES)))
 _fp64_total(c::MixCounts) = sum(c[k] for k in FP64_CLASSES)
 
+"""
+    MixLoop
+
+One natural loop of a kernel's control-flow graph, as listed in `InstructionMix.loops`: `header`
+(block label), `depth` (1 = outermost), `blocks`, `total` and `counts` (everything inside the
+loop, nested loops included), `exclusive_total` / `exclusive_counts` (the loop's own blocks only).
+"""
+struct MixLoop
+    header::String
+    depth::Int
+    blocks::Int
+    total::Int
+    counts::MixCounts
+    exclusive_total::Int
+    exclusive_counts::MixCounts
+end
+
+"""
+    InstructionMix
+
+Result of [`instruction_mix`](@ref): the static instruction counts of one disassembly by class
+(`counts` over [`MIX_CLASSES`](@ref), `total`, `fp64`), the per-opcode histogram (`opcodes`),
+the classifier's coverage (`unclassified`, `unclassified_opcodes`, `coverage`), the parsed block
+count and the loop nest (`loops::Vector{MixLoop}`, `hot_loop::Union{Nothing, MixLoop}`,
+`hot_loop_confidence`, `llvm_loops_agree::Union{Missing, Bool}`). See [`instruction_mix`](@ref)
+for the meaning of each field.
+"""
+struct InstructionMix
+    vendor::Symbol
+    total::Int
+    fp64::Int
+    counts::MixCounts
+    opcodes::Dict{String, Int}
+    unclassified::Int
+    unclassified_opcodes::Dict{String, Int}
+    coverage::Float64
+    blocks::Int
+    loops::Vector{MixLoop}
+    hot_loop::Union{Nothing, MixLoop}
+    hot_loop_confidence::Symbol
+    llvm_loops_agree::Union{Missing, Bool}
+end
+
+"""
+    IRMix
+
+Result of [`kernel_ir_mix`](@ref): `target`, `total`, `fp64`, `counts` (over [`IR_CLASSES`](@ref))
+and `functions` (`Dict` name ⇒ counts) of the optimized LLVM IR of a kernel's job.
+"""
+struct IRMix
+    target::String
+    total::Int
+    fp64::Int
+    counts::NamedTuple
+    functions::Dict{String, <:NamedTuple}
+end
+
+"""
+    KernelInstructionMix
+
+Result of [`kernel_instruction_mix`](@ref): the kernel's `name` and `signature`, the `target` ISA
+the counted code was compiled for, `native` (whether that is the current device's), `registers`
+(from the AMD listing; `missing` for SASS), the [`InstructionMix`](@ref) itself as `mix`, and
+`ir::Union{Nothing, IRMix}`. Every field of `mix` is also readable directly (`m.counts`,
+`m.hot_loop`, …).
+"""
+struct KernelInstructionMix
+    name::String
+    signature::String
+    target::String
+    native::Bool
+    registers::Union{Missing, Int}
+    mix::InstructionMix
+    ir::Union{Nothing, IRMix}
+end
+function Base.getproperty(m::KernelInstructionMix, k::Symbol)
+    k in fieldnames(KernelInstructionMix) && return getfield(m, k)
+    return getproperty(getfield(m, :mix), k)
+end
+Base.propertynames(::KernelInstructionMix) = (fieldnames(KernelInstructionMix)..., fieldnames(InstructionMix)...)
+
+"""
+    FP64IssueFloor
+
+Result of [`fp64_issue_floor`](@ref): `scope`, `fp64_per_slot`, `n_slots`, `fp64_lane_instructions`,
+`peak_fp64_flops`, `floor_s`, `kernel_time_s` and `fp64_issue_fraction` (both `missing` when no
+launch time was given), `confidence` and the `assumptions` the floor rests on.
+"""
+struct FP64IssueFloor
+    scope::Symbol
+    fp64_per_slot::Int
+    n_slots::Float64
+    fp64_lane_instructions::Float64
+    peak_fp64_flops::Float64
+    floor_s::Float64
+    kernel_time_s::Union{Missing, Float64}
+    fp64_issue_fraction::Union{Missing, Float64}
+    confidence::Symbol
+    assumptions::String
+end
+
 # ── Classifiers: ordered rule tables ────────────────────────────────────────────────────────
 #
 # One generic matcher, two vendor tables, first matching rule wins. The rules follow the
@@ -517,13 +618,10 @@ function instruction_mix(text::AbstractString, vendor::Symbol)
         agree === false ? :low :
         (length(outer) == 1 || outer[1].total >= 2 * outer[2].total) ? :medium : :low
 
-    strip_(l) = (; header = l.header, depth = l.depth, blocks = l.blocks, total = l.total, counts = l.counts,
-        exclusive_total = l.exclusive_total, exclusive_counts = l.exclusive_counts)
-    return (; vendor, total, fp64 = _fp64_total(total_counts), counts = total_counts, opcodes,
-        unclassified, unclassified_opcodes, coverage = total == 0 ? 1.0 : 1 - unclassified / total,
-        blocks = length(blocks), loops = map(strip_, loops),
-        hot_loop = hot === nothing ? nothing : strip_(hot), hot_loop_confidence = confidence,
-        llvm_loops_agree = agree)
+    strip_(l) = MixLoop(l.header, l.depth, l.blocks, l.total, l.counts, l.exclusive_total, l.exclusive_counts)
+    return InstructionMix(vendor, total, _fp64_total(total_counts), total_counts, opcodes,
+        unclassified, unclassified_opcodes, total == 0 ? 1.0 : 1 - unclassified / total,
+        length(blocks), map(strip_, loops), hot === nothing ? nothing : strip_(hot), confidence, agree)
 end
 
 # LLVM asm-printer loop annotations vs the CFG loops: every annotated block must lie in the
@@ -543,7 +641,7 @@ function _llvm_loops_agree(blocks::Vector{MixBlock}, loops)
 end
 
 """
-    kernel_instruction_mix(backend, ck::CompiledKernel; target = nothing, dump = nothing) -> NamedTuple
+    kernel_instruction_mix(backend, ck::CompiledKernel; target = nothing, dump = nothing) -> KernelInstructionMix
 
 Static instruction mix of a compiled kernel (see [`compiled_kernels`](@ref)): the vendor
 disassembly of the kernel — the AMD ISA text of `code_native`, the SASS of CUDA.jl's bundled
@@ -585,8 +683,7 @@ function kernel_instruction_mix(backend::KA.Backend, ck::CompiledKernel; target 
     end
     mix = instruction_mix(code.text, code.vendor)
     irc = ir ? kernel_ir_mix(backend, ck; target = tgt) : nothing
-    return merge((; name = ck.name, signature = ck.signature, target = code.isa, native = code.native,
-        registers = code.registers), mix, (; ir = irc))
+    return KernelInstructionMix(ck.name, ck.signature, String(code.isa), code.native, code.registers, mix, irc)
 end
 
 """    backend_kernel_machine_code(backend, ck::CompiledKernel, target) -> NamedTuple
@@ -598,7 +695,7 @@ backend_kernel_machine_code(b::KA.Backend, ck::CompiledKernel, target) =
     throw(BackendUnsupported(b, :native_mix, :kernel_instruction_mix))
 
 """
-    fp64_issue_floor(mix; n_slots, peak_fp64_flops, kernel_time_s = nothing, scope = :hot_loop) -> NamedTuple
+    fp64_issue_floor(mix; n_slots, peak_fp64_flops, kernel_time_s = nothing, scope = :hot_loop) -> FP64IssueFloor
 
 The time the FP64 pipe alone needs for a launch, from a STATIC instruction count and a
 MEASURED issue rate: `fp64_per_slot` FP64 instructions (the six FP64 classes of `mix`'s
@@ -633,11 +730,9 @@ function fp64_issue_floor(mix; n_slots::Real, peak_fp64_flops::Real, kernel_time
     lane_rate = peak_fp64_flops / 2
     floor_s = fp64 * n_slots / lane_rate
     frac = kernel_time_s === nothing ? missing : floor_s / kernel_time_s
-    return (; scope, fp64_per_slot = fp64, n_slots = Float64(n_slots), fp64_lane_instructions = fp64 * Float64(n_slots),
-        peak_fp64_flops = Float64(peak_fp64_flops), floor_s, kernel_time_s = something(kernel_time_s, missing),
-        fp64_issue_fraction = frac,
-        confidence = scope === :hot_loop ? mix.hot_loop_confidence : :static_total,
-        assumptions = "every FP64 instruction issues at the FMA rate; static count = one pass through the loop, nested loops counted once; per-thread setup outside the loop not counted")
+    return FP64IssueFloor(scope, fp64, Float64(n_slots), fp64 * Float64(n_slots), Float64(peak_fp64_flops), floor_s,
+        something(kernel_time_s, missing), frac, scope === :hot_loop ? mix.hot_loop_confidence : :static_total,
+        "every FP64 instruction issues at the FMA rate; static count = one pass through the loop, nested loops counted once; per-thread setup outside the loop not counted")
 end
 
 # ── Typed LLVM-IR operation count (vendor-neutral cross-check) ──────────────────────────────
@@ -758,8 +853,7 @@ function kernel_ir_mix(backend::KA.Backend, ck::CompiledKernel; target = nothing
     _require(backend, :ir_mix, :kernel_ir_mix)
     r = backend_kernel_ir_counts(backend, ck, target === nothing ? nothing : String(target))
     counts = reduce(_add_ir, values(r.functions); init = _zero_ir())
-    return (; target = r.isa, total = sum(counts), fp64 = sum(counts[c] for c in IR_FP64_CLASSES), counts,
-        functions = r.functions)
+    return IRMix(String(r.isa), sum(counts), sum(counts[c] for c in IR_FP64_CLASSES), counts, r.functions)
 end
 """    backend_kernel_ir_counts(backend, ck::CompiledKernel, target) -> (; functions, isa)
 
