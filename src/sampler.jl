@@ -511,7 +511,7 @@ function gpu_telemetry_stats(t::GPUTelemetry; busy_column::Symbol = :compute_uti
         vb = Float64[x for (x, m) in zip(col, busy) if m && !isnan(x)]
         if !isempty(vb)
             out[String(c) * "_busy_mean"] = sum(vb) / length(vb)
-            out[String(c) * "_busy_median"] = _median!(vb)
+            out[String(c) * "_busy_median"] = Float64(Statistics.median(vb))
         end
     end
     if haskey(t, :power_W) && haskey(t, :power_limit_W)
@@ -524,10 +524,4 @@ function gpu_telemetry_stats(t::GPUTelemetry; busy_column::Symbol = :compute_uti
         n_ok == 0 || (out["power_capped_fraction"] = capped / n_ok)
     end
     return out
-end
-
-function _median!(v::Vector{Float64})
-    sort!(v)
-    n = length(v)
-    return isodd(n) ? v[(n + 1) ÷ 2] : (v[n ÷ 2] + v[n ÷ 2 + 1]) / 2
 end

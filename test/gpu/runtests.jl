@@ -109,9 +109,37 @@ end
         @info "instruction mix" native_total = m.total hot_loop = m.hot_loop.total confidence = m.hot_loop_confidence cross_total = mx.total unclassified = m.unclassified_opcodes
     end
 
+    @testset "probes: launch overhead, host snapshot, warm-up" begin
+        o = measure_launch_overhead(backend; n = 100)
+        @test o.device_s > 0 && o.enqueue_s > 0 && o.roundtrip_s ≥ o.device_s && o.queue_depth ≥ 1
+        h = host_snapshot(backend)
+        @test h.backend == string(nameof(typeof(backend))) && !ismissing(h.gpu_runtime) && !ismissing(h.gpu_package)
+        VENDOR == "cuda" && @test !ismissing(h.gpu_driver)
+        @test !ismissing(h.gpu_kernel_module)
+        @test !isempty(diagnostics_dict(h; prefix = "host_")["host_gpu_runtime"])
+        @info "probes" launch_overhead = sprint(show, o) host = sprint(show, h) versions = (h.gpu_driver, h.gpu_runtime, h.gpu_kernel_module, h.gpu_package)
+        timer = LaunchTimer()
+        lane = launch_lane(timer, backend)
+        for _ in 1:3
+            e0 = launch_tick(timer, backend)
+            gpudiag_probe_kernel!(backend, 256)(out, x, Int32(1000); ndrange = n)
+            launch_tock!(timer, lane, backend, e0)
+        end
+        @test length(launch_times(timer; skip_first = true)[gpu_device(backend)]) == 2 && first_launch_s(timer)[gpu_device(backend)] > 0
+        @test occursin("median_s", sprint(show, MIME"text/plain"(), timer))
+    end
+
     @testset "telemetry sampler" begin
         s = gpu_sample(backend)
         @test s.power_W > 0 && 0 ≤ s.compute_util ≤ 1 && s.vram_used_B > 0
+        # #3 columns: clocks, temperature, power limit, throttle bitmask (NaN where the vendor has none)
+        @test s.sm_clock_MHz > 0 && s.mem_clock_MHz > 0 && 0 < s.temperature_C < 120 && s.power_limit_W > 0
+        if VENDOR == "cuda"
+            @test isfinite(s.throttle_reasons) && isinteger(s.throttle_reasons) && throttle_reasons(s.throttle_reasons) isa Vector{Symbol}
+        else
+            @test isnan(s.throttle_reasons) && isfinite(s.hotspot_C)
+        end
+        @info "gpu_sample" sample = s decoded_throttle = throttle_reasons(s.throttle_reasons)
         # The child needs a few seconds to start (it loads CUDA.jl for NVML on NVIDIA), so the
         # workload must outlast that: launch until ~8 s of wall time have passed.
         result, telem = with_gpu_sampler(backend, 0.2; counters = :none) do
@@ -126,6 +154,11 @@ end
         @test telem.ticks ≥ 2 && !ismissing(telem.first_sample_s) && haskey(telem, :power_W)
         st = gpu_telemetry_stats(telem)
         @test st["samples"] == telem.ticks && haskey(st, "power_W_mean")
+        @test haskey(st, "sm_clock_MHz_busy_median") && haskey(st, "power_capped_fraction") && 0 ≤ st["power_capped_fraction"] ≤ 1
+        dd = diagnostics_dict(telem; prefix = "sampler_")
+        @test dd["sampler_ticks"] == telem.ticks && haskey(dd, "sampler_sm_clock_MHz_busy_median")
+        @test occursin("ticks", sprint(show, MIME"text/plain"(), telem))
+        @info "clocks" sm_clock_busy_median = st["sm_clock_MHz_busy_median"] power_capped_fraction = st["power_capped_fraction"] temperature_peak = get(st, "temperature_C_peak", NaN)
         @info "telemetry" ticks = telem.ticks first_sample_s = telem.first_sample_s power_W_mean = st["power_W_mean"] starved = telem.starved
     end
 end
