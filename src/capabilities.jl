@@ -21,7 +21,8 @@ subsystem of the package:
 | `:events` | `gpu_event`, `gpu_elapsed`, `LaunchTimer` |
 | `:telemetry` | `gpu_power`, `gpu_utilization`, `gpu_sample`, `gpu_sampler_sources`, `with_gpu_sampler` |
 | `:telemetry_counters` | hardware counters in the sample (NVIDIA GPM: achieved occupancy, pipe utilizations, …) |
-| `:fp64_peak` | `measure_peak_fp64_flops` (a device that computes in `Float64`) |
+| `:peak_flops` | `measure_peak_flops` (the FMA-chain probe runs on this backend) |
+| `:fp64` | the device computes in `Float64`: `measure_peak_flops(b, Float64)`, `fp64_issue_floor` |
 | `:kernel_inventory` | `compiled_kernels` |
 | `:resources` | `kernel_resources` (registers, spill/local and shared memory) |
 | `:occupancy` | the runtime occupancy calculator behind `kernel_resources` |
@@ -29,7 +30,7 @@ subsystem of the package:
 | `:ir_mix` | `kernel_ir_mix` |
 | `:hw_counters` | a hardware-counter collection path for this vendor (`rocprof_*` on AMD) |
 """
-const FEATURES = (:devices, :device_props, :events, :telemetry, :telemetry_counters, :fp64_peak,
+const FEATURES = (:devices, :device_props, :events, :telemetry, :telemetry_counters, :peak_flops, :fp64,
     :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix, :hw_counters)
 
 """
@@ -37,7 +38,7 @@ const FEATURES = (:devices, :device_props, :events, :telemetry, :telemetry_count
     supports(backend, ::Val{feature}) -> Bool
 
 Whether `backend` implements the subsystem `feature` (one of [`FEATURES`](@ref)). The default
-is `false`; the KA `CPU` backend declares `:devices`, `:events`, `:fp64_peak` and
+is `false`; the KA `CPU` backend declares `:devices`, `:events`, `:peak_flops`, `:fp64` and
 `:kernel_inventory` (an empty inventory), and each vendor extension declares what its runtime
 can answer. A backend extension adds a method per feature:
 
@@ -50,7 +51,8 @@ supports(backend::Backend, feature::Symbol) = supports(backend, Val(feature))
 
 supports(::KA.CPU, ::Val{:devices}) = true
 supports(::KA.CPU, ::Val{:events}) = true
-supports(::KA.CPU, ::Val{:fp64_peak}) = true
+supports(::KA.CPU, ::Val{:peak_flops}) = true
+supports(::KA.CPU, ::Val{:fp64}) = true
 supports(::KA.CPU, ::Val{:kernel_inventory}) = true
 
 """    capabilities(backend) -> Vector{Symbol}

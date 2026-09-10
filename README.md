@@ -73,16 +73,42 @@ averaged over the interval between two consecutive ticks. `counters = :none` ski
 `fp64_util` is normalised to the SM's full-rate issue slots: a saturated FP64 FMA chain reads ≈ 0.9
 on an H100 but only ≈ 1.5 % on a 1/64-rate consumer board.
 
-## Measured FP64 peak
+## Measured peak FLOP/s
 
 ```julia
-measure_peak_fp64_flops(backend)   # FLOP/s, dependent-FMA-chain kernel, best of 5
-gpu_peak_fp64_flops(backend)       # same; BLAS peakflops on the CPU backend
+measure_peak_flops(backend)            # FP64 FLOP/s, dependent-FMA-chain kernel, best of 5
+measure_peak_flops(backend, Float32)   # the FP32 rate of the same probe
 ```
 
-No per-architecture table: the probe measures the attainable vector FP64 rate at the clocks the device
+No per-architecture table: the probe measures the attainable vector rate at the clocks the device
 actually holds, and is never routed to matrix/tensor units (the wrong yardstick for scalar kernels).
-The result is checked against a host reference so a mis-launched kernel cannot be credited.
+The result is checked against a host reference so a mis-launched kernel cannot be credited. It runs on
+the CPU backend too, one scalar chain per work-item, which under-reports the host by its SIMD width;
+the vectorised host number is `LinearAlgebra.peakflops(2048; ntrials = 3)`, a different quantity.
+
+## Capabilities
+
+```julia
+capabilities(CUDABackend())        # [:devices, :device_props, :events, :telemetry, …]
+supports(backend, :native_mix)     # Bool; the CPU backend has :devices, :events, :peak_flops, :fp64, :kernel_inventory
+```
+
+Every entry point belongs to one feature of `FEATURES`; calling one the backend does not declare throws
+`BackendUnsupported`, whose message names the package to load when that is the reason. The conformance
+suite (`test/conformance.jl`) checks a backend against its declarations and runs on the CPU backend in
+the regular tests.
+
+### Porting a backend
+
+An extension declares its features with `GPUDiagnostics.supports(::MyBackend, ::Val{:feature}) = true`
+and implements the hooks behind them. `:devices` / `:device_props` / `:telemetry` are the `gpu_*`
+generics of the device API plus `gpu_sampler_sources` (and a `sampler_source(::Val{kind}, …)` for a new
+source kind); `:events` is `gpu_event` / `gpu_elapsed`; `:kernel_inventory` is `backend_compiled_kernels`
+(with `backend_wrap_kernel` if the kernel type is shaped differently); `:resources` / `:occupancy` are
+`backend_kernel_attributes` / `backend_kernel_occupancy` (+ optional `backend_kernel_isa_info`);
+`:native_mix` is `backend_kernel_machine_code`; `:ir_mix` is `backend_kernel_ir_counts`, the one hook
+every GPU backend should have (a GPUCompiler job over LLVM IR). The `backend_*` names are public API,
+documented in their docstrings, not exported.
 
 ## Compile-time resource report
 
@@ -113,7 +139,7 @@ m.counts.fp64_fma, m.counts.fp64_add, m.counts.fp64_mul         # whole binary, 
 m.hot_loop.counts, m.hot_loop_confidence                        # the per-slot loop: one pass, nested loops once
 m942 = kernel_instruction_mix(backend, only(cks); target = "gfx942")   # the MI300X code, without an MI300X
 m90 = kernel_instruction_mix(backend, only(cks); target = "sm_90")     # the H100 code, from any CUDA context
-fp64_issue_floor(m; n_slots = n_work_items * n_iterations_per_item, peak_fp64_flops = measure_peak_fp64_flops(backend),
+fp64_issue_floor(m; n_slots = n_work_items * n_iterations_per_item, peak_fp64_flops = measure_peak_flops(backend),
     kernel_time_s = median_launch_s)                            # FP64-pipe time floor and fraction
 ```
 
@@ -132,7 +158,7 @@ that ptxas pads an sm_120 hot loop with NOPs where the sm_90 loop has none). Sta
 code, not execution; against Nsight Compute on an RTX 5090 the hot-loop DFMA / DADD+DMUL counts of
 an FP64 Newton-iteration kernel reproduced the measured per-slot warp-instruction counts exactly.
 `fp64_issue_floor` divides a per-slot FP64 count × executed slots by the
-measured FP64 lane-instruction rate (`measure_peak_fp64_flops` / 2 — an FMA is 2 FLOP): the time the
+measured FP64 lane-instruction rate (`measure_peak_flops` / 2 — an FMA is 2 FLOP): the time the
 FP64 pipe alone needs per launch, assuming every FP64 instruction issues at the FMA rate.
 
 The classifiers are ordered rule tables, `SASS_RULES` / `AMD_RULES :: Vector{Pair{Regex, Symbol}}`,

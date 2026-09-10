@@ -91,12 +91,18 @@ function conformance(backend; kernel = nothing, peak_threads = 2^12)
             has(:telemetry_counters) && @test has(:telemetry)   # counters ride in the sample
         end
 
-        @testset ":fp64_peak" begin
-            if has(:fp64_peak)
-                p = measure_peak_fp64_flops(backend; n_threads = peak_threads, trials = 1, target_seconds = 0.01)
+        @testset ":peak_flops / :fp64" begin
+            if has(:peak_flops)
+                p = measure_peak_flops(backend, Float32; n_threads = peak_threads, trials = 1, target_seconds = 0.01)
                 @test p isa Float64 && p > 0
+                if has(:fp64)
+                    p64 = measure_peak_flops(backend, Float64; n_threads = peak_threads, trials = 1, target_seconds = 0.01)
+                    @test p64 isa Float64 && p64 > 0
+                else
+                    @test_throws BackendUnsupported measure_peak_flops(backend, Float64)
+                end
             else
-                @test_throws BackendUnsupported measure_peak_fp64_flops(backend)
+                @test_throws BackendUnsupported measure_peak_flops(backend)
             end
         end
 

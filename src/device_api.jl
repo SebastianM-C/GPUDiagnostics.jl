@@ -59,14 +59,6 @@ Architecture tag of the current device: the compute capability (`"9.0"`) on NVID
 gfx name without feature suffixes (`"gfx942"`) on AMD. Provenance only."""
 function gpu_arch end
 
-"""    gpu_peak_fp64_flops(backend) -> Float64
-
-Attainable vector (non-matrix/tensor) FP64 peak of the current device in FLOP/s, MEASURED on
-the device with the dependent-FMA-chain probe of [`measure_peak_fp64_flops`](@ref) (any
-KernelAbstractions backend, no per-architecture table) — or, on the CPU backend, BLAS
-`LinearAlgebra.peakflops`. The denominator of a percent-of-peak figure for scalar FP64 kernels;
-the matrix/tensor peak would be the wrong yardstick. Costs ~1.5 s of device time per call."""
-gpu_peak_fp64_flops(backend::KA.Backend) = measure_peak_fp64_flops(backend)
 
 # Fallbacks: a backend that does not declare the feature (no vendor extension loaded, or a
 # vendor that cannot answer) → `BackendUnsupported`. The extensions add more-specific methods
@@ -86,9 +78,6 @@ gpu_device(::KA.CPU) = 1
 gpu_device!(::KA.CPU, ::Integer) = 1
 gpu_name(::KA.CPU) = "CPU"
 gpu_arch(::KA.CPU) = "cpu"
-# Host: the SIMD gemm peak over all BLAS threads (best of 3) — what vectorised FP64 code can
-# attain; a per-workitem scalar FMA chain would under-report the host by the SIMD width.
-gpu_peak_fp64_flops(::KA.CPU) = LinearAlgebra.peakflops(2048; ntrials = 3)
 
 # ── Device-event kernel timing ──────────────────────────────────────────────────────────────
 #

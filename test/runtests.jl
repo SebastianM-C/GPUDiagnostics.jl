@@ -1,6 +1,6 @@
 using GPUDiagnostics
 using GPUDiagnostics: _fma_chain_reference, _fma_chain_kernel!, _PEAK_CHAINS
-using GPUDiagnostics: _static_workgroup_size, _parse_amdgpu_kernel_info, _compiled_kernel, _parse_ptxas_verbose
+using GPUDiagnostics: _static_workgroup_size, _parse_amdgpu_kernel_info, backend_wrap_kernel, _parse_ptxas_verbose
 using GPUDiagnostics: _classify, _parse_machine_code, _natural_loops, FP64_CLASSES, _ir_counts, IR_FP64_CLASSES
 import KernelAbstractions as KA
 using KernelAbstractions: CPU, Backend
@@ -53,7 +53,7 @@ end
 
     @testset "capabilities: trait, BackendUnsupported, conformance" begin
         @test FEATURES isa Tuple && allunique(FEATURES) && all(f -> f isa Symbol, FEATURES)
-        @test capabilities(CPU()) == [:devices, :events, :fp64_peak, :kernel_inventory]
+        @test capabilities(CPU()) == [:devices, :events, :peak_flops, :fp64, :kernel_inventory]
         @test isempty(capabilities(NoVendorBackend()))
         @test supports(CPU(), :events) && !supports(CPU(), :telemetry) && !supports(CPU(), :no_such_feature)
         e = try gpu_power(CPU()); catch err; err; end
@@ -249,11 +249,19 @@ end
         _fma_chain_kernel!(CPU(), 16)(out, seed, Int32(1000); ndrange = n)
         @test all(i -> isapprox(out[i], _fma_chain_reference(seed[i], 1000); rtol = 1.0e-12), 1:n)
         @test _PEAK_CHAINS == 8
-        p = measure_peak_fp64_flops(CPU(); n_threads = 4096, trials = 2, target_seconds = 0.02)
+        p = measure_peak_flops(CPU(); n_threads = 4096, trials = 2, target_seconds = 0.02)
+        p32 = measure_peak_flops(CPU(), Float32; n_threads = 4096, trials = 2, target_seconds = 0.02)
+        @test p32 isa Float64 && p32 > 0
+        out32 = zeros(Float32, n); seed32 = Float32.(0:(n - 1))
+        _fma_chain_kernel!(CPU(), 16)(out32, seed32, Int32(1000); ndrange = n)
+        @test all(i -> isapprox(out32[i], _fma_chain_reference(seed32[i], 1000); rtol = 1.0e-5), 1:n)
+        # a backend without :fp64 can still probe Float32
+        struct NoFP64Backend <: Backend end
+        GPUDiagnostics.supports(::NoFP64Backend, ::Val{:peak_flops}) = true
+        e64 = try measure_peak_flops(NoFP64Backend()); catch err; err; end
+        @test e64 isa BackendUnsupported && e64.feature == :fp64
         @test isfinite(p) && p > 1.0e7
-        @test_throws ArgumentError measure_peak_fp64_flops(CPU(); trials = 0)
-        h = gpu_peak_fp64_flops(CPU())
-        @test isfinite(h) && h > 1.0e8
+        @test_throws ArgumentError measure_peak_flops(CPU(); trials = 0)
     end
 
     @testset "compile-time resource report" begin
@@ -280,7 +288,7 @@ end
         end
         closure = let x = 1; i -> x + i; end
         fk = FakeKernel{typeof(closure), Tuple{ctx(KA.NDIteration.StaticSize{(128,)}), typeof(closure), Int}}(closure)
-        ck = _compiled_kernel(fk)
+        ck = backend_wrap_kernel(fk)
         @test ck isa CompiledKernel && ck.workgroup_size == 128 && ck.kernel === fk
         @test ck.name == string(nameof(typeof(closure)))
         @test occursin("StaticSize{(128,)}", ck.signature)
@@ -350,12 +358,12 @@ end
         for f in (:kernel_inventory, :resources, :occupancy)
             @eval GPUDiagnostics.supports(::FakeGPU, ::Val{$(QuoteNode(f))}) = true
         end
-        GPUDiagnostics._compiled_kernels(::FakeGPU) = [ck]
-        GPUDiagnostics._kernel_attributes(::FakeGPU, k::FakeKernel) =
+        GPUDiagnostics.backend_compiled_kernels(::FakeGPU) = [ck]
+        GPUDiagnostics.backend_kernel_attributes(::FakeGPU, k::FakeKernel) =
             (; registers = 123, local_mem_bytes = 584, shared_mem_bytes = 65536, const_mem_bytes = -1, max_threads_per_block = 1024)
-        GPUDiagnostics._kernel_occupancy(::FakeGPU, k::FakeKernel, block_size::Int) =
+        GPUDiagnostics.backend_kernel_occupancy(::FakeGPU, k::FakeKernel, block_size::Int) =
             (; active_blocks_per_sm = min(65536 ÷ 65536, 2048 ÷ block_size), warp_size = 32, max_threads_per_sm = 2048, shared_mem_per_sm = 65536)
-        GPUDiagnostics._kernel_isa_info(::FakeGPU, c::CompiledKernel{<:FakeKernel}) = Dict{String, Any}("vgpr_count" => 123)
+        GPUDiagnostics.backend_kernel_isa_info(::FakeGPU, c::CompiledKernel{<:FakeKernel}) = Dict{String, Any}("vgpr_count" => 123)
         @test length(compiled_kernels(FakeGPU())) == 1
         @test length(compiled_kernels(FakeGPU(); pattern = "StaticSize")) == 1
         @test isempty(compiled_kernels(FakeGPU(); pattern = r"no such kernel"))
@@ -599,10 +607,10 @@ end
         struct FakeMixGPU <: Backend end
         GPUDiagnostics.supports(::FakeMixGPU, ::Val{:native_mix}) = true
         GPUDiagnostics.supports(::FakeMixGPU, ::Val{:ir_mix}) = true
-        GPUDiagnostics._kernel_machine_code(::FakeMixGPU, c::CompiledKernel, target) = target === nothing ?
+        GPUDiagnostics.backend_kernel_machine_code(::FakeMixGPU, c::CompiledKernel, target) = target === nothing ?
             (; text = amd, vendor = :amd, isa = "gfx1100", native = true, registers = 10) :
             (; text = sass, vendor = :nvidia, isa = String(target), native = false, registers = 124)
-        GPUDiagnostics._kernel_ir_counts(::FakeMixGPU, c::CompiledKernel, target) =
+        GPUDiagnostics.backend_kernel_ir_counts(::FakeMixGPU, c::CompiledKernel, target) =
             (; functions = Dict("k" => GPUDiagnostics.IRCounts(ntuple(i -> i, length(IR_CLASSES)))), isa = something(target, "gfx1100"))
         km = kernel_instruction_mix(FakeMixGPU(), ck)
         @test km.name == ck.name && km.signature == ck.signature && km.target == "gfx1100" && km.native && km.registers == 10

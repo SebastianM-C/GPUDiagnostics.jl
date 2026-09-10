@@ -49,14 +49,18 @@ its driver: `compiled_kernels(backend; pattern = r"_my_driver!")`. The CPU backe
 nothing and returns an empty vector. Pass entries to [`kernel_resources`](@ref)."""
 function compiled_kernels(backend::KA.Backend; pattern::Union{Regex, AbstractString, Nothing} = nothing)
     _require(backend, :kernel_inventory, :compiled_kernels)
-    ks = _compiled_kernels(backend)
+    ks = backend_compiled_kernels(backend)
     pattern === nothing && return ks
     return filter(k -> occursin(pattern, k.name) || occursin(pattern, k.signature), ks)
 end
 
-# Vendor hook: the raw inventory (ext/ supplies the CUDA/AMDGPU methods).
-_compiled_kernels(::KA.CPU) = CompiledKernel[]
-_compiled_kernels(b::KA.Backend) = throw(BackendUnsupported(b, :kernel_inventory, :compiled_kernels))
+"""    backend_compiled_kernels(backend) -> Vector{CompiledKernel}
+
+Backend hook (`:kernel_inventory`): every kernel this process has compiled for `backend`, from
+the vendor's kernel-instance cache, each wrapped with [`backend_wrap_kernel`](@ref).
+[`compiled_kernels`](@ref) filters over it."""
+backend_compiled_kernels(::KA.CPU) = CompiledKernel[]
+backend_compiled_kernels(b::KA.Backend) = throw(BackendUnsupported(b, :kernel_inventory, :compiled_kernels))
 
 """
     kernel_resources(backend, ck::CompiledKernel; block_size = something(ck.workgroup_size, 256))
@@ -107,9 +111,9 @@ function kernel_resources(backend::KA.Backend, ck::CompiledKernel;
         block_size::Integer = something(ck.workgroup_size, 256))
     _require(backend, :resources, :kernel_resources)
     block_size > 0 || throw(ArgumentError("kernel_resources: block_size must be > 0 (got $block_size)"))
-    attrs = _kernel_attributes(backend, ck.kernel)          # registers, local/shared/const bytes, max threads
-    occ = _kernel_occupancy(backend, ck.kernel, Int(block_size))   # active blocks/SM + device capacities
-    isa = _kernel_isa_info(backend, ck)                     # vendor extras (may be empty)
+    attrs = backend_kernel_attributes(backend, ck.kernel)          # registers, local/shared/const bytes, max threads
+    occ = backend_kernel_occupancy(backend, ck.kernel, Int(block_size))   # active blocks/SM + device capacities
+    isa = backend_kernel_isa_info(backend, ck)                     # vendor extras (may be empty)
     warps_per_block = cld(Int(block_size), occ.warp_size)
     max_warps = occ.max_threads_per_sm ÷ occ.warp_size
     active_warps = occ.active_blocks_per_sm * warps_per_block
@@ -128,18 +132,34 @@ end
 kernel_resources(backend::KA.Backend, pattern::Union{Regex, AbstractString}; kwargs...) =
     [kernel_resources(backend, ck; kwargs...) for ck in compiled_kernels(backend; pattern)]
 
-# Vendor hooks (ext/): attributes of a compiled kernel object, the runtime's occupancy
-# calculator + the device capacities it is measured against, and the optional ISA figures.
-# `::Any` kernel objects: the vendor types are only known inside the extensions.
-function _kernel_attributes end
-function _kernel_occupancy end
-_kernel_isa_info(::KA.Backend, ck::CompiledKernel) = Dict{String, Any}()
+"""    backend_kernel_attributes(backend, kernel) -> NamedTuple
+
+Backend hook (`:resources`): what the compiler gave the vendor `kernel` object, as
+`(; registers, local_mem_bytes, shared_mem_bytes, const_mem_bytes, max_threads_per_block)` —
+a field the runtime cannot report is `missing`."""
+function backend_kernel_attributes end
+
+"""    backend_kernel_occupancy(backend, kernel, block_size) -> NamedTuple
+
+Backend hook (`:occupancy`): the runtime's occupancy calculator for `kernel` at `block_size`
+and the device capacities it is measured against, as `(; active_blocks_per_sm, warp_size,
+max_threads_per_sm, shared_mem_per_sm)`."""
+function backend_kernel_occupancy end
+
+"""    backend_kernel_isa_info(backend, ck::CompiledKernel) -> Dict{String, Any}
+
+Backend hook (optional): vendor extras for the resource report — SGPR/VGPR/spill counts from
+the AMD ISA dump, `ptxas` figures on NVIDIA. Default: empty."""
+backend_kernel_isa_info(::KA.Backend, ck::CompiledKernel) = Dict{String, Any}()
 
 # ── Pure helpers (vendor-neutral, tested on the CPU) ────────────────────────────────────────
 
-# Build a CompiledKernel from a vendor kernel object of type `K{F, TT}` (both vendors
-# parametrize their kernel struct by the Julia function type and the argument tuple type).
-function _compiled_kernel(kernel)
+"""    backend_wrap_kernel(kernel) -> CompiledKernel
+
+Build a [`CompiledKernel`](@ref) from a vendor kernel object of type `K{F, TT}` (both CUDA.jl
+and AMDGPU.jl parametrize their kernel struct by the Julia function type and the argument
+tuple type). A backend whose kernel type is shaped differently adds its own method."""
+function backend_wrap_kernel(kernel)
     F, TT = typeof(kernel).parameters[1], typeof(kernel).parameters[2]
     return CompiledKernel(string(nameof(F)), string(TT), _static_workgroup_size(TT), kernel)
 end
