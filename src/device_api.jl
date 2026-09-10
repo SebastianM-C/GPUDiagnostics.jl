@@ -68,22 +68,17 @@ KernelAbstractions backend, no per-architecture table) — or, on the CPU backen
 the matrix/tensor peak would be the wrong yardstick. Costs ~1.5 s of device time per call."""
 gpu_peak_fp64_flops(backend::KA.Backend) = measure_peak_fp64_flops(backend)
 
-# Fallbacks: a KA Backend with no vendor extension loaded → a clear "load the package" error.
-# The extensions add more-specific methods (e.g. ::CUDABackend) that win over these.
-for f in (
-        :gpu_device_count, :gpu_device, :gpu_name, :gpu_power, :gpu_utilization,
-        :gpu_memory_info, :gpu_sm_count, :gpu_max_threads_per_sm, :gpu_arch,
+# Fallbacks: a backend that does not declare the feature (no vendor extension loaded, or a
+# vendor that cannot answer) → `BackendUnsupported`. The extensions add more-specific methods
+# (e.g. ::CUDABackend) that win over these.
+for (f, feature) in (
+        :gpu_device_count => :devices, :gpu_device => :devices, :gpu_name => :devices, :gpu_arch => :devices,
+        :gpu_power => :telemetry, :gpu_utilization => :telemetry,
+        :gpu_memory_info => :device_props, :gpu_sm_count => :device_props, :gpu_max_threads_per_sm => :device_props,
     )
-    @eval function $f(b::KA.Backend)
-        error(
-            $(string(f)), ": no GPU vendor extension loaded for ", typeof(b),
-            " — load CUDA.jl or AMDGPU.jl"
-        )
-    end
+    @eval $f(b::KA.Backend) = throw(BackendUnsupported(b, $(QuoteNode(feature)), $(QuoteNode(f))))
 end
-gpu_device!(b::KA.Backend, ::Integer) = error(
-    "gpu_device!: no GPU vendor extension loaded for ", typeof(b), " — load CUDA.jl or AMDGPU.jl"
-)
+gpu_device!(b::KA.Backend, ::Integer) = throw(BackendUnsupported(b, :devices, :gpu_device!))
 # The KA CPU backend is one "device": lets multi-device sharding drivers (and their tests) run
 # on the CPU path — e.g. `devices = [1, 1]` shards work over two tasks on the same backend.
 gpu_device_count(::KA.CPU) = 1
@@ -120,9 +115,7 @@ function gpu_elapsed end
 
 gpu_event(::KA.CPU) = time_ns()
 gpu_elapsed(start::UInt64, stop::UInt64) = (stop - start) / 1.0e9
-gpu_event(b::KA.Backend) = error(
-    "gpu_event: no GPU vendor extension loaded for ", typeof(b), " — load CUDA.jl or AMDGPU.jl"
-)
+gpu_event(b::KA.Backend) = throw(BackendUnsupported(b, :events, :gpu_event))
 
 """
     LaunchTimer()

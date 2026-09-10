@@ -574,6 +574,7 @@ turning the former into time.
 """
 function kernel_instruction_mix(backend::KA.Backend, ck::CompiledKernel; target = nothing, dump = nothing,
         ir::Bool = true)
+    _require(backend, :native_mix, :kernel_instruction_mix)
     tgt = target === nothing ? nothing : String(target)
     code = _kernel_machine_code(backend, ck, tgt)
     if dump isa IO
@@ -586,15 +587,11 @@ function kernel_instruction_mix(backend::KA.Backend, ck::CompiledKernel; target 
     return merge((; name = ck.name, signature = ck.signature, target = code.isa, native = code.native,
         registers = code.registers), mix, (; ir = irc))
 end
-kernel_instruction_mix(::KA.CPU, ck::CompiledKernel; kwargs...) = error(
-    "kernel_instruction_mix: the CPU backend compiles no GPU kernels"
-)
 
 # Vendor hook (ext/): the disassembly of `ck` for `target` (nothing = the current device), as
 # `(; text, vendor::Symbol, isa::String, native::Bool, registers::Union{Int, Nothing})`.
-_kernel_machine_code(b::KA.Backend, ck::CompiledKernel, target) = error(
-    "kernel_instruction_mix: no GPU vendor extension loaded for ", typeof(b), " — load CUDA.jl or AMDGPU.jl"
-)
+_kernel_machine_code(b::KA.Backend, ck::CompiledKernel, target) =
+    throw(BackendUnsupported(b, :native_mix, :kernel_instruction_mix))
 
 """
     fp64_issue_floor(mix; n_slots, peak_fp64_flops, kernel_time_s = nothing, scope = :hot_loop) -> NamedTuple
@@ -752,12 +749,11 @@ still has out-of-line callees) and `target`. Whole-module totals: IR loops are n
 (the machine-code hot loop is the per-slot figure; the IR is for the fusion/expansion ratio).
 """
 function kernel_ir_mix(backend::KA.Backend, ck::CompiledKernel; target = nothing)
+    _require(backend, :ir_mix, :kernel_ir_mix)
     r = _kernel_ir_counts(backend, ck, target === nothing ? nothing : String(target))
     counts = reduce(_add_ir, values(r.functions); init = _zero_ir())
     return (; target = r.isa, total = sum(counts), fp64 = sum(counts[c] for c in IR_FP64_CLASSES), counts,
         functions = r.functions)
 end
-kernel_ir_mix(::KA.CPU, ck::CompiledKernel; kwargs...) = error("kernel_ir_mix: the CPU backend compiles no GPU kernels")
-_kernel_ir_counts(b::KA.Backend, ck::CompiledKernel, target) = error(
-    "kernel_ir_mix: no GPU vendor extension loaded for ", typeof(b), " — load CUDA.jl or AMDGPU.jl"
-)
+_kernel_ir_counts(b::KA.Backend, ck::CompiledKernel, target) =
+    throw(BackendUnsupported(b, :ir_mix, :kernel_ir_mix))
