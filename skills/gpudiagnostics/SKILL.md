@@ -5,21 +5,31 @@ description: Use GPUDiagnostics.jl to answer "why is this KernelAbstractions ker
 
 # GPUDiagnostics.jl — decision guide
 
-Docs: https://SebastianM-C.github.io/GPUDiagnostics.jl/ (each page linked below). Everything
-dispatches on the KernelAbstractions `Backend`; load CUDA.jl or AMDGPU.jl for the vendor methods.
+**Read the docs as files, not URLs.** The documentation sources ship inside the installed package, so
+read them verbatim instead of fetching the site (a URL fetch returns a lossy summary):
+
+```
+julia -e 'using GPUDiagnostics; println(pkgdir(GPUDiagnostics))'   # then read <pkgdir>/docs/src/<page>.md
+```
+
+Pages (`docs/src/`): `capabilities.md`, `device_timing.md`, `telemetry.md`, `peaks_probes.md`,
+`resources_mix.md`, `hw_counters.md`, `report.md`, `porting.md`, `caveats.md`; the docstrings are in
+`src/*.jl` and the hardware suite in `test/gpu/runtests.jl`. The rendered site
+(https://sebastianm-c.github.io/GPUDiagnostics.jl/dev/) is for humans. Everything dispatches on the
+KernelAbstractions `Backend`; load CUDA.jl or AMDGPU.jl for the vendor methods.
 
 ## Symptom → instrument
 
-| you see | reach for | read |
+| you see | reach for | read (`docs/src/`) |
 |---|---|---|
-| Many small launches; wall time ≫ kernel time | `measure_launch_overhead(backend)` for the per-launch floor; `LaunchTimer` medians vs `first_launch_s` | probes, kernel timing |
-| Kernel slower than its FLOP count predicts | `fp64_issue_floor(mix; n_slots, peak_fp64_flops = measure_peak_flops(backend), kernel_time_s)` — the fraction of the launch the FP64 pipe must be issuing; then GPM `fp64_util` from the sampler on NVIDIA | instruction mix, telemetry |
-| Adding work stops scaling | `kernel_resources` (theoretical occupancy) against sampler `sm_occupancy_busy_mean` (achieved); `power_capped_fraction` and `sm_clock_MHz_busy_median` — a power-bound kernel gains per cycle, not per second | resource report, telemetry |
-| Results differ bitwise across vendors or compile options | `kernel_ir_mix` `fp64_contract` vs the native `fp64_fma` count: backend FMA contraction | instruction mix, caveats |
-| "Will it fit / how will it run on the MI300X / H100 I have not rented" | `kernel_instruction_mix(backend, ck; target = "gfx942")` / `"sm_90"` cross-compiles the same kernel from any device of the vendor | instruction mix |
-| Run was slow on a rented box, GPU numbers look fine | `host_snapshot(backend)`: Julia threads vs the cgroup CPU quota, BLAS threads, driver / runtime versions; `warnings` is data | probes |
-| Need per-dispatch hardware counters on AMD | `rocprof_command` wraps the process, `rocprof_counters(dir)` parses, `rocprof_derived` normalises (cycles = `GRBM_GUI_ACTIVE / n_xcd`) | hardware counters |
-| Need the results in a manifest / table | `diagnostics_dict(x; prefix)` per result; `GPUTelemetry` is a Tables.jl table | report layer |
+| Many small launches; wall time ≫ kernel time | `measure_launch_overhead(backend)` for the per-launch floor; `LaunchTimer` medians vs `first_launch_s` | `peaks_probes.md`, `device_timing.md` |
+| Kernel slower than its FLOP count predicts | `fp64_issue_floor(mix; n_slots, peak_fp64_flops = measure_peak_flops(backend), kernel_time_s)` — the fraction of the launch the FP64 pipe must be issuing; then GPM `fp64_util` from the sampler on NVIDIA | `resources_mix.md`, `telemetry.md` |
+| Adding work stops scaling | `kernel_resources` (theoretical occupancy) against sampler `sm_occupancy_busy_mean` (achieved); `power_capped_fraction` and `sm_clock_MHz_busy_median` — a power-bound kernel gains per cycle, not per second | `resources_mix.md`, `telemetry.md` |
+| Results differ bitwise across vendors or compile options | `kernel_ir_mix` `fp64_contract` vs the native `fp64_fma` count: backend FMA contraction | `resources_mix.md`, `caveats.md` |
+| "Will it fit / how will it run on the MI300X / H100 I have not rented" | `kernel_instruction_mix(backend, ck; target = "gfx942")` / `"sm_90"` cross-compiles the same kernel from any device of the vendor | `resources_mix.md` |
+| Run was slow on a rented box, GPU numbers look fine | `host_snapshot(backend)`: Julia threads vs the cgroup CPU quota, BLAS threads, driver / runtime versions; `warnings` is data | `peaks_probes.md` |
+| Need per-dispatch hardware counters on AMD | `rocprof_command` wraps the process, `rocprof_counters(dir)` parses, `rocprof_derived` normalises (cycles = `GRBM_GUI_ACTIVE / n_xcd`) | `hw_counters.md` |
+| Need the results in a manifest / table | `diagnostics_dict(x; prefix)` per result; `GPUTelemetry` is a Tables.jl table | `report.md` |
 
 ## Rules an agent gets wrong without being told
 
