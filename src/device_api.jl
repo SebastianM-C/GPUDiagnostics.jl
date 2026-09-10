@@ -158,11 +158,20 @@ launch_lane(::LaunchTimer, backend) = Int(gpu_device(backend))
 
 Per-device kernel seconds, one entry per launch in launch order. Waits on each launch's stop
 event, so it is safe to call as soon as the loop has returned."""
-function launch_times(t::LaunchTimer)
-    return Dict{Int, Vector{Float64}}(
+function launch_times(t::LaunchTimer; skip_first::Bool = false)
+    lt = Dict{Int, Vector{Float64}}(
         d => Float64[gpu_elapsed(a, b) for (a, b) in pairs] for (d, pairs) in t.lanes
     )
+    skip_first && foreach(v -> popfirst!(v), values(lt))
+    return lt
 end
+
+"""    first_launch_s(timer) -> Dict{Int, Float64}
+
+Device time of the FIRST launch on each device — the one that carries the JIT compile when the
+kernel was not compiled before the loop. `launch_times(timer; skip_first = true)` drops it, so
+the steady-state statistics are not dragged by the warm-up."""
+first_launch_s(t::LaunchTimer) = Dict{Int, Float64}(d => gpu_elapsed(first(pairs)...) for (d, pairs) in t.lanes if !isempty(pairs))
 
 """
     thread_fill_occupancy(backend, n_threads) -> Float64 | missing

@@ -185,6 +185,21 @@ Gotchas: CUDA.jl's `code_sass` loads the module on the current device (via CUPTI
 AMDGPU.jl caches the OCLC ISA-version device library under an ISA-agnostic key; the extension evicts
 it around a cross-compile so gfx942 links `oclc_isa_version_942`, not the current device's.
 
+## Cheap probes: launch overhead, host environment, warm-up
+
+```julia
+measure_launch_overhead(backend)   # LaunchOverhead: device / enqueue / round-trip µs per launch, queue depth
+host_snapshot(backend)             # Julia + BLAS threads vs host cores AND the cgroup quota, memory limits,
+                                   # OS kernel, driver / runtime / vendor package versions, warnings as data
+first_launch_s(timer)              # the JIT-carrying first launch per device; launch_times(timer; skip_first = true)
+```
+
+The launch probe sets the floor below which launches dominate (it differs by an order of magnitude
+between drivers, and between a VM and bare metal). The host snapshot is the first section of any
+report: two manifests written months apart compare only if they say what they ran on, and the
+"pod sees the node's cores while the cgroup grants a fraction" trap is invisible in every device
+counter.
+
 ## Report layer: manifests and readable summaries
 
 ```julia
