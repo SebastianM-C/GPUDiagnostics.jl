@@ -17,8 +17,9 @@ end
     LaunchOverhead
 
 Result of [`measure_launch_overhead`](@ref), all medians over `n` launches of a one-instruction
-kernel, in seconds: `device_s` (device-event time per launch — the smallest kernel the device
-can run), `enqueue_s` (host time to enqueue one asynchronous launch), `roundtrip_s` (host time
+kernel, in seconds: `device_s` (device-event time per launch: the smallest kernel the device
+can run PLUS the cost of the event pair itself, a few µs, so for an empty kernel it is an upper
+bound and may exceed `roundtrip_s`), `enqueue_s` (host time to enqueue one asynchronous launch), `roundtrip_s` (host time
 of one launch followed by a synchronize — the cost of a per-launch sync). `queue_depth` is
 `roundtrip_s / enqueue_s`: how many launches the host can queue in the time one takes to
 complete, i.e. how far a launch loop can run ahead before it stalls.
@@ -194,6 +195,8 @@ function host_snapshot(backend::Union{Nothing, Backend} = nothing)
     blas = try Int(LinearAlgebra.BLAS.get_num_threads()) catch; missing end
     quota = _cgroup_cpu_quota()
     vv = backend === nothing ? (;) : backend_versions(backend)
+    # The nvidia module exposes its version in sysfs; the in-tree amdgpu module does not (its
+    # version is the kernel's, recorded in `kernel`).
     modver = backend === nothing ? missing :
         something(_module_version("nvidia"), _module_version("amdgpu"), missing)
     pkgs = Dict{String, String}("GPUDiagnostics" => string(pkgversion(@__MODULE__)),

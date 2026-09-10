@@ -41,15 +41,33 @@ per-device tasks (pushes are locked; events are per-stream).
 ## Telemetry: one sample, one child, one table
 
 ```julia
-gpu_sample(backend, 1)              # NamedTuple: power_W, compute_util, mem_util, vram_used_B (+ GPM counters on NVIDIA)
+gpu_sample(backend, 1)              # NamedTuple: the base columns below (+ GPM counters on NVIDIA)
 
 result, telem = with_gpu_sampler(backend, 1.0; devices = 1:2, tracefile = "gputrace.tsv") do
     run_the_workload()
 end
-telem.columns                       # [:t_rel_s, :device, :power_W, :compute_util, :mem_util, :vram_used_B, (:sm_util, :sm_occupancy, :fp64_util, …)]
+telem.columns                       # [:t_rel_s, :device, base columns…, (:sm_util, :sm_occupancy, :fp64_util, …)]
 telem[:compute_util]                # a column; length(telem) rows over all devices
-gpu_telemetry_stats(telem)          # "<col>_mean" / "_peak" / "_busy_mean" (rows with compute_util ≥ 0.5), "samples", "busy_samples"
+gpu_telemetry_stats(telem)          # "<col>_mean" / "_peak" / "_busy_mean" / "_busy_median" (rows with compute_util ≥ 0.5),
+                                    # "samples", "busy_samples", "power_capped_fraction" (busy rows at power_W ≥ 0.95 × power_limit_W)
+throttle_reasons(telem[:throttle_reasons][end])   # e.g. [:sw_power_cap, :sw_thermal_slowdown]
 ```
+
+Base columns, every source, `NaN` where the vendor or device has none:
+
+| column | unit | AMD (amdgpu sysfs) | NVIDIA (NVML) |
+|---|---|---|---|
+| `power_W` | W | hwmon `power1_average` / `power1_input` | `nvmlDeviceGetPowerUsage` |
+| `compute_util`, `mem_util` | fraction | `gpu_busy_percent`, `mem_busy_percent` | `nvmlDeviceGetUtilizationRates` |
+| `vram_used_B` | B | `mem_info_vram_used` | `nvmlDeviceGetMemoryInfo` |
+| `sm_clock_MHz`, `mem_clock_MHz` | MHz | hwmon `freq1_input`, `freq2_input` | `nvmlDeviceGetClockInfo` (SM, MEM) |
+| `temperature_C` | °C | hwmon `temp1_input` (edge) | `nvmlDeviceGetTemperature` (GPU) |
+| `hotspot_C` | °C | hwmon `temp2_input` (junction) | `NaN` (no NVML junction sensor) |
+| `power_limit_W` | W | hwmon `power1_cap` | `nvmlDeviceGetEnforcedPowerLimit` |
+| `throttle_reasons` | bitmask | `NaN` (the `gpu_metrics` blob is not decoded yet) | `nvmlDeviceGetCurrentClocksEventReasons` |
+
+`throttle_reasons(x)` decodes the bitmask into NVML's names (`:gpu_idle`, `:sw_power_cap`,
+`:hw_slowdown`, `:sw_thermal_slowdown`, `:hw_thermal_slowdown`, `:hw_power_brake_slowdown`, …).
 
 `gpu_sample` is exactly what the sampler child calls per tick. The child is a Julia process
 (`telemetry_child_main`, started with the parent's julia binary and load path) rather than a Julia

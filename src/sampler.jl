@@ -1,7 +1,8 @@
-# Out-of-process GPU telemetry: `with_gpu_sampler` records per-device power / utilization /
-# VRAM — and, where the device has them, hardware counters (NVIDIA GPM: achieved SM occupancy,
-# per-pipe utilization, DRAM bandwidth) — while a function runs, streaming the time series to a
-# TSV. A telemetry hiccup never breaks the caller: the function still runs, the telemetry is empty.
+# Out-of-process GPU telemetry: `with_gpu_sampler` records per-device power / utilization / VRAM /
+# clocks / temperatures / power limit / throttle reasons — and, where the device has them, hardware
+# counters (NVIDIA GPM: achieved SM occupancy, per-pipe utilization, DRAM bandwidth) — while a
+# function runs, streaming the time series to a TSV. A telemetry hiccup never breaks the caller:
+# the function still runs, the telemetry is empty.
 #
 # One sampling function, `gpu_sample(backend, device)`, returns a NamedTuple with whatever the
 # vendor exposes. It is usable in-process for a one-shot snapshot and is exactly what the child
@@ -42,10 +43,16 @@ device_id(s::SamplerSource) = s.device
 """    sampler_source(spec::AbstractString, counters::Symbol) -> SamplerSource
 
 Build the source described by `spec` (`"<kind>:<payload>"`). Kinds shipped here: `sysfs`
-(amdgpu driver files: `sysfs:<device>:<power_file>:<busy_file>:<membusy_file|->:<vram_file>`)
+(amdgpu driver files: `sysfs:<device>:<power>:<busy>:<membusy>:<vram>[:<sclk>:<mclk>:<temp_edge>:<temp_hot>:<power_cap>]`,
+`-` for a file the device does not have; the five trailing fields may be omitted altogether)
 and `synthetic` (`synthetic:<device>`, deterministic fake values for tests); the CUDA extension
 adds `nvml` (`nvml:GPU-<uuid>=<device>`). `counters` is `:auto` (hardware counters when the
-device has them) or `:none`. Unknown kinds throw."""
+device has them) or `:none`. Unknown kinds throw.
+
+Every source's `sample!` returns the base columns `power_W`, `compute_util`, `mem_util`,
+`vram_used_B`, `sm_clock_MHz`, `mem_clock_MHz`, `temperature_C`, `hotspot_C`, `power_limit_W`,
+`throttle_reasons` (a bitmask stored as an integer-valued `Float64`; decode with
+[`throttle_reasons`](@ref)), `NaN` where the device or vendor has none."""
 function sampler_source(spec::AbstractString, counters::Symbol)
     kind, rest = split(spec, ':'; limit = 2)
     return _sampler_source(Val(Symbol(kind)), String(rest), counters)
@@ -53,18 +60,28 @@ end
 _sampler_source(::Val{K}, rest, counters) where {K} =
     error("sampler_source: unknown source kind '$K' — is the vendor extension loaded in this process?")
 
-# amdgpu driver sysfs. Values: power in µW, busy percentages, VRAM in bytes.
+# amdgpu driver sysfs. Values: power in µW, busy percentages, VRAM in bytes, hwmon clocks in Hz,
+# temperatures in millidegrees, power cap in µW. `nothing` = the device has no such file (NaN).
 struct SysfsSource <: SamplerSource
     device::Int
     power::String
     busy::String
     membusy::Union{String, Nothing}
     vram::String
+    sclk::Union{String, Nothing}
+    mclk::Union{String, Nothing}
+    temp_edge::Union{String, Nothing}
+    temp_hot::Union{String, Nothing}
+    power_cap::Union{String, Nothing}
 end
+const _SYSFS_FIELDS = 10   # device + 9 files; the 5-field form of older parents is still accepted
 function _sampler_source(::Val{:sysfs}, rest::AbstractString, ::Symbol)
     f = split(rest, ':')
-    length(f) == 5 || throw(ArgumentError("sysfs source spec needs 5 fields, got $(length(f)): $rest"))
-    return SysfsSource(parse(Int, f[1]), String(f[2]), String(f[3]), f[4] == "-" ? nothing : String(f[4]), String(f[5]))
+    5 <= length(f) <= _SYSFS_FIELDS ||
+        throw(ArgumentError("sysfs source spec needs 5 to $_SYSFS_FIELDS fields, got $(length(f)): $rest"))
+    opt(i) = (i > length(f) || f[i] == "-") ? nothing : String(f[i])
+    return SysfsSource(parse(Int, f[1]), String(f[2]), String(f[3]), opt(4), String(f[5]),
+        opt(6), opt(7), opt(8), opt(9), opt(10))
 end
 function _read_number(path)
     try
@@ -74,11 +91,20 @@ function _read_number(path)
         return NaN   # transient read failure → nan for this tick
     end
 end
+_read_number(::Nothing) = NaN
+# throttle_reasons: the amdgpu driver reports throttling only inside the `gpu_metrics` binary
+# blob (throttle_status), not decoded yet → NaN on AMD.
 sample!(s::SysfsSource) = (
     power_W = _read_number(s.power) / 1.0e6,
     compute_util = _read_number(s.busy) / 100,
-    mem_util = s.membusy === nothing ? NaN : _read_number(s.membusy) / 100,
+    mem_util = _read_number(s.membusy) / 100,
     vram_used_B = _read_number(s.vram),
+    sm_clock_MHz = _read_number(s.sclk) / 1.0e6,
+    mem_clock_MHz = _read_number(s.mclk) / 1.0e6,
+    temperature_C = _read_number(s.temp_edge) / 1000,
+    hotspot_C = _read_number(s.temp_hot) / 1000,
+    power_limit_W = _read_number(s.power_cap) / 1.0e6,
+    throttle_reasons = NaN,
 )
 
 # Deterministic fake device for tests of the child protocol (and a handy `gpu_sample` stand-in on
@@ -92,9 +118,45 @@ _sampler_source(::Val{:synthetic}, rest::AbstractString, counters::Symbol) =
 function sample!(s::SyntheticSource)
     busy = s.device == 1
     base = (power_W = 100.0 + 50 * (s.device - 1), compute_util = busy ? 0.9 : 0.1,
-        mem_util = s.device == 2 ? NaN : 0.5, vram_used_B = 1000.0 * s.device)
+        mem_util = s.device == 2 ? NaN : 0.5, vram_used_B = 1000.0 * s.device,
+        sm_clock_MHz = busy ? 1800.0 : 300.0, mem_clock_MHz = 1200.0,
+        temperature_C = busy ? 70.0 : 40.0, hotspot_C = s.device == 2 ? NaN : 85.0,
+        power_limit_W = 100.0 + 50 * (s.device - 1), throttle_reasons = busy ? 36.0 : 0.0)   # 36 = sw_power_cap | sw_thermal_slowdown
     s.counters || return base
     return merge(base, (sm_util = busy ? 0.9 : 0.1, sm_occupancy = busy ? 0.3 : 0.1, fp64_util = busy ? 0.8 : NaN))
+end
+
+# NVML's nvmlClocksEventReason* / nvmlClocksThrottleReason* bit defines (nvml.h), in bit order.
+const THROTTLE_REASON_BITS = (
+    (0x001, :gpu_idle), (0x002, :applications_clocks_setting), (0x004, :sw_power_cap),
+    (0x008, :hw_slowdown), (0x010, :sync_boost), (0x020, :sw_thermal_slowdown),
+    (0x040, :hw_thermal_slowdown), (0x080, :hw_power_brake_slowdown), (0x100, :display_clock_setting),
+    (0x200, :board_limit), (0x400, :reliability),
+)
+
+"""    throttle_reasons(x::Real) -> Vector{Symbol}
+
+Decode a `throttle_reasons` sample (the NVML clocks-event bitmask, stored in the telemetry as an
+integer-valued `Float64`) into its set bits: `:gpu_idle` (0x1), `:applications_clocks_setting`
+(0x2), `:sw_power_cap` (0x4), `:hw_slowdown` (0x8), `:sync_boost` (0x10), `:sw_thermal_slowdown`
+(0x20), `:hw_thermal_slowdown` (0x40), `:hw_power_brake_slowdown` (0x80),
+`:display_clock_setting` (0x100), `:board_limit` (0x200), `:reliability` (0x400). `NaN` (no
+vendor bitmask) and 0 give an empty vector; an unknown bit is reported as `:bit_<n>`."""
+function throttle_reasons(x::Real)
+    out = Symbol[]
+    (x isa AbstractFloat && !isfinite(x)) && return out
+    isinteger(x) && x >= 0 || throw(ArgumentError("throttle_reasons: expected a non-negative integer bitmask, got $x"))
+    mask = UInt64(x)
+    for (bit, name) in THROTTLE_REASON_BITS
+        mask & bit == 0 || push!(out, name)
+        mask &= ~UInt64(bit)
+    end
+    while mask != 0
+        n = trailing_zeros(mask)
+        push!(out, Symbol("bit_", n))
+        mask &= ~(UInt64(1) << n)
+    end
+    return out
 end
 
 """    gpu_sampler_sources(backend, device_ids, counters) -> (specs, packages)
@@ -113,8 +175,10 @@ const _SOURCE_LOCK = ReentrantLock()
 """    gpu_sample(backend, device = gpu_device(backend); counters = :auto) -> NamedTuple
 
 One telemetry sample of `device` (1-based vendor ordinal), in-process: `power_W`,
-`compute_util`, `mem_util`, `vram_used_B` (fractions in [0, 1]; `NaN` when the device does not
-expose a counter) and, on NVIDIA GPUs with GPM (Hopper and newer) when `counters = :auto`,
+`compute_util`, `mem_util`, `vram_used_B`, `sm_clock_MHz`, `mem_clock_MHz`, `temperature_C`,
+`hotspot_C`, `power_limit_W`, `throttle_reasons` (fractions in [0, 1]; the throttle bitmask as an
+integer-valued `Float64`, see [`throttle_reasons`](@ref); `NaN` when the device does not expose
+a counter) and, on NVIDIA GPUs with GPM (Hopper and newer) when `counters = :auto`,
 `sm_util`, `sm_occupancy` (ACHIEVED), `fp64_util`, `dram_bw_util`, `fp32_util`, `fp16_util`,
 `tensor_util`, `int_util`, `pcie_tx_MiBps`, `pcie_rx_MiBps`, `nvlink_rx_MiBps`, `nvlink_tx_MiBps`.
 Interval metrics (GPM) cover the time since the previous `gpu_sample` of that device (the first
@@ -285,7 +349,8 @@ Base.show(io::IO, t::GPUTelemetry) = print(io, "GPUTelemetry(", length(t), " row
     with_gpu_sampler(f, backend, dt; devices = 1:1, tracefile = nothing, counters = :auto) -> (f(), telem)
 
 Run `f()` while a child process samples `devices` (1-based vendor ids) every `dt` seconds:
-power / compute / memory utilization / VRAM everywhere, plus hardware counters where the device
+power / compute / memory utilization / VRAM / SM and memory clocks / edge and hotspot temperature /
+power limit / throttle bitmask everywhere (`NaN` where a vendor has none), plus hardware counters where the device
 has them (`counters = :auto`; NVIDIA GPM on Hopper and newer — achieved SM occupancy, FP64 / FP32
 / tensor pipe and DRAM-bandwidth utilization, PCIe / NVLink traffic; `:none` skips them). `f` is
 first so the do-block form works. Without `tracefile`, samples go to a temp file that is deleted
@@ -364,8 +429,9 @@ _starved(window, first_sample_s, ticks, dt) = (s = window - first_sample_s; s > 
 # must have exactly that many fields and pass a plausibility gate — a torn row (two writers
 # interleaving) can still parse as numbers; a VRAM value glued to the next row's epoch once reached
 # a manifest as a 3e20 B peak. Epoch inside the sampled window (±5 s), device ≥ 1, fractions
-# (`*_util`, `sm_occupancy`) in [0, 1], power below 5 kW, VRAM below 1 TB; `nan` (a counter the
-# device does not expose) is kept anywhere but epoch/device.
+# (`*_util`, `sm_occupancy`) in [0, 1], power and power limit below 5 kW, VRAM below 1 TB, clocks
+# below 20 GHz, temperatures within [-50, 200] °C, a non-negative integer throttle bitmask; `nan`
+# (a counter the device does not expose) is kept anywhere but epoch/device.
 function _parse_trace(trace::AbstractString, t0::Real)
     columns = copy(_BASE_COLUMNS)
     rows = Vector{Float64}[]
@@ -403,10 +469,16 @@ function _plausible_row(columns, vals)
         c = String(columns[j])
         if endswith(c, "_util") || c == "sm_occupancy"
             0 <= v <= 1 || return false
-        elseif c == "power_W"
+        elseif c == "power_W" || c == "power_limit_W"
             0 <= v <= 5000 || return false
         elseif c == "vram_used_B"
             0 <= v <= 1.0e12 || return false
+        elseif endswith(c, "_clock_MHz")
+            0 <= v <= 20000 || return false
+        elseif c == "temperature_C" || c == "hotspot_C"
+            -50 <= v <= 200 || return false
+        elseif c == "throttle_reasons"
+            (v >= 0 && isinteger(v)) || return false
         end
     end
     return true
@@ -415,10 +487,13 @@ end
 """    gpu_telemetry_stats(telem; busy_column = :compute_util, busy_threshold = 0.5) -> Dict{String, Any}
 
 Reduce a [`GPUTelemetry`](@ref) over all devices' rows, skipping `NaN` entries per column: for
-every metric column `<col>_mean`, `<col>_peak` and `<col>_busy_mean` — the mean over rows whose
-`busy_column` is ≥ `busy_threshold`, i.e. the kernel-active part of the window without the idle
-JIT / upload / drain phases diluting it (the number to hold against a kernel's theoretical
-occupancy) — plus `samples` (ticks) and `busy_samples` (rows). Empty when there are no rows."""
+every metric column `<col>_mean`, `<col>_peak`, `<col>_busy_mean` and `<col>_busy_median` — over
+the rows whose `busy_column` is ≥ `busy_threshold`, i.e. the kernel-active part of the window
+without the idle JIT / upload / drain phases diluting it (the number to hold against a kernel's
+theoretical occupancy) — plus `samples` (ticks), `busy_samples` (rows) and, when both `power_W`
+and `power_limit_W` are present, `power_capped_fraction`: the share of busy rows at
+`power_W ≥ 0.95 × power_limit_W`, i.e. running into the power cap. Empty when there are no
+rows."""
 function gpu_telemetry_stats(t::GPUTelemetry; busy_column::Symbol = :compute_util, busy_threshold::Real = 0.5)
     out = Dict{String, Any}()
     n = size(t.samples, 1)
@@ -434,7 +509,19 @@ function gpu_telemetry_stats(t::GPUTelemetry; busy_column::Symbol = :compute_uti
         out[String(c) * "_mean"] = sum(v) / length(v)
         out[String(c) * "_peak"] = maximum(v)
         vb = Float64[x for (x, m) in zip(col, busy) if m && !isnan(x)]
-        isempty(vb) || (out[String(c) * "_busy_mean"] = sum(vb) / length(vb))
+        if !isempty(vb)
+            out[String(c) * "_busy_mean"] = sum(vb) / length(vb)
+            out[String(c) * "_busy_median"] = Float64(Statistics.median(vb))
+        end
+    end
+    if haskey(t, :power_W) && haskey(t, :power_limit_W)
+        capped = 0; n_ok = 0
+        for (p, lim, m) in zip(t[:power_W], t[:power_limit_W], busy)
+            (m && !isnan(p) && !isnan(lim)) || continue
+            n_ok += 1
+            p >= 0.95 * lim && (capped += 1)
+        end
+        n_ok == 0 || (out["power_capped_fraction"] = capped / n_ok)
     end
     return out
 end
