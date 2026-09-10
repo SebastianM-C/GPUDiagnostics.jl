@@ -113,11 +113,10 @@ end
 
     @testset "probes: launch overhead, host snapshot, warm-up" begin
         o = measure_launch_overhead(backend; n = 100)
-        @test o.device_s > 0 && o.enqueue_s > 0 && o.roundtrip_s ≥ o.device_s && o.queue_depth ≥ 1
+        @test o.device_s > 0 && o.enqueue_s > 0 && o.roundtrip_s > o.enqueue_s && o.queue_depth ≥ 1
         h = host_snapshot(backend)
         @test h.backend == string(nameof(typeof(backend))) && !ismissing(h.gpu_runtime) && !ismissing(h.gpu_package)
-        VENDOR == "cuda" && @test !ismissing(h.gpu_driver)
-        @test !ismissing(h.gpu_kernel_module)
+        VENDOR == "cuda" && @test !ismissing(h.gpu_driver) && !ismissing(h.gpu_kernel_module)   # in-tree amdgpu has no sysfs version
         @test !isempty(diagnostics_dict(h; prefix = "host_")["host_gpu_runtime"])
         @info "probes" launch_overhead = sprint(show, o) host = sprint(show, h) versions = (h.gpu_driver, h.gpu_runtime, h.gpu_kernel_module, h.gpu_package)
         timer = LaunchTimer()

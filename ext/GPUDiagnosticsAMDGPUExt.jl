@@ -251,7 +251,8 @@ end
 # amdgpu kernel module version is read from sysfs by host_snapshot itself).
 function GD.backend_versions(::ROCBackend)
     rt = try string(AMDGPU.HIP.runtime_version()) catch; missing end
-    return (; runtime = rt, package = "AMDGPU.jl " * string(pkgversion(AMDGPU)))
+    rocm = isfile("/opt/rocm/.info/version") ? (try strip(read("/opt/rocm/.info/version", String)) catch; missing end) : missing
+    return (; driver = ismissing(rocm) ? missing : "ROCm " * rocm, runtime = rt, package = "AMDGPU.jl " * string(pkgversion(AMDGPU)))
 end
 
 end
