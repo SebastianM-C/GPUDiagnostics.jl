@@ -121,7 +121,8 @@ function conformance(backend; kernel = nothing, peak_threads = 2^12)
                 has(:occupancy) && @test has(:resources)
                 if kernel !== nothing
                     r = kernel_resources(backend, kernel)
-                    @test all(k -> hasproperty(r, k), (:name, :registers, :local_mem_bytes, :shared_mem_bytes))
+                    @test r isa KernelResources
+                    @test has(:occupancy) ? (r.occupancy isa Union{Missing, KernelOccupancy}) : ismissing(r.occupancy)
                 end
             else
                 @test !has(:occupancy)
