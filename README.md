@@ -14,15 +14,15 @@ Not registered yet: `pkg> add https://github.com/SebastianM-C/GPUDiagnostics.jl`
 
 | question | instrument | docs |
 |---|---|---|
-| Which device, how many, how much memory, power, utilization? | `gpu_device_count`, `gpu_device!`, `gpu_memory_info`, `gpu_power`, … | [device API](https://SebastianM-C.github.io/GPUDiagnostics.jl/device_timing/) |
-| How long does each kernel launch take, when launches are queued asynchronously? | `LaunchTimer` (one device-event pair per launch), `first_launch_s` | [kernel timing](https://SebastianM-C.github.io/GPUDiagnostics.jl/device_timing/) |
-| What did the device do while the code ran — power, clocks, temperature, achieved occupancy? | `with_gpu_sampler` (an out-of-process child, one TSV row per device per tick), `gpu_telemetry_stats` | [telemetry](https://SebastianM-C.github.io/GPUDiagnostics.jl/telemetry/) |
-| What FP64 / FP32 rate can scalar code reach on this device, at the clocks it holds? | `measure_peak_flops` (FMA-chain probe, never routed to matrix units) | [measured peak](https://SebastianM-C.github.io/GPUDiagnostics.jl/peaks_probes/) |
-| What does a launch cost; what is this host, really? | `measure_launch_overhead`, `host_snapshot` (threads vs cgroup quota, driver / runtime versions) | [probes](https://SebastianM-C.github.io/GPUDiagnostics.jl/peaks_probes/) |
-| Registers, spills, shared memory, theoretical occupancy of the kernels that actually ran? | `compiled_kernels`, `kernel_resources` → `KernelResources` | [resource report](https://SebastianM-C.github.io/GPUDiagnostics.jl/resources_mix/) |
-| What instructions is the kernel made of — here, or on a GPU I have not rented yet? | `kernel_instruction_mix` (AMD ISA / NVIDIA SASS by class, per loop; `target = "gfx942"` cross-compiles), `kernel_ir_mix`, `fp64_issue_floor` | [instruction mix](https://SebastianM-C.github.io/GPUDiagnostics.jl/resources_mix/) |
-| Hardware counters per dispatch on AMD? | `rocprof_command`, `rocprof_counters`, `rocprof_derived` (rocprofv3 wrapper + parser) | [hardware counters](https://SebastianM-C.github.io/GPUDiagnostics.jl/hw_counters/) |
-| How do I store or read all of that? | `diagnostics_dict(x; prefix)` (flat TOML-safe dicts, stable keys), `show`, Tables.jl on `GPUTelemetry` | [report layer](https://SebastianM-C.github.io/GPUDiagnostics.jl/report/) |
+| Which device, how many, how much memory, power, utilization? | `gpu_device_count`, `gpu_device!`, `gpu_memory_info`, `gpu_power`, … | [device API](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/device_timing/) |
+| How long does each kernel launch take, when launches are queued asynchronously? | `LaunchTimer` (one device-event pair per launch), `first_launch_s` | [kernel timing](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/device_timing/) |
+| What did the device do while the code ran — power, clocks, temperature, achieved occupancy? | `with_gpu_sampler` (an out-of-process child, one TSV row per device per tick), `gpu_telemetry_stats` | [telemetry](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/telemetry/) |
+| What FP64 / FP32 rate can scalar code reach on this device, at the clocks it holds? | `measure_peak_flops` (FMA-chain probe, never routed to matrix units) | [measured peak](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/peaks_probes/) |
+| What does a launch cost; what is this host, really? | `measure_launch_overhead`, `host_snapshot` (threads vs cgroup quota, driver / runtime versions) | [probes](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/peaks_probes/) |
+| Registers, spills, shared memory, theoretical occupancy of the kernels that actually ran? | `compiled_kernels`, `kernel_resources` → `KernelResources` | [resource report](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/resources_mix/) |
+| What instructions is the kernel made of — here, or on a GPU I have not rented yet? | `kernel_instruction_mix` (AMD ISA / NVIDIA SASS by class, per loop; `target = "gfx942"` cross-compiles), `kernel_ir_mix`, `fp64_issue_floor` | [instruction mix](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/resources_mix/) |
+| Hardware counters per dispatch on AMD? | `rocprof_command`, `rocprof_counters`, `rocprof_derived` (rocprofv3 wrapper + parser) | [hardware counters](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/hw_counters/) |
+| How do I store or read all of that? | `diagnostics_dict(x; prefix)` (flat TOML-safe dicts, stable keys), `show`, Tables.jl on `GPUTelemetry` | [report layer](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/report/) |
 
 Which of these a backend implements is declared through `supports(backend, :feature)` /
 `capabilities(backend)`; an entry point of an undeclared feature throws `BackendUnsupported`. A value a
@@ -57,7 +57,7 @@ merge!(manifest, diagnostics_dict(timer; prefix = "kernel_"), diagnostics_dict(t
 
 ## Reading the numbers
 
-The [caveats page](https://SebastianM-C.github.io/GPUDiagnostics.jl/caveats/) collects the traps
+The [caveats page](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/caveats/) collects the traps
 that have already cost time: static counts are code, not execution; `compute_util` is not comparable
 across vendors; `thread_fill_occupancy` is an upper bound; the `atomic_fallback` class is not spill
 traffic; read busy medians, not window means. The
@@ -80,7 +80,7 @@ It has been run on RTX 4080 SUPER, A100, H100 (also both in one process) and Rad
 
 A backend declares its features with `GPUDiagnostics.supports(::MyBackend, ::Val{:feature}) = true`
 and implements the `backend_*` hooks behind them. The
-[porting page](https://SebastianM-C.github.io/GPUDiagnostics.jl/porting/) lists them; `:ir_mix` (a
+[porting page](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/porting/) lists them; `:ir_mix` (a
 GPUCompiler job over LLVM IR) is the one every GPU backend should have.
 
 ## Related packages
