@@ -168,7 +168,7 @@ fp64_issue_floor(m; n_slots = n_work_items * n_iterations_per_item, peak_fp64_fl
 The disassembly (AMD ISA text from `code_native`; NVIDIA SASS from CUDA.jl's bundled `nvdisasm` on
 the cubin) is counted by class — FP64 fma / add / mul / transcendental seeds / other / CDNA packed,
 FP32, integer, scalar, memory loads / stores / atomics, constant loads, LDS, control, waits, nops,
-other (`MIX_CLASSES`) — for the whole kernel and for every loop of its control-flow graph (natural loops
+atomic-expansion fallback paths a device-memory atomic never executes (`atomic_fallback`, see the `MIX_CLASSES` docstring), other (`MIX_CLASSES`) — for the whole kernel and for every loop of its control-flow graph (natural loops
 from dominators), the hot loop being the outermost loop with the most instructions. On AMD the
 loop nest is checked against the LLVM assembly printer's own loop annotations (`:high` confidence
 when they agree); SASS has none, so the CFG result stands alone (`:medium` with a single dominant

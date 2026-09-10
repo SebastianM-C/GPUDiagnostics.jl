@@ -130,6 +130,48 @@ end
         @test occursin("median_s", sprint(show, MIME"text/plain"(), timer))
     end
 
+    @testset "multi-device (skipped with one device)" begin
+        nd = gpu_device_count(backend)
+        if nd < 2
+            @info "multi-device section skipped: $nd device visible"
+        else
+            d0 = gpu_device(backend)
+            # gpu_device! round trip, one LaunchTimer lane per device, sampler rows for both
+            timer = LaunchTimer()
+            outs = Dict{Int, Any}()
+            for d in 1:2
+                @test gpu_device!(backend, d) in 1:nd
+                @test gpu_device(backend) == d
+                outs[d] = Adapt.adapt(backend, zeros(Float64, n))
+                xd = Adapt.adapt(backend, rand(Float64, n))
+                lane = launch_lane(timer, backend)
+                @test lane == d
+                for _ in 1:2
+                    e0 = launch_tick(timer, backend)
+                    gpudiag_probe_kernel!(backend, 256)(outs[d], xd, Int32(100); ndrange = n)
+                    launch_tock!(timer, lane, backend, e0)
+                end
+                KernelAbstractions.synchronize(backend)
+                @test gpu_name(backend) isa AbstractString && gpu_memory_info(backend).total > 0
+            end
+            lt = launch_times(timer)
+            @test sort!(collect(keys(lt))) == [1, 2] && all(v -> length(v) == 2 && all(>(0), v), values(lt))
+            @test collect(keys(diagnostics_dict(timer)["devices"])) == [1, 2] || diagnostics_dict(timer)["devices"] == [1, 2]
+            gpu_device!(backend, d0)
+            _, telem2 = with_gpu_sampler(backend, 0.2; devices = 1:2, counters = :none) do
+                t_end = time() + 6
+                while time() < t_end
+                    gpudiag_probe_kernel!(backend, 256)(out, x, Int32(20_000); ndrange = n)
+                    KernelAbstractions.synchronize(backend)
+                end
+            end
+            @test telem2.ticks ≥ 2 && sort!(unique(Int.(telem2[:device]))) == [1, 2]
+            @test gpu_sample(backend, 2).power_W > 0 && gpu_sample(backend, 1).power_W > 0
+            @info "multi-device" devices = nd lanes = Dict(k => length(v) for (k, v) in lt) sampler_rows = length(telem2) names = [(gpu_device!(backend, d); gpu_name(backend)) for d in 1:2]
+            gpu_device!(backend, d0)
+        end
+    end
+
     @testset "telemetry sampler" begin
         s = gpu_sample(backend)
         @test s.power_W > 0 && 0 ≤ s.compute_util ≤ 1 && s.vram_used_B > 0

@@ -166,19 +166,37 @@ Base.show(io::IO, m::InstructionMix) = print(io, "InstructionMix(", m.vendor, ":
     ", coverage ", _fmt3(m.coverage), ", ", length(m.loops), " loops",
     m.hot_loop === nothing ? "" : ", hot loop $(m.hot_loop.total) ($(m.hot_loop_confidence))", ")")
 function Base.show(io::IO, ::MIME"text/plain", m::InstructionMix)
-    println(io, "InstructionMix (", m.vendor, "): ", m.total, " instructions in ", m.blocks, " blocks, coverage ", _fmt3(m.coverage))
-    println(io, " whole kernel (fp64 ", m.fp64, "):")
-    _show_counts(io, m.counts, MIX_CLASSES)
-    if m.hot_loop === nothing
-        print(io, " hot loop: none")
-    else
-        h = m.hot_loop
-        println(io, " hot loop ", h.header, " (depth ", h.depth, ", ", h.blocks, " blocks, ", h.total, " instructions, fp64 ",
-            _fp64_total(h.counts), ", confidence ", m.hot_loop_confidence, "):")
-        _show_counts(io, h.counts, MIX_CLASSES)
-        print(io, " ", length(m.loops), " loops total")
+    println(io, "InstructionMix (", m.vendor, "): ", m.total, " instructions in ", m.blocks, " blocks, coverage ",
+        _fmt3(m.coverage), ", ", length(m.loops), " loop", length(m.loops) == 1 ? "" : "s",
+        m.hot_loop === nothing ? ", no hot loop" : ", hot loop $(m.hot_loop.header) (confidence $(m.hot_loop_confidence))")
+    # class × column table: whole kernel, then the hot loop (all / own blocks), then the other loops
+    cols = Pair{String, MixCounts}["total (static)" => m.counts]
+    if m.hot_loop !== nothing
+        push!(cols, "hot loop" => m.hot_loop.counts, "hot loop excl." => m.hot_loop.exclusive_counts)
     end
-    isempty(m.unclassified_opcodes) || print(io, "\n unclassified: ", join(sort!(collect(keys(m.unclassified_opcodes))), ", "))
+    for l in m.loops
+        (m.hot_loop !== nothing && l.header == m.hot_loop.header) && continue
+        push!(cols, "$(l.header) d$(l.depth)" => l.counts)
+    end
+    w(nm) = max(16, length(nm) + 2)
+    println(io, rpad("class", 14), join(lpad(first(c), w(first(c))) for c in cols))
+    for c in MIX_CLASSES
+        any(cnt[c] != 0 for (_, cnt) in cols) || continue
+        println(io, rpad(String(c), 14), join(lpad(string(cnt[c]), w(nm)) for (nm, cnt) in cols))
+    end
+    println(io, rpad("fp64 (all)", 14), join(lpad(string(_fp64_total(cnt)), w(nm)) for (nm, cnt) in cols))
+    println(io, rpad("TOTAL", 14), join(lpad(string(sum(cnt)), w(nm)) for (nm, cnt) in cols))
+    if !isempty(m.loops)
+        println(io, "loop nest (largest first; total = one pass, nested loops counted once; excl = own blocks):")
+        for l in m.loops
+            println(io, "  ", rpad(l.header, 12), " depth ", l.depth, "  blocks ", lpad(l.blocks, 4), "  total ", lpad(l.total, 6),
+                "  excl ", lpad(l.exclusive_total, 6), "  fp64 ", lpad(_fp64_total(l.counts), 5), "  waits ", lpad(l.counts.wait, 4),
+                "  loads ", lpad(l.counts.mem_load, 4))
+        end
+    end
+    other = sort!([(k, v) for (k, v) in m.opcodes if _classify(k, m.vendor) in (:other, :unclassified)]; by = x -> -x[2])
+    isempty(other) || print(io, "'other': ", join(("$k×$v" for (k, v) in other[1:min(end, 10)]), ", "))
+    isempty(m.unclassified_opcodes) || print(io, "\nunclassified: ", join(("$k×$v" for (k, v) in sort!(collect(m.unclassified_opcodes); by = x -> -x[2])), ", "))
     return nothing
 end
 Base.show(io::IO, m::KernelInstructionMix) = print(io, "KernelInstructionMix(", m.name, " for ", m.target,

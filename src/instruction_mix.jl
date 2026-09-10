@@ -44,6 +44,15 @@ Instruction classes of [`kernel_instruction_mix`](@ref) (vendor-neutral; the man
   `v_div_fixup_f64`, `v_ldexp_f64`);
 - `fp64_packed` — CDNA packed FP64 (`v_pk_fma_f64`, `v_pk_mul_f64`, `v_pk_add_f64`: two lanes
   of FP64 work per instruction; NVIDIA has no equivalent);
+- `atomic_fallback` — every instruction inside the address-space fallback paths LLVM's
+  AtomicExpand pass emits for an atomic on a GENERIC (flat) pointer: the `%atomicrmw.private*`
+  and `%atomicrmw.shared*` machine blocks (identified by the assembly printer's block names on
+  AMD), i.e. the `scratch_load/store` pair and the `ds_*` path that a device-memory atomic never
+  executes. Counted here instead of as `mem_load` / `mem_store` / `lds`, which would inflate the
+  memory classes and suggest register spills that do not exist (the kernel's scratch size is 0).
+  Nonzero means the kernel's atomics take a generic pointer — an address-space-1 pointer removes
+  the paths altogether. Not emitted for SASS (no block names; NVIDIA lowers generic atomics
+  without such paths);
 - `fp32` — FP32 and FP16 arithmetic (FFMA/FADD/FMUL/MUFU.RCP/HFMA2 / `v_*_f32`, `v_*_f16`);
 - `int` — vector integer / logic / move / select / compare (IMAD, IADD3, LOP3, SHF, ISETP,
   MOV, SEL, PRMT … / `v_add_co_u32`, `v_cndmask_b32`, `v_mov_b32`, `v_readlane_b32`,
@@ -65,7 +74,7 @@ Instruction classes of [`kernel_instruction_mix`](@ref) (vendor-neutral; the man
   CS2R), shuffles/votes, and anything unrecognised (see the `opcodes` histogram of the report).
 """
 const MIX_CLASSES = (:fp64_fma, :fp64_add, :fp64_mul, :fp64_trans, :fp64_other, :fp64_packed,
-    :fp32, :int, :salu, :mem_load, :mem_store, :mem_atomic, :smem, :lds, :control, :wait, :nop, :other)
+    :fp32, :int, :salu, :mem_load, :mem_store, :mem_atomic, :atomic_fallback, :smem, :lds, :control, :wait, :nop, :other)
 const FP64_CLASSES = (:fp64_fma, :fp64_add, :fp64_mul, :fp64_trans, :fp64_other, :fp64_packed)
 
 const MixCounts = NamedTuple{MIX_CLASSES, NTuple{length(MIX_CLASSES), Int}}
@@ -86,6 +95,7 @@ function _count_classes(opcodes, vendor::Symbol, unclassified = nothing)
     return MixCounts(ntuple(i -> get(acc, MIX_CLASSES[i], 0), length(MIX_CLASSES)))
 end
 _add_counts(a::MixCounts, b::MixCounts) = MixCounts(ntuple(i -> a[i] + b[i], length(MIX_CLASSES)))
+_fallback_counts(n::Int) = MixCounts(ntuple(i -> MIX_CLASSES[i] === :atomic_fallback ? n : 0, length(MIX_CLASSES)))
 _fp64_total(c::MixCounts) = sum(c[k] for k in FP64_CLASSES)
 
 """
@@ -292,7 +302,11 @@ struct MixBlock
     targets::Vector{String}       # branch target labels (direct branches only)
     fallthrough::Bool             # control may reach the next block in layout order
     loop_note::Union{Nothing, Tuple{String, Int}}   # LLVM asm-printer loop annotation (header label, depth)
+    ir_name::Union{Nothing, String}   # the IR basic-block name the asm printer comments after the label (AMD)
 end
+
+# AtomicExpand's fallback paths for a generic-pointer atomic: never executed for device memory.
+_is_atomic_fallback(b::MixBlock) = b.ir_name !== nothing && occursin(r"^atomicrmw\.(private|shared)", b.ir_name)
 
 # Text → blocks for vendor ∈ (:amd, :nvidia). Only the instruction stream, its labels and the
 # direct branch targets are kept; directives, debug labels, line info and metadata are skipped.
@@ -304,6 +318,7 @@ end
 
 const _AMD_TERMINATORS = ("s_branch", "s_endpgm", "s_endpgm_saved", "s_setpc_b64", "s_trap")
 const _AMD_UNLABELLED_BLOCK = r"^\s*;\s*%bb\.(\d+):"
+const _AMD_IR_NAME = r":\s*;\s*%([\w.]+)\s*$"   # `.LBB0_23:  ; %atomicrmw.phi529` / `; %bb.22:  ; %atomicrmw.private527`
 
 function _parse_amd_isa(text::AbstractString)
     blocks = MixBlock[]
@@ -311,14 +326,15 @@ function _parse_amd_isa(text::AbstractString)
     opcodes = String[]
     targets = String[]
     note = nothing
+    ir_name = nothing
     in_metadata = false
     unlabelled = 0
     function finish!()
         (label === nothing && isempty(opcodes)) && return
         lbl = label === nothing ? "%entry" : label
         last_op = isempty(opcodes) ? "" : opcodes[end]
-        push!(blocks, MixBlock(lbl, opcodes, targets, !(last_op in _AMD_TERMINATORS), note))
-        opcodes = String[]; targets = String[]; note = nothing
+        push!(blocks, MixBlock(lbl, opcodes, targets, !(last_op in _AMD_TERMINATORS), note, ir_name))
+        opcodes = String[]; targets = String[]; note = nothing; ir_name = nothing
         return
     end
     for raw in eachline(IOBuffer(text))
@@ -337,9 +353,11 @@ function _parse_amd_isa(text::AbstractString)
         elseif is_label
             finish!()
             label = m[1]
+            ir_name = (n = match(_AMD_IR_NAME, line)) === nothing ? nothing : String(n[1])
         elseif (m = match(_AMD_UNLABELLED_BLOCK, line)) !== nothing
             finish!()
             label = "%bb." * m[1]
+            ir_name = (n = match(_AMD_IR_NAME, line)) === nothing ? nothing : String(n[1])
             unlabelled += 1
         end
         # LLVM's loop annotations follow the block marker, on the same line or the next
@@ -380,7 +398,7 @@ function _parse_sass(text::AbstractString)
         (label === nothing && isempty(opcodes)) && return
         # code after an unconditional terminator without a label: reachable by nothing
         lbl = label === nothing ? "%bb." * string(length(blocks)) : label
-        push!(blocks, MixBlock(lbl, opcodes, targets, fall, nothing))
+        push!(blocks, MixBlock(lbl, opcodes, targets, fall, nothing, nothing))
         opcodes = String[]; targets = String[]; fall = true
         return
     end
@@ -591,7 +609,8 @@ function instruction_mix(text::AbstractString, vendor::Symbol)
         opcodes[op] = get(opcodes, op, 0) + 1
     end
     unclassified_opcodes = Dict{String, Int}()
-    block_counts = [_count_classes(b.opcodes, vendor, unclassified_opcodes) for b in blocks]
+    block_counts = [_is_atomic_fallback(b) ? _fallback_counts(length(b.opcodes)) : _count_classes(b.opcodes, vendor, unclassified_opcodes)
+        for b in blocks]
     total_counts = reduce(_add_counts, block_counts; init = _zero_counts())
     total = sum(total_counts)
     unclassified = sum(values(unclassified_opcodes); init = 0)

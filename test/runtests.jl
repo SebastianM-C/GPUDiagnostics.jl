@@ -502,7 +502,7 @@ end
         for (op, cls) in sass_expect
             @test _classify(op, :nvidia) === (cls === :other && op == "XYZZY" ? :unclassified : cls)
         end
-        @test length(MIX_CLASSES) == 18 && all(c in MIX_CLASSES for c in FP64_CLASSES)
+        @test length(MIX_CLASSES) == 19 && all(c in MIX_CLASSES for c in FP64_CLASSES)
         # the tables are ordered data: last rule is the catch-all, a pushfirst! override wins
         @test last(SASS_RULES)[2] === :unclassified && last(AMD_RULES)[2] === :unclassified
         @test all(r -> r isa Pair{Regex, Symbol}, SASS_RULES) && all(r -> r isa Pair{Regex, Symbol}, AMD_RULES)
@@ -712,6 +712,50 @@ end
         @test_throws BackendUnsupported kernel_instruction_mix(NoVendorBackend(), ck)
     end
 
+    @testset "atomic-expansion fallback blocks (AMD): counted apart, not as memory traffic" begin
+        # The shape LLVM emits for `atomicrmw` on a generic pointer: a global path (flat_atomic
+        # cmpswap loop), a private path (scratch load/store) and a shared path (ds_*), selected by
+        # address-space checks; the asm printer names the machine blocks after their IR blocks.
+        amd_atomic = """
+        k:
+        \ts_load_b64 s[0:1], s[4:5], 0x0
+        \ts_cmp_lg_u64 s[0:1], 0
+        \ts_cbranch_scc1 .LBB0_3
+        ; %bb.1:                                ; %atomicrmw.shared12
+        \tds_cmpst_rtn_b64 v[2:3], v0, v[4:5], v[6:7]
+        \ts_branch .LBB0_5
+        .LBB0_3:                                ; %atomicrmw.check.private
+        \ts_cmp_eq_u32 s2, s3
+        \ts_cbranch_scc1 .LBB0_6
+        ; %bb.4:                                ; %atomicrmw.private527
+        \tscratch_load_dwordx2 v[2:3], off, s6
+        \ts_waitcnt vmcnt(0)
+        \tv_cndmask_b32_e32 v3, v3, v4, vcc
+        \tscratch_store_dwordx2 off, v[2:3], s6
+        \ts_branch .LBB0_5
+        .LBB0_6:                                ; %atomicrmw.global
+        \tflat_atomic_cmpswap_x2 v[2:3], v[4:7] sc1
+        \ts_waitcnt vmcnt(0) lgkmcnt(0)
+        .LBB0_5:                                ; %atomicrmw.phi529
+        \tglobal_store_b64 v[0:1], v[2:3], off
+        \ts_endpgm
+        """
+        ma = instruction_mix(amd_atomic, :amd)
+        @test ma.counts.atomic_fallback == 7          # shared path: ds_cmpst, s_branch; private path: load, waitcnt, cndmask, store, s_branch
+        @test ma.counts.mem_load == 0 && ma.counts.mem_store == 1 && ma.counts.lds == 0   # the fallback paths' traffic is not memory traffic
+        @test ma.counts.mem_atomic == 1                # the real (global) path still counts
+        @test ma.total == 16 && sum(ma.counts) == ma.total
+        blocks = GPUDiagnostics._parse_amd_isa(amd_atomic)
+        @test [b.ir_name for b in blocks] == [nothing, "atomicrmw.shared12", "atomicrmw.check.private", "atomicrmw.private527", "atomicrmw.global", "atomicrmw.phi529"]
+        @test count(GPUDiagnostics._is_atomic_fallback, blocks) == 2
+        @test occursin("atomic_fallback", sprint(show, MIME"text/plain"(), ma))
+        # the same opcodes outside an annotated fallback block keep their opcode classes
+        plain = instruction_mix("k:\n\tscratch_load_dwordx2 v[2:3], off, s6\n\tscratch_store_dwordx2 off, v[2:3], s6\n\ts_endpgm\n", :amd)
+        @test plain.counts.mem_load == 1 && plain.counts.mem_store == 1 && plain.counts.atomic_fallback == 0
+        # SASS has no block names: nothing is ever classified as fallback
+        @test all(b -> b.ir_name === nothing, GPUDiagnostics._parse_sass("/*0000*/ ATOM.E.ADD.F64.FTZ.RN R2, [R4.64], R6 ;\n/*0010*/ EXIT ;\n"))
+    end
+
     @testset "typed IR walker on a stand-in LLVM.jl module" begin
         # _ir_counts takes the LLVM.jl module binding as an argument (AMDGPU.LLVM / CUDACore.LLVM in
         # the extensions); the same duck-typed surface is provided here by a tiny stand-in so the
@@ -781,7 +825,9 @@ end
         @test dm["kernel_mix_hot_loop_confidence"] == String(m.hot_loop_confidence) && dm["kernel_mix_vendor"] == "amd"
         @test !haskey(dm, "kernel_mix_llvm_loops_agree")   # missing ⇒ omitted
         @test all(v isa Union{Int, Float64, Bool, String} for v in values(dm))
-        @test occursin("hot loop .LBB0_1", sprint(show, MIME"text/plain"(), m)) && occursin("InstructionMix(amd", sprint(show, m))
+        txt = sprint(show, MIME"text/plain"(), m)
+        @test occursin("hot loop .LBB0_1", txt) && occursin("hot loop excl.", txt) && occursin("loop nest", txt) && occursin("fp64 (all)", txt)
+        @test occursin("InstructionMix(amd", sprint(show, m))
         ck = CompiledKernel("gpu_k", "sig", 256, nothing)
         struct FakeReportGPU <: Backend end
         GPUDiagnostics.supports(::FakeReportGPU, ::Val{:native_mix}) = true
