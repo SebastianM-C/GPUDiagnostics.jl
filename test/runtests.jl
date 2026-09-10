@@ -131,16 +131,46 @@ end
         @test s1 isa SamplerSource && GPUDiagnostics.device_id(s1) == 1 && GPUDiagnostics.close!(s1) === nothing
         nt = GPUDiagnostics.sample!(s1)
         @test nt.power_W == 100 && nt.compute_util == 0.9 && nt.sm_occupancy == 0.3 && nt.fp64_util == 0.8
+        @test nt.sm_clock_MHz == 1800 && nt.mem_clock_MHz == 1200 && nt.temperature_C == 70 && nt.hotspot_C == 85
+        @test nt.power_limit_W == 100 && nt.throttle_reasons == 36 && isinteger(nt.throttle_reasons)
         @test !haskey(GPUDiagnostics.sample!(sampler_source("synthetic:2", :none)), :sm_util)
-        @test isnan(GPUDiagnostics.sample!(sampler_source("synthetic:2", :auto)).mem_util)
+        nt2 = GPUDiagnostics.sample!(sampler_source("synthetic:2", :auto))
+        @test isnan(nt2.mem_util) && isnan(nt2.hotspot_C) && nt2.throttle_reasons == 0 && nt2.sm_clock_MHz == 300
+        base_cols = (:power_W, :compute_util, :mem_util, :vram_used_B, :sm_clock_MHz, :mem_clock_MHz,
+            :temperature_C, :hotspot_C, :power_limit_W, :throttle_reasons)
+        @test keys(GPUDiagnostics.sample!(sampler_source("synthetic:2", :none))) == base_cols
         d = mktempdir()
         write(joinpath(d, "p"), "150000000\n"); write(joinpath(d, "b"), "75\n"); write(joinpath(d, "v"), "2048\n")
+        # the old 5-field spec still parses: the new columns are nan
         sy = sampler_source("sysfs:3:$d/p:$d/b:-:$d/v", :auto)
         @test sy isa GPUDiagnostics.SysfsSource && GPUDiagnostics.device_id(sy) == 3
         nt = GPUDiagnostics.sample!(sy)
+        @test keys(nt) == base_cols
         @test nt.power_W == 150 && nt.compute_util == 0.75 && isnan(nt.mem_util) && nt.vram_used_B == 2048
+        @test isnan(nt.sm_clock_MHz) && isnan(nt.mem_clock_MHz) && isnan(nt.temperature_C) && isnan(nt.hotspot_C)
+        @test isnan(nt.power_limit_W) && isnan(nt.throttle_reasons)
+        # the 10-field spec: hwmon Hz / millidegree / µW files, `-` for an absent one
+        write(joinpath(d, "f1"), "1850000000\n"); write(joinpath(d, "f2"), "1124000000\n")
+        write(joinpath(d, "t1"), "61000\n"); write(joinpath(d, "cap"), "300000000\n")
+        sy10 = sampler_source("sysfs:4:$d/p:$d/b:-:$d/v:$d/f1:$d/f2:$d/t1:-:$d/cap", :none)
+        nt = GPUDiagnostics.sample!(sy10)
+        @test nt.sm_clock_MHz == 1850 && nt.mem_clock_MHz == 1124 && nt.temperature_C == 61 && isnan(nt.hotspot_C)
+        @test nt.power_limit_W == 300 && isnan(nt.throttle_reasons) && nt.power_W == 150
+        # a partial extension (7 fields) and too many fields
+        @test GPUDiagnostics.sample!(sampler_source("sysfs:4:$d/p:$d/b:-:$d/v:$d/f1:-", :none)).sm_clock_MHz == 1850
+        @test_throws ArgumentError sampler_source("sysfs:4:$d/p:$d/b:-:$d/v:-:-:-:-:-:-", :none)
         rm(joinpath(d, "b"))
         @test isnan(GPUDiagnostics.sample!(sy).compute_util) && GPUDiagnostics.sample!(sy).power_W == 150   # transient read failure → nan, row survives
+
+        # the throttle bitmask decoder (NVML nvmlClocksEventReason* bits)
+        @test throttle_reasons(NaN) == Symbol[] && throttle_reasons(0) == Symbol[] && throttle_reasons(0.0) == Symbol[]
+        @test throttle_reasons(36.0) == [:sw_power_cap, :sw_thermal_slowdown]
+        @test throttle_reasons(0x1) == [:gpu_idle] && throttle_reasons(0x8 | 0x40 | 0x80) == [:hw_slowdown, :hw_thermal_slowdown, :hw_power_brake_slowdown]
+        @test throttle_reasons(0x2 | 0x10 | 0x100 | 0x200 | 0x400) == [:applications_clocks_setting, :sync_boost, :display_clock_setting, :board_limit, :reliability]
+        @test throttle_reasons(0x800) == [:bit_11] && throttle_reasons(0x4 | 0x1000) == [:sw_power_cap, :bit_12]
+        @test length(THROTTLE_REASON_BITS) == 11 && all(b -> count_ones(b[1]) == 1, THROTTLE_REASON_BITS)
+        @test_throws ArgumentError throttle_reasons(1.5)
+        @test_throws ArgumentError throttle_reasons(-1)
 
         # gpu_sample in-process through the source cache: give the CPU backend synthetic devices
         GPUDiagnostics.gpu_sampler_sources(::CPU, ids::AbstractVector{<:Integer}, counters::Symbol) =
@@ -176,16 +206,20 @@ end
             sleep(4); :done
         end
         @test r == :done && telem.trace == trace && isfile(trace) && telem.counters == :auto
-        @test telem.columns == [:t_rel_s, :device, :power_W, :compute_util, :mem_util, :vram_used_B, :sm_util, :sm_occupancy, :fp64_util]
-        @test telem.ticks >= 5 && length(telem) == 2 * telem.ticks && size(telem.samples) == (2 * telem.ticks, 9)
+        @test telem.columns == [:t_rel_s, :device, base_cols..., :sm_util, :sm_occupancy, :fp64_util]
+        @test telem.ticks >= 5 && length(telem) == 2 * telem.ticks && size(telem.samples) == (2 * telem.ticks, 15)
         @test 0 < telem.first_sample_s < 4 && !telem.starved && telem.window >= 4 && t < 12
         @test all(∈((1.0, 2.0)), telem[:device]) && all(∈((100.0, 150.0)), telem[:power_W])
         @test count(isnan, telem[:mem_util]) == telem.ticks && count(isnan, telem[:fp64_util]) == telem.ticks
+        @test all(∈((36.0, 0.0)), telem[:throttle_reasons]) && count(isnan, telem[:hotspot_C]) == telem.ticks
+        @test all(∈((1800.0, 300.0)), telem[:sm_clock_MHz]) && all(==(1200.0), telem[:mem_clock_MHz])
+        @test throttle_reasons(maximum(telem[:throttle_reasons])) == [:sw_power_cap, :sw_thermal_slowdown]
         @test_throws KeyError telem[:nope]
         @test haskey(telem, :sm_util) && !haskey(telem, :nope) && keys(telem) == telem.columns
         @test occursin("rows", sprint(show, telem))
-        @test startswith(readline(trace), "# epoch_s\tdevice\tpower_W\tcompute_util\tmem_util\tvram_used_B\tsm_util")
-        @test length(split(readlines(trace)[2], '\t')) == 9
+        @test startswith(readline(trace), "# epoch_s\tdevice\tpower_W\tcompute_util\tmem_util\tvram_used_B\tsm_clock_MHz\tmem_clock_MHz\ttemperature_C\thotspot_C\tpower_limit_W\tthrottle_reasons\tsm_util")
+        @test length(split(readlines(trace)[2], '\t')) == 15
+        @test split(readlines(trace)[2], '\t')[12] == "36"   # the bitmask travels as a plain integer
         st = gpu_telemetry_stats(telem)
         @test st["samples"] == telem.ticks && st["busy_samples"] == telem.ticks
         @test st["power_W_mean"] ≈ 125 && st["power_W_peak"] == 150 && st["power_W_busy_mean"] == 100
@@ -193,16 +227,32 @@ end
         @test st["sm_occupancy_busy_mean"] ≈ 0.3 && st["sm_occupancy_mean"] ≈ 0.2 && st["sm_occupancy_peak"] == 0.3
         @test st["fp64_util_mean"] ≈ 0.8 && st["fp64_util_busy_mean"] ≈ 0.8 && st["mem_util_mean"] ≈ 0.5
         @test st["vram_used_B_peak"] == 2000 && st["vram_used_B_mean"] == 1500
+        @test st["power_W_busy_median"] == 100 && st["sm_clock_MHz_busy_median"] == 1800 && st["throttle_reasons_busy_median"] == 36
+        @test st["temperature_C_mean"] ≈ 55 && st["temperature_C_busy_mean"] == 70 && st["hotspot_C_peak"] == 85
+        @test st["power_limit_W_mean"] ≈ 125 && st["hotspot_C_busy_median"] == 85
+        @test st["power_capped_fraction"] == 1.0   # busy device 1 sits exactly at its 100 W limit
+        # power_capped_fraction / busy median on a handcrafted table: 2 of 3 busy rows at the cap, the
+        # idle row and the nan-limit row do not count; no power_limit_W column ⇒ no stat
+        hc(cols, m) = GPUTelemetry(cols, m, size(m, 1), 1.0, 5.0, 0.1, false, nothing, :none)
+        ht = hc([:t_rel_s, :device, :power_W, :compute_util, :power_limit_W],
+            [0 1 290.0 0.9 300; 1 1 300 0.9 300; 2 1 200 0.9 300; 3 1 299 0.1 300; 4 1 300 0.9 NaN])
+        hs = gpu_telemetry_stats(ht)
+        @test hs["power_capped_fraction"] ≈ 2 / 3 && hs["busy_samples"] == 4
+        @test hs["power_W_busy_median"] == 295 && hs["power_W_busy_mean"] == 272.5   # median of 290, 300, 200, 300 (even count)
+        @test hs["power_limit_W_busy_median"] == 300 && !haskey(hs, "power_W_median")
+        @test !haskey(gpu_telemetry_stats(hc([:t_rel_s, :device, :power_W, :compute_util], [0 1 290.0 0.9])), "power_capped_fraction")
         @test !haskey(st, "t_rel_s_mean") && !haskey(st, "device_mean")
         st2 = gpu_telemetry_stats(telem; busy_column = :sm_occupancy, busy_threshold = 0.05)
-        @test st2["busy_samples"] == length(telem) && st2["power_W_busy_mean"] ≈ 125
-        @test gpu_telemetry_stats(telem; busy_column = :absent)["busy_samples"] == 0
+        @test st2["busy_samples"] == length(telem) && st2["power_W_busy_mean"] ≈ 125 && st2["power_W_busy_median"] ≈ 125
+        @test st2["power_capped_fraction"] == 1.0
+        st3 = gpu_telemetry_stats(telem; busy_column = :absent)
+        @test st3["busy_samples"] == 0 && !haskey(st3, "power_W_busy_median") && !haskey(st3, "power_capped_fraction")
         rm(trace; force = true)
         # counters = :none ⇒ base columns only; no tracefile ⇒ temp trace removed
         r, telem = with_gpu_sampler(CPU(), 0.1; counters = :none) do
             sleep(3); 1
         end
-        @test r == 1 && telem.columns == [:t_rel_s, :device, :power_W, :compute_util, :mem_util, :vram_used_B]
+        @test r == 1 && telem.columns == [:t_rel_s, :device, base_cols...]
         @test telem.ticks >= 3 && telem.counters == :none && telem.trace === nothing
 
         # trace parser + plausibility gate on a handcrafted file
@@ -228,6 +278,14 @@ end
         @test length(rows) == 3 && rows[1][1] ≈ 1 && rows[3][1] ≈ 3 && isnan(rows[1][5]) && rows[2][2] == 2
         @test GPUDiagnostics._parse_trace(tempname(), t0) == ([:t_rel_s, :device], Vector{Float64}[])
         rm(f)
+        # plausibility gates of the new columns
+        pr(cols, vals) = GPUDiagnostics._plausible_row(cols, vals)
+        newcols = [:t_rel_s, :device, :sm_clock_MHz, :mem_clock_MHz, :temperature_C, :hotspot_C, :power_limit_W, :throttle_reasons]
+        @test pr(newcols, [0.0, 1, 1800, 1200, 70, 85, 300, 36]) && pr(newcols, [0.0, 1, NaN, NaN, NaN, NaN, NaN, NaN])
+        @test !pr(newcols, [0.0, 1, 25000, 1200, 70, 85, 300, 36]) && !pr(newcols, [0.0, 1, 1800, -1, 70, 85, 300, 36])
+        @test !pr(newcols, [0.0, 1, 1800, 1200, 250, 85, 300, 36]) && !pr(newcols, [0.0, 1, 1800, 1200, 70, -60, 300, 36])
+        @test !pr(newcols, [0.0, 1, 1800, 1200, 70, 85, 9000, 36]) && !pr(newcols, [0.0, 1, 1800, 1200, 70, 85, 300, 36.5])
+        @test !pr(newcols, [0.0, 1, 1800, 1200, 70, 85, 300, -1])
 
         # a child whose sources cannot be opened exits without rows ⇒ warning, empty telemetry, no trace left
         Base.delete_method(only(methods(GPUDiagnostics.gpu_sampler_sources, (CPU, AbstractVector{<:Integer}, Symbol))))

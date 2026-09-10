@@ -59,7 +59,8 @@ function GD.gpu_sampler_sources(::CUDABackend, device_ids::AbstractVector{<:Inte
     return (specs = specs, packages = [Base.PkgId(CUDA)])
 end
 
-# NVML per-device source: power / utilization / memory via the plain NVML queries, plus — when
+# NVML per-device source: power / utilization / memory / clocks / temperature / power limit /
+# throttle bitmask via the plain NVML queries, plus — when
 # the device supports GPU Performance Monitoring (Hopper and newer, incl. consumer Blackwell on
 # recent drivers; no admin privileges) and counters are wanted — the GPM metrics. GPM is
 # interval-based: a metric is the difference of two samples, so the source keeps two sample
@@ -110,10 +111,38 @@ function GD._sampler_source(::Val{:nvml}, rest::AbstractString, counters::Symbol
         gpm ? zeros(UInt8, sizeof(NVML.nvmlGpmMetricsGet_t)) : UInt8[])
 end
 
+# Guarded NVML query: an unsupported / failing query is a NaN in the row, never an exception.
+function _nvml_or_nan(f, what)
+    try
+        return Float64(f())
+    catch err
+        @debug "NVML $what query failed" exception = err
+        return NaN
+    end
+end
+_nvml_clock(dev, type) = (r = Ref{Cuint}(); NVML.nvmlDeviceGetClockInfo(dev, type, r); r[])   # MHz
+_nvml_power_limit(dev) = (r = Ref{Cuint}(); NVML.nvmlDeviceGetEnforcedPowerLimit(dev, r); r[] / 1000)   # mW → W
+# The bitmask (nvmlClocksEventReason* bits); the entry point was renamed in NVML 12.2.
+function _nvml_throttle(dev)
+    r = Ref{Culonglong}(0)
+    if NVML.version() >= v"12.2"
+        NVML.nvmlDeviceGetCurrentClocksEventReasons(dev, r)
+    else
+        NVML.nvmlDeviceGetCurrentClocksThrottleReasons(dev, r)
+    end
+    return r[]
+end
+
 function GD.sample!(s::NVMLSource)
     ur = NVML.utilization_rates(s.dev)
     base = (power_W = Float64(NVML.power_usage(s.dev)), compute_util = Float64(ur.compute),
-        mem_util = Float64(ur.memory), vram_used_B = Float64(NVML.memory_info(s.dev).used))
+        mem_util = Float64(ur.memory), vram_used_B = Float64(NVML.memory_info(s.dev).used),
+        sm_clock_MHz = _nvml_or_nan(() -> _nvml_clock(s.dev, NVML.NVML_CLOCK_SM), "SM clock"),
+        mem_clock_MHz = _nvml_or_nan(() -> _nvml_clock(s.dev, NVML.NVML_CLOCK_MEM), "memory clock"),
+        temperature_C = _nvml_or_nan(() -> NVML.temperature(s.dev, NVML.NVML_TEMPERATURE_GPU), "temperature"),
+        hotspot_C = NaN,   # NVML exposes no junction sensor (nvmlTemperatureSensors_t is GPU only)
+        power_limit_W = _nvml_or_nan(() -> _nvml_power_limit(s.dev), "power limit"),
+        throttle_reasons = _nvml_or_nan(() -> _nvml_throttle(s.dev), "throttle reasons"))
     s.gpm || return base
     if !s.primed
         NVML.nvmlGpmSampleGet(s.dev, s.samples[s.older])

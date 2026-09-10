@@ -71,11 +71,14 @@ function _amd_device_sysfs(dev = AMDGPU.device())
     error("gpu telemetry: no /sys/class/drm card matches PCI $pci")
 end
 
-# The hwmon power file under a card's sysfs dir: `power1_average` where the driver provides
-# it (most dGPUs), else the instantaneous `power1_input`. Reports µW.
+# The amdgpu hwmon directory under a card's sysfs dir (power, clocks, temperatures).
+_amd_hwmon_dir(card::AbstractString) = first(filter(d -> startswith(basename(d), "hwmon"),
+    readdir(joinpath(card, "hwmon"); join = true)))
+
+# The hwmon power file: `power1_average` where the driver provides it (most dGPUs), else the
+# instantaneous `power1_input`. Reports µW.
 function _amd_power_file(card::AbstractString)
-    hw = first(filter(d -> startswith(basename(d), "hwmon"),
-        readdir(joinpath(card, "hwmon"); join = true)))
+    hw = _amd_hwmon_dir(card)
     f = isfile(joinpath(hw, "power1_average")) ? "power1_average" : "power1_input"
     return joinpath(hw, f)
 end
@@ -93,13 +96,20 @@ end
 # paths once; the sampler child (a Julia process that never loads AMDGPU.jl) then reads the amdgpu
 # driver's counters (VRAM included, via `mem_info_vram_used` — no hipMemGetInfo) directly, immune
 # to this process's HIP locks and Julia's GC/timer coupling. Sysfs paths contain no ':' so the
-# spec join is safe. No hardware counters here (`counters` is ignored).
+# spec join is safe. No hardware counters here (`counters` is ignored). Spec:
+# `sysfs:<device>:<power>:<busy>:<membusy>:<vram>:<sclk>:<mclk>:<temp_edge>:<temp_hot>:<power_cap>`,
+# `-` for a file the device lacks; the hwmon files are `freq1_input` (sclk, Hz), `freq2_input`
+# (mclk, Hz), `temp1_input` (edge, m°C), `temp2_input` (junction, m°C), `power1_cap` (µW).
 function GD.gpu_sampler_sources(::ROCBackend, device_ids::AbstractVector{<:Integer}, ::Symbol)
     specs = map(device_ids) do i
         card = _amd_device_sysfs(AMDGPU.devices()[i])
-        mb = joinpath(card, "mem_busy_percent")   # absent on some devices (e.g. iGPUs) → nan
+        hw = _amd_hwmon_dir(card)
+        opt(p) = isfile(p) ? p : "-"   # absent on some devices (e.g. iGPUs) → nan
         "sysfs:" * join([string(i), _amd_power_file(card), joinpath(card, "gpu_busy_percent"),
-            isfile(mb) ? mb : "-", joinpath(card, "mem_info_vram_used")], ":")
+            opt(joinpath(card, "mem_busy_percent")), joinpath(card, "mem_info_vram_used"),
+            opt(joinpath(hw, "freq1_input")), opt(joinpath(hw, "freq2_input")),
+            opt(joinpath(hw, "temp1_input")), opt(joinpath(hw, "temp2_input")),
+            opt(joinpath(hw, "power1_cap"))], ":")
     end
     return (specs = specs, packages = Base.PkgId[])
 end

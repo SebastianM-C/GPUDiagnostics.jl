@@ -15,12 +15,15 @@ fallbacks so the plumbing (and its tests) run without a GPU.
 - **Device-event kernel timing** — `gpu_event` / `gpu_elapsed` on the task-local launch stream,
   and `LaunchTimer` + `launch_times` for one event pair per launch: the only kernel clock that
   works when launches are queued asynchronously (a host clock measures enqueue latency).
-- **Telemetry** — `gpu_sample` is one snapshot of a device (power / utilization / VRAM, plus
-  NVIDIA GPM hardware counters where available: ACHIEVED SM occupancy, FP64 / FP32 / tensor pipe
-  and DRAM-bandwidth utilization, PCIe / NVLink traffic); `with_gpu_sampler` runs a function while
-  a child process takes that sample per device per tick into a TSV, and `gpu_telemetry_stats`
-  reduces the resulting `GPUTelemetry` column table. In-process sampling wedges behind a backed-up
-  kernel stream or is suspended by Julia's GC/timer coupling; a child is immune.
+- **Telemetry** — `gpu_sample` is one snapshot of a device (power / utilization / VRAM / SM and
+  memory clocks / edge and hotspot temperature / power limit / throttle-reason bitmask — decoded by
+  `throttle_reasons` — plus NVIDIA GPM hardware counters where available: ACHIEVED SM occupancy,
+  FP64 / FP32 / tensor pipe and DRAM-bandwidth utilization, PCIe / NVLink traffic);
+  `with_gpu_sampler` runs a function while a child process takes that sample per device per tick
+  into a TSV, and `gpu_telemetry_stats` reduces the resulting `GPUTelemetry` column table
+  (means, peaks, busy-window means and medians, the power-capped fraction). In-process sampling
+  wedges behind a backed-up kernel stream or is suspended by Julia's GC/timer coupling; a child
+  is immune.
 - **Measured peak** — `measure_peak_flops(backend, T)`: a dependent-FMA-chain kernel gives the
   attainable vector FP64 (or FP32) rate of the device at the clocks it actually holds, never
   routed to matrix/tensor units. Runs on every backend, the CPU included.
@@ -74,7 +77,7 @@ export FEATURES, supports, capabilities, BackendUnsupported,
     gpu_event, gpu_elapsed, LaunchTimer, launch_times, first_launch_s, launch_lane, launch_tick, launch_tock!,
     LaunchOverhead, measure_launch_overhead, HostSnapshot, host_snapshot, backend_versions,
     gpu_sample, gpu_sampler_sources, sampler_source, SamplerSource, telemetry_child_main,
-    with_gpu_sampler, GPUTelemetry, gpu_telemetry_stats,
+    with_gpu_sampler, GPUTelemetry, gpu_telemetry_stats, throttle_reasons, THROTTLE_REASON_BITS,
     measure_peak_flops,
     CompiledKernel, KernelResources, KernelOccupancy, compiled_kernels, kernel_resources,
     MIX_CLASSES, SASS_RULES, AMD_RULES, MixLoop, InstructionMix, KernelInstructionMix, FP64IssueFloor,
