@@ -37,6 +37,11 @@ fallbacks so the plumbing (and its tests) run without a GPU.
   job's optimized LLVM IR by typed opcode (the arithmetic before backend contraction);
   `fp64_issue_floor` turns a per-slot FP64 count and the measured FP64 rate into the FP64-pipe
   time floor per launch.
+- **Cheap probes** — `measure_launch_overhead` (device / enqueue / round-trip cost of a launch:
+  the floor below which launches dominate) and `host_snapshot` (Julia and BLAS threads against
+  the host cores AND the cgroup CPU quota, memory limits, OS kernel, driver / runtime / vendor
+  package versions, warnings as data); `first_launch_s` / `launch_times(; skip_first)` separate
+  the JIT-carrying first launch from the steady state.
 - **Report layer** — `diagnostics_dict(x; prefix)` turns every result type (`KernelResources`,
   `KernelInstructionMix`, `IRMix`, `FP64IssueFloor`, `LaunchTimer`, `GPUTelemetry`,
   `RocprofCounters`) into a flat `Dict{String, Any}` of TOML-safe scalars with stable, additive
@@ -58,6 +63,7 @@ import Adapt
 import KernelAbstractions
 import KernelAbstractions as KA
 import Statistics
+using LinearAlgebra: LinearAlgebra
 import Tables
 using KernelAbstractions: Backend, @kernel, @index, @Const
 
@@ -65,7 +71,8 @@ export FEATURES, supports, capabilities, BackendUnsupported,
     gpu_device_count, gpu_device, gpu_device!, gpu_name, gpu_arch,
     gpu_sm_count, gpu_max_threads_per_sm, gpu_memory_info, gpu_power, gpu_utilization,
     thread_fill_occupancy,
-    gpu_event, gpu_elapsed, LaunchTimer, launch_times, launch_lane, launch_tick, launch_tock!,
+    gpu_event, gpu_elapsed, LaunchTimer, launch_times, first_launch_s, launch_lane, launch_tick, launch_tock!,
+    LaunchOverhead, measure_launch_overhead, HostSnapshot, host_snapshot, backend_versions,
     gpu_sample, gpu_sampler_sources, sampler_source, SamplerSource, telemetry_child_main,
     with_gpu_sampler, GPUTelemetry, gpu_telemetry_stats,
     measure_peak_flops,
@@ -85,5 +92,6 @@ include("resources.jl")    # compile-time resource report: registers / spills / 
 include("instruction_mix.jl")   # static instruction mix of the disassembly + loop nest + FP64-issue floor
 include("rocprof.jl")           # AMD hardware counters: rocprofv3 wrapper + CSV parser + normalised derived metrics
 include("report.jl")            # diagnostics_dict (flat TOML-safe dicts), show methods, Tables.jl on GPUTelemetry
+include("probes.jl")            # launch-overhead probe, host environment snapshot (cgroup quota, versions)
 
 end

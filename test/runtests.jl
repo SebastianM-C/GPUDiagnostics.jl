@@ -769,6 +769,43 @@ end
         @test [r.power_W for r in GPUDiagnostics.Tables.rows(tel)] == [100.0, 120.0, 110.0]
     end
 
+    @testset "probes: launch overhead, host snapshot, warm-up accounting" begin
+        o = measure_launch_overhead(CPU(); n = 20, workgroup = 8)
+        @test o isa LaunchOverhead && o.n == 20 && o.device_s ≥ 0 && o.enqueue_s > 0 && o.roundtrip_s > 0 && o.queue_depth > 0
+        @test_throws BackendUnsupported measure_launch_overhead(NoVendorBackend())
+        @test_throws ArgumentError measure_launch_overhead(CPU(); n = 0)
+        @test diagnostics_dict(o; prefix = "launch_")["launch_n"] == 20 && occursin("queue depth", sprint(show, o))
+
+        h = host_snapshot()
+        @test h isa HostSnapshot && h.julia == string(VERSION) && h.julia_threads == Threads.nthreads() && h.cpu_threads == Sys.CPU_THREADS
+        @test h.memory_total_B > h.memory_available_B > 0 && h.backend == "" && ismissing(h.gpu_driver)
+        @test h.packages["KernelAbstractions"] == string(pkgversion(KA)) && haskey(h.packages, "GPUDiagnostics")
+        hc = host_snapshot(CPU())
+        @test hc.backend == "CPU" && ismissing(hc.gpu_runtime)   # no vendor: backend_versions is empty
+        struct FakeVersionsGPU <: Backend end
+        GPUDiagnostics.backend_versions(::FakeVersionsGPU) = (; driver = "1.2", runtime = "3.4", package = "Fake.jl 0.1")
+        hv = host_snapshot(FakeVersionsGPU())
+        @test hv.gpu_driver == "1.2" && hv.gpu_runtime == "3.4" && hv.gpu_package == "Fake.jl 0.1"
+        dh = diagnostics_dict(hv; prefix = "host_")
+        @test dh["host_gpu_driver"] == "1.2" && dh["host_julia_threads"] == Threads.nthreads() && haskey(dh, "host_pkg_KernelAbstractions")
+        @test !haskey(dh, "host_warnings") == isempty(hv.warnings)
+        @test occursin("julia_threads", sprint(show, MIME"text/plain"(), hv)) && occursin("HostSnapshot(", sprint(show, hv))
+        # cgroup parsing
+        @test GPUDiagnostics._cpu_quota_from_max("200000 100000") == 2.0
+        @test ismissing(GPUDiagnostics._cpu_quota_from_max("max 100000")) && ismissing(GPUDiagnostics._cpu_quota_from_max("garbage"))
+        @test GPUDiagnostics._cpu_quota_from_max("50000 100000") == 0.5
+        # warm-up accounting on the LaunchTimer
+        timer = LaunchTimer()
+        lane = launch_lane(timer, CPU())
+        for i in 1:3
+            e0 = launch_tick(timer, CPU()); sleep(i == 1 ? 0.02 : 0.001); launch_tock!(timer, lane, CPU(), e0)
+        end
+        f = first_launch_s(timer)
+        @test f[1] ≈ launch_times(timer)[1][1] && f[1] > 0.015
+        @test length(launch_times(timer; skip_first = true)[1]) == 2 && all(<(0.015), launch_times(timer; skip_first = true)[1])
+        @test isempty(first_launch_s(LaunchTimer()))
+    end
+
     @testset "rocprofv3 counters: CSV parser, normalisation, command wrapper" begin
         fx = joinpath(@__DIR__, "fixtures", "rocprof")   # trimmed real MI300X collections (3 sets)
         S = 401 * 401 * 1666   # slots of one dispatch of the fixture cell (pixels × window samples)
