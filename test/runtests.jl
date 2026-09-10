@@ -120,7 +120,7 @@ end
         @test_throws ArgumentError gpu_sample(CPU(), 1; counters = :sometimes)
         r, telem = @test_logs (:warn, r"GPU telemetry unavailable") with_gpu_sampler(() -> 42, CPU(), 0.1)
         @test r == 42 && telem isa GPUTelemetry && telem.ticks == 0 && length(telem) == 0
-        @test telem.columns == [:t_rel_s, :device] && telem.trace === nothing && !telem.starved && isnan(telem.first_sample_s)
+        @test telem.columns == [:t_rel_s, :device] && telem.trace === nothing && !telem.starved && ismissing(telem.first_sample_s)
         @test isempty(gpu_telemetry_stats(telem))
         @test_throws ArgumentError with_gpu_sampler(() -> throw(ArgumentError("boom")), NoVendorBackend(), 0.1)
 
@@ -370,12 +370,21 @@ end
         r = kernel_resources(FakeGPU(), ck)
         @test r.block_size == 128                      # defaults to the static workgroup size
         @test r.registers == 123 && r.local_mem_bytes == 584 && r.shared_mem_bytes == 65536
+        @test ismissing(r.const_mem_bytes) && r.max_threads_per_block == 1024   # HIP's −1 ⇒ missing
         @test r.active_blocks_per_sm == 1 && r.warp_size == 32 && r.max_warps_per_sm == 64
         @test r.active_warps_per_sm == 4 && r.occupancy ≈ 4 / 64
         @test r.isa["vgpr_count"] == 123 && r.name == ck.name && r.signature == ck.signature
         r2 = kernel_resources(FakeGPU(), ck; block_size = 1024)
         @test r2.active_warps_per_sm == 32 && r2.occupancy ≈ 0.5
         @test_throws ArgumentError kernel_resources(FakeGPU(), ck; block_size = 0)
+        struct FakeNoOccGPU <: Backend end
+        GPUDiagnostics.supports(::FakeNoOccGPU, ::Val{:resources}) = true
+        GPUDiagnostics.backend_kernel_attributes(::FakeNoOccGPU, k::FakeKernel) =
+            (; registers = missing, local_mem_bytes = 0, shared_mem_bytes = 0, const_mem_bytes = missing, max_threads_per_block = 1024)
+        GPUDiagnostics.backend_kernel_occupancy(::FakeNoOccGPU, k::FakeKernel, block_size::Int) =
+            (; active_blocks_per_sm = 0, warp_size = 32, max_threads_per_sm = 0, shared_mem_per_sm = 0)
+        r3 = kernel_resources(FakeNoOccGPU(), ck)
+        @test ismissing(r3.registers) && ismissing(r3.const_mem_bytes) && ismissing(r3.occupancy)
         @test length(kernel_resources(FakeGPU(), "StaticSize")) == 1
     end
 
@@ -523,7 +532,7 @@ end
         @test instruction_mix(amd_bad2, :amd).llvm_loops_agree === false
         # no loops at all
         m0 = instruction_mix("k:\n\ts_load_b64 s[0:1], s[4:5], 0x0\n\ts_endpgm\n", :amd)
-        @test m0.total == 2 && isempty(m0.loops) && m0.hot_loop === nothing && m0.hot_loop_confidence === :none && m0.llvm_loops_agree === nothing
+        @test m0.total == 2 && isempty(m0.loops) && m0.hot_loop === nothing && m0.hot_loop_confidence === :none && ismissing(m0.llvm_loops_agree)
 
         # SASS listing (nvdisasm --print-code): predicated/uniform branches, BSSY targets that
         # are not edges, an unconditional EXIT ending a block, the trap spin after it (dropped)
@@ -587,7 +596,7 @@ end
         @test length(ms.loops) == 2                                        # the .L_x_3 trap spin is dropped
         @test ms.loops[1].header == ".L_x_0" && ms.loops[1].depth == 1 && ms.loops[1].blocks == 3 && ms.loops[1].total == 16 && ms.loops[1].exclusive_total == 10
         @test ms.loops[2].header == ".L_x_1" && ms.loops[2].depth == 2 && ms.loops[2].total == 6
-        @test ms.hot_loop.header == ".L_x_0" && ms.hot_loop_confidence === :medium && ms.llvm_loops_agree === nothing
+        @test ms.hot_loop.header == ".L_x_0" && ms.hot_loop_confidence === :medium && ismissing(ms.llvm_loops_agree)
         @test_throws ArgumentError instruction_mix(sass, :intel)
 
         # FP64-issue floor: lane-instruction rate = peak / 2 (FMA chain), floor = count × slots / rate
@@ -595,7 +604,7 @@ end
         @test fl.scope === :hot_loop && fl.fp64_per_slot == 6 && fl.fp64_lane_instructions == 6.0e6
         @test fl.floor_s ≈ 6.0e-6 && fl.fp64_issue_fraction ≈ 0.5 && fl.confidence === :medium
         fl2 = fp64_issue_floor(ms; n_slots = 10, peak_fp64_flops = 4.0)
-        @test fl2.floor_s ≈ 30.0 && isnan(fl2.fp64_issue_fraction) && fl2.kernel_time_s === nothing
+        @test fl2.floor_s ≈ 30.0 && ismissing(fl2.fp64_issue_fraction) && ismissing(fl2.kernel_time_s)
         flt = fp64_issue_floor(ms; n_slots = 1, peak_fp64_flops = 2.0, scope = :total)
         @test flt.fp64_per_slot == 6 && flt.confidence === :static_total
         @test_throws ArgumentError fp64_issue_floor(m0; n_slots = 1, peak_fp64_flops = 1.0)

@@ -97,6 +97,12 @@ function Base.showerror(io::IO, e::BackendUnsupported)
     return nothing
 end
 
+# Convention for values a backend cannot answer, at the API boundary (every NamedTuple / struct
+# field and dict value the package returns): `missing`. `NaN` only inside the numeric telemetry
+# matrix and on its TSV wire, where rows must stay numeric. `nothing` means the thing does not
+# exist or was not asked for (a kernel with no loop, `ir = false`, no trace file) — never "the
+# vendor could not report it". Serialisation (diagnostics_dict) omits `missing` keys.
+
 # Guard for entry points: no-op when declared, else the typed error.
 @inline function _require(backend::Backend, feature::Symbol, entry::Symbol)
     supports(backend, Val(feature)) || throw(BackendUnsupported(backend, feature, entry))

@@ -79,8 +79,8 @@ Returns a NamedTuple:
 - `shared_mem_bytes` — static shared memory (LDS) per block the kernel descriptor RESERVES,
   whether or not the source declares any (LLVM's AMDGPU backend promotes private arrays it
   cannot keep in registers to LDS, sized for the kernel's maximum block size);
-- `const_mem_bytes`, `max_threads_per_block` — as reported by the runtime (`-1` = not
-  reported);
+- `const_mem_bytes`, `max_threads_per_block` — as reported by the runtime; `missing` when it
+  does not report one (HIP implements no const-size attribute);
 - `active_blocks_per_sm`, `active_warps_per_sm`, `max_warps_per_sm`, `warp_size`,
   `occupancy` — the vendor occupancy calculator's resident blocks per SM (CU / WGP on AMD)
   at `block_size`, converted to warps (waves) and divided by the device's resident-warp
@@ -111,7 +111,7 @@ function kernel_resources(backend::KA.Backend, ck::CompiledKernel;
         block_size::Integer = something(ck.workgroup_size, 256))
     _require(backend, :resources, :kernel_resources)
     block_size > 0 || throw(ArgumentError("kernel_resources: block_size must be > 0 (got $block_size)"))
-    attrs = backend_kernel_attributes(backend, ck.kernel)          # registers, local/shared/const bytes, max threads
+    attrs = map(_reported, backend_kernel_attributes(backend, ck.kernel))   # registers, local/shared/const bytes, max threads
     occ = backend_kernel_occupancy(backend, ck.kernel, Int(block_size))   # active blocks/SM + device capacities
     isa = backend_kernel_isa_info(backend, ck)                     # vendor extras (may be empty)
     warps_per_block = cld(Int(block_size), occ.warp_size)
@@ -124,7 +124,7 @@ function kernel_resources(backend::KA.Backend, ck::CompiledKernel;
         max_threads_per_block = attrs.max_threads_per_block,
         active_blocks_per_sm = occ.active_blocks_per_sm, active_warps_per_sm = active_warps,
         max_warps_per_sm = max_warps, warp_size = occ.warp_size,
-        occupancy = max_warps > 0 ? active_warps / max_warps : NaN,
+        occupancy = max_warps > 0 ? active_warps / max_warps : missing,
         max_threads_per_sm = occ.max_threads_per_sm, shared_mem_per_sm = occ.shared_mem_per_sm,
         isa,
     )
@@ -132,11 +132,17 @@ end
 kernel_resources(backend::KA.Backend, pattern::Union{Regex, AbstractString}; kwargs...) =
     [kernel_resources(backend, ck; kwargs...) for ck in compiled_kernels(backend; pattern)]
 
+# The vendor runtimes report "not available" as a negative count (HIP's CONST_SIZE_BYTES is
+# −1); the API boundary says `missing`.
+_reported(x::Integer) = x < 0 ? missing : x
+_reported(x) = x
+
 """    backend_kernel_attributes(backend, kernel) -> NamedTuple
 
 Backend hook (`:resources`): what the compiler gave the vendor `kernel` object, as
 `(; registers, local_mem_bytes, shared_mem_bytes, const_mem_bytes, max_threads_per_block)` —
-a field the runtime cannot report is `missing`."""
+a field the runtime cannot report is `missing` (a negative count is normalised to `missing`
+by [`kernel_resources`](@ref))."""
 function backend_kernel_attributes end
 
 """    backend_kernel_occupancy(backend, kernel, block_size) -> NamedTuple
