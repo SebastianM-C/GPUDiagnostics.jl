@@ -1,0 +1,9 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+GPUDiagnostics = "5ccc9b3c-1187-41e2-9266-b19f02873332"
+
+[sources]
+GPUDiagnostics = {path = ".."}
+
+[compat]
+Documenter = "1"
