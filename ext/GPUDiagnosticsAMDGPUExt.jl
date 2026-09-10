@@ -221,7 +221,7 @@ end
 
 function _isa_vgprs(text::AbstractString)
     info = GD._parse_amdgpu_kernel_info(text)
-    return get(info, "vgpr_count", nothing)
+    return get(info, "vgpr_count", missing)
 end
 
 # Typed IR count: the optimized module of the same job, walked with AMDGPU's LLVM.jl.

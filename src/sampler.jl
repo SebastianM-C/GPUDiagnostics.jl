@@ -250,7 +250,8 @@ end
 Column table returned by [`with_gpu_sampler`](@ref): `columns` (`[:t_rel_s, :device, metric
 columns…]` as declared by the child), `samples::Matrix{Float64}` (one row per device per tick,
 `NaN` where a metric is not reported), `ticks` (sample rounds = rows of the first device), `dt`
-and `window` (requested cadence / sampled window, s), `first_sample_s` (child startup lag),
+and `window` (requested cadence / sampled window, s), `first_sample_s` (child startup lag;
+`missing` when no sample landed),
 `starved` (ticks ≪ window/dt ⇒ stats unreliable), `trace` (the TSV, or `nothing`) and
 `counters`. Index a column by symbol: `telem[:compute_util]`; `haskey(telem, :fp64_util)`."""
 struct GPUTelemetry
@@ -259,14 +260,14 @@ struct GPUTelemetry
     ticks::Int
     dt::Float64
     window::Float64
-    first_sample_s::Float64
+    first_sample_s::Union{Missing, Float64}
     starved::Bool
     trace::Union{String, Nothing}
     counters::Symbol
 end
 const _BASE_COLUMNS = [:t_rel_s, :device]
 _empty_telemetry(dt, counters; columns = copy(_BASE_COLUMNS), window = 0.0) =
-    GPUTelemetry(columns, zeros(0, length(columns)), 0, Float64(dt), window, NaN, false, nothing, counters)
+    GPUTelemetry(columns, zeros(0, length(columns)), 0, Float64(dt), window, missing, false, nothing, counters)
 
 function Base.getindex(t::GPUTelemetry, c::Symbol)
     j = findfirst(==(c), t.columns)

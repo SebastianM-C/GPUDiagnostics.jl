@@ -289,7 +289,7 @@ function GD.backend_kernel_machine_code(backend::CUDABackend, ck::GD.CompiledKer
         rm(cubin; force = true)
     end
     # nvdisasm prints no register count; kernel_resources carries ptxas's
-    return (; text, vendor = :nvidia, isa, native = target === nothing, registers = nothing)
+    return (; text, vendor = :nvidia, isa, native = target === nothing, registers = missing)
 end
 
 # Typed IR count: the optimized module of the same job, walked with CUDACore's LLVM.jl.

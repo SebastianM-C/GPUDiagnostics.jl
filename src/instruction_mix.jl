@@ -480,7 +480,8 @@ prints it) or `:nvidia` (SASS as `nvdisasm --print-code` prints it). Fields:
 - `hot_loop_confidence` — `:high` when the LLVM assembly printer's own loop annotations are
   present and agree with the CFG analysis (AMD), `:medium` when the CFG has a single
   dominant outer loop (≥ 2× the next), `:low` otherwise, `:none` without loops;
-- `llvm_loops_agree` — `true`/`false` when LLVM annotations were present, else `nothing`.
+- `llvm_loops_agree` — `true`/`false` when LLVM annotations were present, else `missing`
+  (the listing carries none, so the check cannot be made).
 """
 function instruction_mix(text::AbstractString, vendor::Symbol)
     blocks = _parse_machine_code(text, vendor)
@@ -527,9 +528,9 @@ end
 
 # LLVM asm-printer loop annotations vs the CFG loops: every annotated block must lie in the
 # CFG loop of the header it names, at the same depth, and every annotated header must be a
-# CFG header. `nothing` when the listing carries no annotations.
+# CFG header. `missing` when the listing carries no annotations.
 function _llvm_loops_agree(blocks::Vector{MixBlock}, loops)
-    any(b -> b.loop_note !== nothing, blocks) || return nothing
+    any(b -> b.loop_note !== nothing, blocks) || return missing
     by_header = Dict(l.header => l for l in loops)
     for (i, b) in enumerate(blocks)
         b.loop_note === nothing && continue
@@ -551,7 +552,7 @@ the control-flow graph and the hot loop's counts. All fields of [`instruction_mi
 plus `name`, `signature`, `target` (the ISA the counted code was compiled for: `gfx1100`,
 `sm_120a`, …), `native` (whether that is the current device's ISA, i.e. whether the counted
 code is the code that ran), and `registers` (the VGPR count read from the AMD listing's
-metadata, to cross-check the runtime's attribute; `nothing` for SASS, where `nvdisasm` prints
+metadata, to cross-check the runtime's attribute; `missing` for SASS, where `nvdisasm` prints
 none — `kernel_resources` has the ptxas figure).
 
 `target = "gfx942"` / `"sm_90"` **cross-compiles** the same kernel — same function, argument
@@ -591,7 +592,7 @@ end
 """    backend_kernel_machine_code(backend, ck::CompiledKernel, target) -> NamedTuple
 
 Backend hook (`:native_mix`): the disassembly of `ck` for `target` (`nothing` = the current
-device), as `(; text, vendor::Symbol, isa::String, native::Bool, registers::Union{Int, Nothing})`.
+device), as `(; text, vendor::Symbol, isa::String, native::Bool, registers::Union{Int, Missing})`.
 `vendor` selects the classifier rules (`:amd`, `:nvidia`)."""
 backend_kernel_machine_code(b::KA.Backend, ck::CompiledKernel, target) =
     throw(BackendUnsupported(b, :native_mix, :kernel_instruction_mix))
@@ -607,7 +608,8 @@ inside the window) ÷ the device's FP64 lane-instruction rate, taken as
 `peak_fp64_flops / 2` (`measure_peak_flops` runs an FMA chain: 2 FLOP per instruction).
 `floor_s` is a lower bound on the launch time on an FP64-issue-bound device;
 `fp64_issue_fraction = floor_s / kernel_time_s` (when a measured launch time is given) is
-the fraction of the launch during which the FP64 pipe was provably issuing.
+the fraction of the launch during which the FP64 pipe was provably issuing (`missing`, like
+`kernel_time_s`, when no launch time was given).
 
 Assumptions, stated in `assumptions`: every FP64 instruction issues at the FMA rate (adds
 and multiplies do; MUFU/`v_rcp_f64` seeds and packed CDNA ops do not, so the floor errs
@@ -630,9 +632,10 @@ function fp64_issue_floor(mix; n_slots::Real, peak_fp64_flops::Real, kernel_time
     fp64 = _fp64_total(counts)
     lane_rate = peak_fp64_flops / 2
     floor_s = fp64 * n_slots / lane_rate
-    frac = kernel_time_s === nothing ? NaN : floor_s / kernel_time_s
+    frac = kernel_time_s === nothing ? missing : floor_s / kernel_time_s
     return (; scope, fp64_per_slot = fp64, n_slots = Float64(n_slots), fp64_lane_instructions = fp64 * Float64(n_slots),
-        peak_fp64_flops = Float64(peak_fp64_flops), floor_s, kernel_time_s, fp64_issue_fraction = frac,
+        peak_fp64_flops = Float64(peak_fp64_flops), floor_s, kernel_time_s = something(kernel_time_s, missing),
+        fp64_issue_fraction = frac,
         confidence = scope === :hot_loop ? mix.hot_loop_confidence : :static_total,
         assumptions = "every FP64 instruction issues at the FMA rate; static count = one pass through the loop, nested loops counted once; per-thread setup outside the loop not counted")
 end

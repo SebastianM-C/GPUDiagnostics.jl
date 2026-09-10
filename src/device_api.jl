@@ -165,7 +165,7 @@ function launch_times(t::LaunchTimer)
 end
 
 """
-    thread_fill_occupancy(backend, n_threads) -> Float64
+    thread_fill_occupancy(backend, n_threads) -> Float64 | missing
 
 Thread-fill occupancy: the fraction of the current device's total resident-thread capacity
 (`gpu_sm_count × gpu_max_threads_per_sm`) a launch of `n_threads` can fill (e.g. the pixel
@@ -173,7 +173,6 @@ count of a pixel-parallel kernel). This is an UPPER BOUND on achieved occupancy 
 shared memory cap it further; [`kernel_resources`](@ref) reports that compile-time bound.
 """
 function thread_fill_occupancy(backend::KA.Backend, n_threads::Integer)
-    capacity = gpu_sm_count(backend) * gpu_max_threads_per_sm(backend)
-
+    capacity = gpu_sm_count(backend) * gpu_max_threads_per_sm(backend)   # missing when either is
     return n_threads / capacity
 end
