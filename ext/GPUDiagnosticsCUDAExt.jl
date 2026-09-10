@@ -331,7 +331,6 @@ function GD.backend_kernel_ir_counts(backend::CUDABackend, ck::GD.CompiledKernel
     return (; functions, isa)
 end
 
-end
 
 # Versions for host_snapshot: the CUDA driver and runtime CUDA.jl binds, the NVML driver string
 # when NVML answers, and the package version.
@@ -339,4 +338,6 @@ function GD.backend_versions(::CUDABackend)
     nvml = try string(NVML.driver_version()) catch; missing end
     return (; driver = string(CUDA.driver_version()) * (ismissing(nvml) ? "" : " (driver $nvml)"),
         runtime = string(CUDA.runtime_version()), package = "CUDA.jl " * string(pkgversion(CUDA)))
+end
+
 end

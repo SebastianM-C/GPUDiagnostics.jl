@@ -246,11 +246,12 @@ function GD.backend_kernel_ir_counts(::ROCBackend, ck::GD.CompiledKernel{<:AMDGP
     return (; functions, isa)
 end
 
-end
 
 # Versions for host_snapshot: the HIP runtime AMDGPU.jl binds and the package version (the
 # amdgpu kernel module version is read from sysfs by host_snapshot itself).
 function GD.backend_versions(::ROCBackend)
     rt = try string(AMDGPU.HIP.runtime_version()) catch; missing end
     return (; runtime = rt, package = "AMDGPU.jl " * string(pkgversion(AMDGPU)))
+end
+
 end
