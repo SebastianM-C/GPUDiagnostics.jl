@@ -21,9 +21,9 @@ fallbacks so the plumbing (and its tests) run without a GPU.
   a child process takes that sample per device per tick into a TSV, and `gpu_telemetry_stats`
   reduces the resulting `GPUTelemetry` column table. In-process sampling wedges behind a backed-up
   kernel stream or is suspended by Julia's GC/timer coupling; a child is immune.
-- **Measured FP64 peak** — `measure_peak_fp64_flops` / `gpu_peak_fp64_flops`: a dependent-FMA-chain
-  kernel gives the attainable vector FP64 rate of the device at the clocks it actually holds
-  (never routed to matrix/tensor units); BLAS `peakflops` on the CPU backend.
+- **Measured peak** — `measure_peak_flops(backend, T)`: a dependent-FMA-chain kernel gives the
+  attainable vector FP64 (or FP32) rate of the device at the clocks it actually holds, never
+  routed to matrix/tensor units. Runs on every backend, the CPU included.
 - **Compile-time resource report** — `compiled_kernels` inventories the kernels this process
   compiled (from the vendor's kernel cache, so closures inside driver functions are reachable
   too) and `kernel_resources` reports registers, spill/stack and shared (LDS) memory, and the
@@ -52,7 +52,6 @@ import Adapt
 import KernelAbstractions
 import KernelAbstractions as KA
 using KernelAbstractions: Backend, @kernel, @index, @Const
-using LinearAlgebra: LinearAlgebra
 
 export FEATURES, supports, capabilities, BackendUnsupported,
     gpu_device_count, gpu_device, gpu_device!, gpu_name, gpu_arch,
@@ -61,7 +60,7 @@ export FEATURES, supports, capabilities, BackendUnsupported,
     gpu_event, gpu_elapsed, LaunchTimer, launch_times, launch_lane, launch_tick, launch_tock!,
     gpu_sample, gpu_sampler_sources, sampler_source, SamplerSource, telemetry_child_main,
     with_gpu_sampler, GPUTelemetry, gpu_telemetry_stats,
-    measure_peak_fp64_flops, gpu_peak_fp64_flops,
+    measure_peak_flops,
     CompiledKernel, compiled_kernels, kernel_resources,
     MIX_CLASSES, SASS_RULES, AMD_RULES, instruction_mix, kernel_instruction_mix, fp64_issue_floor,
     IR_CLASSES, kernel_ir_mix,
@@ -69,7 +68,7 @@ export FEATURES, supports, capabilities, BackendUnsupported,
     rocprof_median, rocprof_derived, rocprof_summary, rocprof_manifest_section
 
 include("capabilities.jl")   # supports/capabilities trait + BackendUnsupported; declared per backend by ext/
-include("device_api.jl")   # generics + CPU fallbacks + LaunchTimer; vendor methods in ext/
+include("device_api.jl")   # generics + CPU fallbacks + LaunchTimer; vendor methods in ext/ (hooks: backend_*)
 include("sampler.jl")      # gpu_sample sources, the telemetry child, with_gpu_sampler, gpu_telemetry_stats
 include("peakflops.jl")    # FMA-chain FP64 peak probe
 include("resources.jl")    # compile-time resource report: registers / spills / LDS / occupancy

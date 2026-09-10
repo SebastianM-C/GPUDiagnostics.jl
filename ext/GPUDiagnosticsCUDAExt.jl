@@ -17,7 +17,7 @@ _nvml() = NVML.Device(CUDA.uuid(CUDA.device()))
 
 # Everything but the AMD-only counter path. GPM counters are a per-device runtime question
 # (Hopper+ and recent consumer drivers); the FEATURE is the sampler knowing how to ask.
-for f in (:devices, :device_props, :events, :telemetry, :telemetry_counters, :fp64_peak,
+for f in (:devices, :device_props, :events, :telemetry, :telemetry_counters, :peak_flops, :fp64,
         :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix)
     @eval GD.supports(::CUDABackend, ::Val{$(QuoteNode(f))}) = true
 end
@@ -176,11 +176,11 @@ end
 # `cuOccupancyMaxActiveBlocksPerMultiprocessor`, capacities from the CURRENT device.
 const _CC = isdefined(CUDA, :CUDACore) ? CUDA.CUDACore : CUDA
 
-GD._compiled_kernels(::CUDABackend) = Base.@lock _CC.cufunction_lock begin
-    [GD._compiled_kernel(k) for k in values(_CC._kernel_instances) if k isa CUDA.HostKernel]
+GD.backend_compiled_kernels(::CUDABackend) = Base.@lock _CC.cufunction_lock begin
+    [GD.backend_wrap_kernel(k) for k in values(_CC._kernel_instances) if k isa CUDA.HostKernel]
 end
 
-function GD._kernel_attributes(::CUDABackend, k::CUDA.HostKernel)
+function GD.backend_kernel_attributes(::CUDABackend, k::CUDA.HostKernel)
     mem = CUDA.memory(k)   # (local, shared, constant) bytes; `local` is a keyword → positional
     return (;
         registers = Int(CUDA.registers(k)),
@@ -191,7 +191,7 @@ function GD._kernel_attributes(::CUDABackend, k::CUDA.HostKernel)
     )
 end
 
-function GD._kernel_occupancy(::CUDABackend, k::CUDA.HostKernel, block_size::Int)
+function GD.backend_kernel_occupancy(::CUDABackend, k::CUDA.HostKernel, block_size::Int)
     dev = CUDA.device()
     return (;
         active_blocks_per_sm = Int(CUDA.active_blocks(k.fun, block_size)),
@@ -210,7 +210,7 @@ end
 # (`always_inline` from the backend, `maxthreads` = the static KA workgroup size); the register
 # count is checked against the runtime attribute so a mismatched regeneration is flagged, not
 # trusted. Costs a few seconds of compiler time; nothing is launched.
-function GD._kernel_isa_info(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel})
+function GD.backend_kernel_isa_info(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel})
     k = ck.kernel
     info = Dict{String, Any}()
     try
@@ -278,7 +278,7 @@ function _mix_job(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel}
     return _GPUC.CompilerJob(_GPUC.methodinstance(typeof(k.f), TT), config), _CC.cpu_name(config.params.sm)
 end
 
-function GD._kernel_machine_code(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel}, target)
+function GD.backend_kernel_machine_code(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel}, target)
     job, isa = _mix_job(backend, ck, target)
     compiled = _CC.compile(job)
     cubin = tempname(; cleanup = false) * ".cubin"
@@ -293,7 +293,7 @@ function GD._kernel_machine_code(backend::CUDABackend, ck::GD.CompiledKernel{<:C
 end
 
 # Typed IR count: the optimized module of the same job, walked with CUDACore's LLVM.jl.
-function GD._kernel_ir_counts(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel}, target)
+function GD.backend_kernel_ir_counts(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel}, target)
     job, isa = _mix_job(backend, ck, target)
     functions = _GPUC.JuliaContext() do ctx
         ir, _ = _GPUC.compile(:llvm, job)

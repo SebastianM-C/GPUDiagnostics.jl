@@ -22,7 +22,7 @@
 # present the CFG result is checked against them, which is what backs a `:high` confidence.
 #
 # The derived figure ([`fp64_issue_floor`](@ref)) combines a per-slot FP64 instruction count
-# with the MEASURED FP64 issue rate of the device (`measure_peak_fp64_flops`, an FMA chain at
+# with the MEASURED FP64 issue rate of the device (`measure_peak_flops`, an FMA chain at
 # 2 FLOP per lane-instruction) into the time the FP64 pipe alone needs per launch — a floor on
 # the kernel time on an FP64-issue-bound device, and, against a measured launch time, the
 # fraction of the launch the FP64 pipe is provably busy. Every FP64 instruction is assumed to
@@ -576,7 +576,7 @@ function kernel_instruction_mix(backend::KA.Backend, ck::CompiledKernel; target 
         ir::Bool = true)
     _require(backend, :native_mix, :kernel_instruction_mix)
     tgt = target === nothing ? nothing : String(target)
-    code = _kernel_machine_code(backend, ck, tgt)
+    code = backend_kernel_machine_code(backend, ck, tgt)
     if dump isa IO
         write(dump, code.text)
     elseif dump !== nothing
@@ -588,9 +588,12 @@ function kernel_instruction_mix(backend::KA.Backend, ck::CompiledKernel; target 
         registers = code.registers), mix, (; ir = irc))
 end
 
-# Vendor hook (ext/): the disassembly of `ck` for `target` (nothing = the current device), as
-# `(; text, vendor::Symbol, isa::String, native::Bool, registers::Union{Int, Nothing})`.
-_kernel_machine_code(b::KA.Backend, ck::CompiledKernel, target) =
+"""    backend_kernel_machine_code(backend, ck::CompiledKernel, target) -> NamedTuple
+
+Backend hook (`:native_mix`): the disassembly of `ck` for `target` (`nothing` = the current
+device), as `(; text, vendor::Symbol, isa::String, native::Bool, registers::Union{Int, Nothing})`.
+`vendor` selects the classifier rules (`:amd`, `:nvidia`)."""
+backend_kernel_machine_code(b::KA.Backend, ck::CompiledKernel, target) =
     throw(BackendUnsupported(b, :native_mix, :kernel_instruction_mix))
 
 """
@@ -601,7 +604,7 @@ MEASURED issue rate: `fp64_per_slot` FP64 instructions (the six FP64 classes of 
 `hot_loop` — `scope = :total` uses the whole-kernel count instead) × `n_slots` executions
 (hot-loop iterations summed over all threads; e.g. pixels × samples when every slot is
 inside the window) ÷ the device's FP64 lane-instruction rate, taken as
-`peak_fp64_flops / 2` (`measure_peak_fp64_flops` runs an FMA chain: 2 FLOP per instruction).
+`peak_fp64_flops / 2` (`measure_peak_flops` runs an FMA chain: 2 FLOP per instruction).
 `floor_s` is a lower bound on the launch time on an FP64-issue-bound device;
 `fp64_issue_fraction = floor_s / kernel_time_s` (when a measured launch time is given) is
 the fraction of the launch during which the FP64 pipe was provably issuing.
@@ -750,10 +753,15 @@ still has out-of-line callees) and `target`. Whole-module totals: IR loops are n
 """
 function kernel_ir_mix(backend::KA.Backend, ck::CompiledKernel; target = nothing)
     _require(backend, :ir_mix, :kernel_ir_mix)
-    r = _kernel_ir_counts(backend, ck, target === nothing ? nothing : String(target))
+    r = backend_kernel_ir_counts(backend, ck, target === nothing ? nothing : String(target))
     counts = reduce(_add_ir, values(r.functions); init = _zero_ir())
     return (; target = r.isa, total = sum(counts), fp64 = sum(counts[c] for c in IR_FP64_CLASSES), counts,
         functions = r.functions)
 end
-_kernel_ir_counts(b::KA.Backend, ck::CompiledKernel, target) =
+"""    backend_kernel_ir_counts(backend, ck::CompiledKernel, target) -> (; functions, isa)
+
+Backend hook (`:ir_mix`, required of every GPU backend): the optimized LLVM IR of `ck`'s
+GPUCompiler job for `target`, walked with [`GPUDiagnostics._ir_counts`](@ref) into
+`functions::Dict{String, IRCounts}` plus the `isa` string the job compiled for."""
+backend_kernel_ir_counts(b::KA.Backend, ck::CompiledKernel, target) =
     throw(BackendUnsupported(b, :ir_mix, :kernel_ir_mix))

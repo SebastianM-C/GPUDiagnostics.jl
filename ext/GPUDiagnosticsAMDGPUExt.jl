@@ -16,7 +16,7 @@ const GD = GPUDiagnostics
 # AMDGPU device ids are already 1-based (HIPDevice(id=1, …)), matching the common API — no offset.
 # Everything but GPM-style in-sample counters (no in-process counter API on AMD; the
 # hardware counters go through rocprofv3, the `:hw_counters` path).
-for f in (:devices, :device_props, :events, :telemetry, :fp64_peak,
+for f in (:devices, :device_props, :events, :telemetry, :peak_flops, :fp64,
         :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix, :hw_counters)
     @eval GD.supports(::ROCBackend, ::Val{$(QuoteNode(f))}) = true
 end
@@ -112,8 +112,8 @@ end
 # is what HIP calls one — a WGP on RDNA3, a CU on CDNA), capacities from the CURRENT device's
 # properties. The ISA dump (`code_native`, ~0.5 s, no launch) adds the SGPR/VGPR/spill/scratch
 # figures and the compiler's own occupancy estimate, which the HIP attributes do not expose.
-GD._compiled_kernels(::ROCBackend) = Base.@lock AMDGPU.Compiler.hipfunction_lock begin
-    [GD._compiled_kernel(k) for k in values(AMDGPU.Compiler._kernel_instances) if k isa AMDGPU.Runtime.HIPKernel]
+GD.backend_compiled_kernels(::ROCBackend) = Base.@lock AMDGPU.Compiler.hipfunction_lock begin
+    [GD.backend_wrap_kernel(k) for k in values(AMDGPU.Compiler._kernel_instances) if k isa AMDGPU.Runtime.HIPKernel]
 end
 
 function _hip_func_attr(fun::AMDGPU.HIP.HIPFunction, attr)
@@ -122,7 +122,7 @@ function _hip_func_attr(fun::AMDGPU.HIP.HIPFunction, attr)
     return Int(v[])
 end
 
-function GD._kernel_attributes(::ROCBackend, k::AMDGPU.Runtime.HIPKernel)
+function GD.backend_kernel_attributes(::ROCBackend, k::AMDGPU.Runtime.HIPKernel)
     HIP = AMDGPU.HIP
     a(attr) = _hip_func_attr(k.fun, attr)
     return (;
@@ -134,7 +134,7 @@ function GD._kernel_attributes(::ROCBackend, k::AMDGPU.Runtime.HIPKernel)
     )
 end
 
-function GD._kernel_occupancy(::ROCBackend, k::AMDGPU.Runtime.HIPKernel, block_size::Int)
+function GD.backend_kernel_occupancy(::ROCBackend, k::AMDGPU.Runtime.HIPKernel, block_size::Int)
     nb = Ref{Cint}(0)
     AMDGPU.HIP.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(nb, k.fun, block_size, 0)
     dev = AMDGPU.device()
@@ -147,7 +147,7 @@ function GD._kernel_occupancy(::ROCBackend, k::AMDGPU.Runtime.HIPKernel, block_s
     )
 end
 
-function GD._kernel_isa_info(::ROCBackend, ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel})
+function GD.backend_kernel_isa_info(::ROCBackend, ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel})
     k = ck.kernel
     TT = typeof(k).parameters[2]
     try
@@ -209,7 +209,7 @@ function _with_target_libs(f, native::Bool)
     end
 end
 
-function GD._kernel_machine_code(::ROCBackend, ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel}, target)
+function GD.backend_kernel_machine_code(::ROCBackend, ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel}, target)
     job, isa = _mix_job(ck, target)
     io = IOBuffer()
     _with_target_libs(target === nothing) do
@@ -225,7 +225,7 @@ function _isa_vgprs(text::AbstractString)
 end
 
 # Typed IR count: the optimized module of the same job, walked with AMDGPU's LLVM.jl.
-function GD._kernel_ir_counts(::ROCBackend, ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel}, target)
+function GD.backend_kernel_ir_counts(::ROCBackend, ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel}, target)
     job, isa = _mix_job(ck, target)
     functions = _with_target_libs(target === nothing) do
         _GPUC.JuliaContext() do ctx

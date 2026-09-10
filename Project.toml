@@ -6,7 +6,6 @@ version = "0.1.0"
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
-LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 
 [weakdeps]
 AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
@@ -29,7 +28,6 @@ CUDA = "6"
 GPUCompiler = "2"
 KernelAbstractions = "0.9.41"
 LLVM = "9"
-LinearAlgebra = "1.10"
 Test = "1"
 julia = "1.10"
 
