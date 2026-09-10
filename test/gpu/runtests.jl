@@ -112,11 +112,14 @@ end
     @testset "telemetry sampler" begin
         s = gpu_sample(backend)
         @test s.power_W > 0 && 0 ≤ s.compute_util ≤ 1 && s.vram_used_B > 0
+        # The child needs a few seconds to start (it loads CUDA.jl for NVML on NVIDIA), so the
+        # workload must outlast that: launch until ~8 s of wall time have passed.
         result, telem = with_gpu_sampler(backend, 0.2; counters = :none) do
-            for _ in 1:20
+            t_end = time() + 8
+            while time() < t_end
                 gpudiag_probe_kernel!(backend, 256)(out, x, Int32(20_000); ndrange = n)
+                KernelAbstractions.synchronize(backend)
             end
-            KernelAbstractions.synchronize(backend)
             :done
         end
         @test result === :done

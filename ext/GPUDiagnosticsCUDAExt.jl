@@ -22,8 +22,8 @@ for f in (:devices, :device_props, :events, :telemetry, :telemetry_counters, :pe
     @eval GD.supports(::CUDABackend, ::Val{$(QuoteNode(f))}) = true
 end
 
-GD.gpu_device_count(::CUDABackend) = length(CUDA.devices())
-GD.gpu_device(::CUDABackend) = CUDA.deviceid(CUDA.device()) + 1          # 0-based CUDA → 1-based API
+GD.gpu_device_count(::CUDABackend) = Int(length(CUDA.devices()))
+GD.gpu_device(::CUDABackend) = Int(CUDA.deviceid(CUDA.device())) + 1          # 0-based CUDA → 1-based API
 function GD.gpu_device!(::CUDABackend, i::Integer)
     prev = CUDA.deviceid(CUDA.device()) + 1
     CUDA.device!(i - 1)
@@ -42,9 +42,9 @@ function GD.gpu_elapsed(start::CUDA.CuEvent, stop::CUDA.CuEvent)
     return Float64(CUDA.elapsed(start, stop))   # seconds
 end
 GD.gpu_sm_count(::CUDABackend) =
-    CUDA.attribute(CUDA.device(), CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+    Int(CUDA.attribute(CUDA.device(), CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT))   # attribute() is Int32
 GD.gpu_max_threads_per_sm(::CUDABackend) =
-    CUDA.attribute(CUDA.device(), CUDA.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)
+    Int(CUDA.attribute(CUDA.device(), CUDA.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR))
 
 GD.gpu_arch(::CUDABackend) = (cc = CUDA.capability(CUDA.device()); "$(cc.major).$(cc.minor)")
 
