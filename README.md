@@ -182,6 +182,10 @@ counters: `GRBM_GUI_ACTIVE` is summed over the dies, so every per-cycle rate div
 - [NVTX.jl](https://github.com/JuliaGPU/NVTX.jl) — range and mark annotations for Nsight Systems
   timelines. Complementary: NVTX labels host regions for a profiler GUI, `LaunchTimer` measures
   individual kernels with device events at run time, without a profiler attached.
+- [LIKWID.jl](https://github.com/JuliaPerf/LIKWID.jl) — hardware performance counters through
+  LIKWID, primarily for the CPU; LIKWID also has NVIDIA (`nvmon`) and ROCm (`rocmon`) counter
+  backends. GPUDiagnostics reaches the GPU counters through the vendor tools instead (NVML GPM
+  counters in-process on NVIDIA, rocprofv3 as a wrapping process on AMD).
 - [CUDA.jl's `@profile`](https://cuda.juliagpu.org/stable/development/profiling/) and
   [AMDGPU.jl's `@roc` profiling](https://amdgpu.juliagpu.org/stable/profiling/) — the vendor packages'
   own integrated profilers, for per-kernel timelines of a single session.
