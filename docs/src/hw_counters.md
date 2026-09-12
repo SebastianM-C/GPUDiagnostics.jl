@@ -334,8 +334,16 @@ dispatch ID alone need not be globally unique. AMD agent metadata is matched by 
 NVIDIA wide raw exports (including their units row) and long metric/value exports are
 supported. Quoted signatures and numeric grouping separators are accepted. Unknown counters
 are `missing`, not zero. Conflicting duplicate counters, units or identities are errors.
-Categorical NVIDIA device/launch attributes stay in dispatch metadata. Native numeric
-values retain their units; the command builder requests base units.
+The raw page exports everything ncu collected, and most of it is not a counter: every
+rollup of each requested metric (`.sum`, `.avg`, `.min`, `.max`) stays in `counters`, while
+`device__*` attributes and NVLink / C2C / NUMA topology go to each dispatch's `device`,
+`launch__*` to its `resources` (with `registers`, `shared_mem_bytes`, `grid_blocks`,
+`workgroup_size` and `grid_size` derived from them), and `profiler__replayer_passes` becomes
+`provenance["passes"]` when every dispatch agrees and the caller did not supply one. Those
+passthrough entries keep their native names on the dispatch and are not summarised:
+`hw_counter_summary` and `diagnostics_dict` carry only the named common properties, so a
+manifest section stays a few dozen keys rather than a few hundred. Native numeric values
+retain their units; the command builder requests base units.
 
 Native access is `hc["SQ_WAVES"]` or `hc["smsp__inst_executed.sum"]`. `hc.units` records
 ncu's units; AMD CSV does not supply units, so those entries are `missing`. `slots` can

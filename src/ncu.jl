@@ -134,6 +134,7 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
     units = Dict{String, Union{Missing, String}}()
     dispatches = HWDispatch[]
     rows = Dict{String, Union{Missing, Float64}}[]
+    passes = Union{Missing, Int}[]
     seen = Dict{Tuple, Int}()
     function setunit(c, u)
         u = ismissing(u) || isempty(u) ? missing : String(u)
@@ -162,6 +163,7 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
             resources = Dict{String, Any}("grid" => getv("Grid Size"), "block" => getv("Block Size"))
             push!(dispatches, HWDispatch(id, pid, dev, ctx, stream, kname, missing, missing, resources, device, missing))
             push!(rows, Dict{String, Union{Missing, Float64}}())
+            push!(passes, missing)
             seen[key] = length(rows)
         end
         i = seen[key]
@@ -173,24 +175,28 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
         metrics = long ? [(String(getv("Metric Name")), getv("Metric Unit"), getv("Metric Value"))] :
             [(c, get(units, c, missing), row[j]) for (j, c) in enumerate(header) if c ∉ _NCU_IDENTITY]
         for (c, u, value) in metrics
+            # `--page raw` exports everything ncu collected: every rollup of each requested metric,
+            # and next to them ~170 device attributes, ~70 launch attributes, NVLink / C2C / NUMA
+            # topology and the replay pass count. Those are not counters: they go to the dispatch's
+            # `device` / `resources` (under their native names) and to `provenance["passes"]`, so
+            # `counters` keeps only what the hardware measured.
             if c == "device__attribute_display_name"
                 dispatches[i].device["name"] = value
                 continue
+            elseif any(pre -> startswith(c, pre), ("device__", "nvlink__", "c2clink__", "numa__"))
+                dispatches[i].device[c] = _metadata_value(value)   # device attributes and topology
+                continue
+            elseif startswith(c, "launch__")
+                dispatches[i].resources[c] = _metadata_value(value)
+                continue
+            elseif c == "profiler__replayer_passes"
+                passes[i] = _counter_int(value)
+                continue
+            elseif startswith(c, "profiler__")
+                continue
             end
             setunit(c, u)
-            v = try
-                _counter_number(value)
-            catch err
-                err isa ArgumentError || rethrow()
-                if startswith(c, "device__attribute_")
-                    dispatches[i].device[c] = value
-                    continue
-                elseif startswith(c, "launch__")
-                    dispatches[i].resources[c] = value
-                    continue
-                end
-                rethrow()
-            end
+            v = _counter_number(value)
             if haskey(rows[i], c)
                 isequal(rows[i][c], v) || throw(ArgumentError("conflicting duplicate ncu metric $c for dispatch $id"))
             else
@@ -203,17 +209,29 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
         duration = _ncu_seconds(get(r, "gpu__time_duration.sum", missing), get(units, "gpu__time_duration.sum", missing))
         !ismissing(duration) && duration < 0 && throw(ArgumentError("negative ncu duration"))
         for (key, c) in (("registers", "launch__registers_per_thread"), ("shared_mem_bytes", "launch__shared_mem_per_block_static"))
-            d.resources[key] = get(r, c, missing)
+            d.resources[key] = get(d.resources, c, missing)
         end
-        blocks = get(r, "launch__grid_size", _ncu_dim_product(get(d.resources, "grid", missing)))
-        threads = get(r, "launch__block_size", _ncu_dim_product(get(d.resources, "block", missing)))
+        blocks = get(d.resources, "launch__grid_size", _ncu_dim_product(get(d.resources, "grid", missing)))
+        threads = get(d.resources, "launch__block_size", _ncu_dim_product(get(d.resources, "block", missing)))
         d.resources["grid_blocks"] = blocks
         d.resources["workgroup_size"] = threads
         d.resources["grid_size"] = blocks * threads  # common field: work-items, as on AMD
         dispatches[i] = HWDispatch(d.id, d.process_id, d.device_id, d.context_id, d.queue_id,
             d.kernel, d.start_s, duration, d.resources, d.device, d.slots)
     end
-    return _build_counters(NsightCompute(), file, dispatches, rows, units; kernel, slots, provenance, required_metrics)
+    # The tool's own pass count is provenance when every dispatch agrees and the caller did not set it.
+    prov = Dict{String, Any}(String(k) => v for (k, v) in pairs(provenance))
+    if !haskey(prov, "passes") && !isempty(passes) && all(!ismissing, passes) && allequal(passes)
+        prov["passes"] = first(passes)
+    end
+    return _build_counters(NsightCompute(), file, dispatches, rows, units; kernel, slots, provenance = prov, required_metrics)
+end
+
+# A metadata cell: numeric where it parses as a number, the string otherwise, missing when empty.
+function _metadata_value(value)
+    ismissing(value) && return missing
+    v = tryparse(Float64, replace(strip(String(value)), "," => ""))
+    return v === nothing ? String(value) : isinteger(v) ? Int(v) : v
 end
 
 function _nvidia_derived(raw, d, units)

@@ -323,8 +323,10 @@ end
 """
     hw_counter_summary(hc) -> Dict{String,Any}
 
-Flat reduction with vendor/tool identity, metadata common to every selected dispatch,
-and `<metric>_median/min/max/samples/rel_spread`. Native counters have `raw_` prefixes and
+Flat reduction with vendor/tool identity, the named device and resource properties common
+to every selected dispatch (`device_n_cu`, `resources_registers`, …; the vendor-namespaced
+passthrough entries such as `launch__*` and `device__attribute_*` stay on the dispatch), and
+`<metric>_median/min/max/samples/rel_spread`. Native counters have `raw_` prefixes and
 unit keys; derived columns have `derived_` prefixes. A total profiled duration is emitted
 only when every dispatch has a duration. Different device/launch properties are not
 silently represented by the first dispatch. Missing keys are omitted.
@@ -338,6 +340,7 @@ function hw_counter_summary(h::HWCounters)
     for field in (:device, :resources)
         dicts = [getfield(d, field) for d in h.dispatches]
         for k in sort!(collect(union((Set(keys(d)) for d in dicts)...)))
+            occursin("__", k) && continue   # vendor-namespaced passthrough metadata stays on the dispatch
             v = get(first(dicts), k, missing)
             ismissing(v) && continue
             all(d -> isequal(get(d, k, missing), v), dicts) && (out[String(field) * "_" * k] = v)

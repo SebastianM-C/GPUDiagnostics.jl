@@ -223,6 +223,16 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test first(h.dispatches).device["name"] == "NVIDIA test GPU"
         @test first(h.dispatches).device["device__attribute_confidential_computing_mode"] == "No-CC"
         @test all(d -> d.resources["grid_size"] == 4096 && d.resources["grid_blocks"] == 16, h.dispatches)
+        # metadata columns of the raw page are not counters: launch attributes → resources, replay passes → provenance
+        @test Set(h.counters) == Set(["gpu__time_duration.sum"; COUNTER_SETS[:nvidia][:fp64].metrics])
+        @test all(d -> d.resources["registers"] == 16 && d.resources["launch__registers_per_thread"] == 16 &&
+            d.resources["launch__func_cache_config"] == "CachePreferNone", h.dispatches)
+        @test h.provenance["passes"] == 3 && hw_counter_summary(h)["collection_passes"] == 3
+        @test hw_counters(joinpath(@__DIR__, "fixtures", "ncu", "fp64_ncu.csv"); provenance = Dict("passes" => 1)).provenance["passes"] == 1
+        s = hw_counter_summary(h)
+        @test !any(k -> occursin("launch__", k) || occursin("profiler__", k) || occursin("device__", k), keys(s))
+        @test s["resources_registers"] == 16 && s["device_name"] == "NVIDIA test GPU" && s["device_architecture"] == "12.0"
+        @test first(h.dispatches).device["device__attribute_confidential_computing_mode"] == "No-CC"   # kept on the dispatch
         h.units["smsp__sass_thread_inst_executed_op_dfma_pred_on.sum"] = "Kinst"
         @test hw_counter_derived(h)["insts_per_slot_fp64_fma"] == [1000, 1000]
     end
