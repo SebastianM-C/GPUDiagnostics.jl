@@ -201,8 +201,13 @@ dispatch count, units, and expected activity before collecting a full preset.
 
 The repository's `test/gpu/counter_probe.jl` is a small KernelAbstractions FMA workload
 for either vendor, selected with `GPUDIAGNOSTICS_GPU=cuda` or `rocm`. Its three launches
-each process 4096 work-items. When checking AMD wave counts, use the kernel's actual
-wave width: 4096 work-items correspond to 128 waves at width 32, or 64 at width 64.
+each process 4096 work-items × 32 FP64 FMAs. When checking AMD wave counts, use the kernel's
+actual wave width: 4096 work-items correspond to 128 waves at width 32, or 64 at width 64.
+The hardware suite (`test/gpu/runtests.jl`) runs exactly this: the probe under the backend's
+collector, then the parsed result against the known counts — 131072 DFMA thread instructions
+per launch on NVIDIA, the wave count and nonzero GRBM cycles on AMD. It is skipped when the
+tool is not found; `GPUDIAGNOSTICS_COUNTER_TOOL` points at one outside `PATH` and
+`GPUDIAGNOSTICS_COUNTER_DEVICE=N` adds the `:device=N` qualifier on AMD.
 
 | Symptom | First check |
 |---|---|
