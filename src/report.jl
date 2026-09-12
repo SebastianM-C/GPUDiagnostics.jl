@@ -3,7 +3,7 @@
 # Every consumer of this package has to reduce its results into something storable and
 # something readable. `diagnostics_dict` is the storable form: a flat `Dict{String, Any}` of
 # TOML-safe scalars (Int / Float64 / Bool / String, or vectors of those) under stable keys — a
-# key is never renamed, only added, and a value the backend could not report (`missing`) is
+# key is only added within a schema version, and a value the backend could not report (`missing`) is
 # OMITTED rather than written as a sentinel, so manifests written months apart merge and
 # compare by key. `show(io, MIME"text/plain"(), x)` is the readable form of the same content.
 
@@ -12,17 +12,17 @@
 
 Version of the key layout [`diagnostics_dict`](@ref) writes. Every dict carries it under
 `"gpudiagnostics_schema"` (unprefixed, so a manifest merging several dicts holds it once). Keys
-are additive; the number changes only when an existing key changes meaning.
+are additive within a schema; version 2 introduces the unified hardware-counter layout.
 """
-const GPUDIAGNOSTICS_SCHEMA = 1
+const GPUDIAGNOSTICS_SCHEMA = 2
 
 """
     diagnostics_dict(x; prefix = "") -> Dict{String, Any}
 
 Flat, TOML-safe dictionary of a result — `KernelResources`, `KernelInstructionMix` /
-`InstructionMix`, `IRMix`, `FP64IssueFloor`, `LaunchTimer`, `GPUTelemetry`, `RocprofCounters` —
+`InstructionMix`, `IRMix`, `FP64IssueFloor`, `LaunchTimer`, `GPUTelemetry`, `HWCounters` —
 with every key prefixed by `prefix` (the convention used by the first consumer: `kernel_`,
-`kernel_mix_`, `kernel_ir_`, `sampler_`, `rocprof_`), ready to `merge!` into a run manifest.
+`kernel_mix_`, `kernel_ir_`, `sampler_`, `hw_`), ready to `merge!` into a run manifest.
 Values are `Int`, `Float64`, `Bool`, `String` or vectors of those; `Symbol`s become strings;
 a `missing` value is omitted (never written as a sentinel), as are `nothing` fields. Every
 dict also carries `"gpudiagnostics_schema" => `[`GPUDIAGNOSTICS_SCHEMA`](@ref).
@@ -139,10 +139,10 @@ function diagnostics_dict(t::GPUTelemetry; prefix::AbstractString = "", kwargs..
     return d
 end
 
-# ---- RocprofCounters: the summary, prefixed
-function diagnostics_dict(rc::RocprofCounters; prefix::AbstractString = "")
+# ---- HWCounters: the summary, prefixed
+function diagnostics_dict(rc::HWCounters; prefix::AbstractString = "")
     d = _newdict()
-    for (k, v) in rocprof_summary(rc)
+    for (k, v) in hw_counter_summary(rc)
         _put!(d, prefix, k, v)
     end
     return d

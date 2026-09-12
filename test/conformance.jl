@@ -130,6 +130,18 @@ function conformance(backend; kernel = nothing, peak_threads = 2^12)
             end
         end
 
+        @testset ":hw_counters" begin
+            if has(:hw_counters)
+                st = hw_counter_status(backend)
+                @test st isa HWCounterAvailability && st.tool in (:ncu, :rocprofv3)
+                @test ismissing(st.permitted)
+                @test hw_counter_command(backend, `true`; dir = "out", name = "probe") isa Cmd
+            else
+                @test !hw_counters_available(backend)
+                @test_throws BackendUnsupported hw_counter_command(backend, `true`; dir = "out", name = "probe")
+            end
+        end
+
         @testset ":native_mix" begin
             if has(:native_mix)
                 if kernel !== nothing

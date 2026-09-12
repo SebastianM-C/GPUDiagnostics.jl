@@ -25,7 +25,11 @@ backend_kernel_isa_info
 backend_kernel_machine_code
 backend_kernel_ir_counts
 backend_versions
+backend_counter_vendor
 ```
+
+`:hw_counters` implements `backend_counter_vendor` and identifies the external collector.
+Tool discovery is separate from the backend capability and from profiling permission.
 
 The telemetry hooks `gpu_sampler_sources` and `sampler_source` are documented in the [API reference](api.md).
 

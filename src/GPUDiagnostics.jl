@@ -47,18 +47,16 @@ fallbacks so the plumbing (and its tests) run without a GPU.
   the JIT-carrying first launch from the steady state.
 - **Report layer** — `diagnostics_dict(x; prefix)` turns every result type (`KernelResources`,
   `KernelInstructionMix`, `IRMix`, `FP64IssueFloor`, `LaunchTimer`, `GPUTelemetry`,
-  `RocprofCounters`) into a flat `Dict{String, Any}` of TOML-safe scalars with stable, additive
+  `HWCounters`) into a flat `Dict{String, Any}` of TOML-safe scalars with stable, additive
   keys (a value the backend could not report is omitted; every dict carries
   `gpudiagnostics_schema`), and each result type prints as a readable summary. `GPUTelemetry`
   implements Tables.jl, so DataFrames / CSV.jl consume it directly.
-- **AMD hardware counters (rocprofv3)** — `rocprof_command` wraps a process in a rocprofv3 counter
-  collection (`ROCPROF_COUNTER_SETS`: instruction issue, wave residency, the L1 pipe, FP64, L2 —
-  the sets that fit one pass on gfx942, and the one that does not), `rocprof_counters` parses its
-  CSV into per-dispatch values of one kernel, and `rocprof_derived` / `rocprof_summary` /
-  `diagnostics_dict` reduce them: medians with spreads, per-slot instruction counts,
-  unit-busy fractions and achieved occupancy with the normalisation rocprofv3's own derived
-  metrics use (die-summed `GRBM_GUI_ACTIVE`, quad-cycle SQ counters). Pure Julia, no GPU needed
-  to parse.
+- **Per-dispatch hardware counters** — `hw_counter_command` wraps a process in rocprofv3 or
+  Nsight Compute. `hw_counters` parses raw CSV into `HWCounters`, retaining each dispatch's
+  identity, resources, device, native counters and units. `hw_counter_derived` returns aligned
+  derived columns; `hw_counter_summary` / `diagnostics_dict` explicitly reduce them. Parsing
+  needs no GPU or vendor package. Sampled counters remain in `GPUTelemetry`.
+
 """
 module GPUDiagnostics
 
@@ -84,8 +82,9 @@ export FEATURES, supports, capabilities, BackendUnsupported,
     instruction_mix, kernel_instruction_mix, fp64_issue_floor,
     IR_CLASSES, IRMix, kernel_ir_mix,
     diagnostics_dict, GPUDIAGNOSTICS_SCHEMA,
-    ROCPROF_COUNTER_SETS, RocprofCounters, rocprof_available, rocprof_command, rocprof_counters,
-    rocprof_median, rocprof_derived, rocprof_summary
+    CounterSet, COUNTER_SETS, HWDispatch, HWCounters, HWCounterAvailability,
+    hw_counter_command, hw_counter_export_command, hw_counters, hw_counter_derived,
+    hw_counter_summary, hw_counter_status, hw_counters_available
 
 include("capabilities.jl")   # supports/capabilities trait + BackendUnsupported; declared per backend by ext/
 include("device_api.jl")   # generics + CPU fallbacks + LaunchTimer; vendor methods in ext/ (hooks: backend_*)
@@ -93,7 +92,10 @@ include("sampler.jl")      # gpu_sample sources, the telemetry child, with_gpu_s
 include("peakflops.jl")    # FMA-chain FP64 peak probe
 include("resources.jl")    # compile-time resource report: registers / spills / LDS / occupancy
 include("instruction_mix.jl")   # static instruction mix of the disassembly + loop nest + FP64-issue floor
-include("rocprof.jl")           # AMD hardware counters: rocprofv3 wrapper + CSV parser + normalised derived metrics
+include("counter_csv.jl")
+include("hw_counters.jl")
+include("rocprof.jl")           # AMD raw parser and architecture-qualified normalization
+include("ncu.jl")
 include("report.jl")            # diagnostics_dict (flat TOML-safe dicts), show methods, Tables.jl on GPUTelemetry
 include("probes.jl")            # launch-overhead probe, host environment snapshot (cgroup quota, versions)
 

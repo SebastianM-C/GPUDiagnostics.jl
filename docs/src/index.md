@@ -28,7 +28,7 @@ gpu_memory_info(backend), gpu_power(backend), gpu_utilization(backend)
 - [Telemetry](telemetry.md) — the out-of-process sampler, its columns, GPM counters, stats.
 - [Measured peak and cheap probes](peaks_probes.md) — FMA-chain peak FLOP/s, launch overhead, host snapshot, warm-up accounting.
 - [Resource report and instruction mix](resources_mix.md) — registers / spills / occupancy, the static ISA and IR mix, cross-compilation, the FP64 issue floor.
-- [Hardware counters](hw_counters.md) — the rocprofv3 wrapper and parser on AMD.
+- [Hardware counters](hw_counters.md) — rocprofv3 / Nsight Compute collectors and a shared per-dispatch result.
 - [Report layer](report.md) — `diagnostics_dict`, `show`, Tables.jl.
 - [Porting a backend](porting.md) — the `backend_*` contract.
 - [Caveats](caveats.md) — the traps that have already cost time.

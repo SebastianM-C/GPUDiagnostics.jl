@@ -28,7 +28,7 @@ subsystem of the package:
 | `:occupancy` | the runtime occupancy calculator behind `kernel_resources` |
 | `:native_mix` | `kernel_instruction_mix` (a disassembly of the device code exists) |
 | `:ir_mix` | `kernel_ir_mix` |
-| `:hw_counters` | a hardware-counter collection path for this vendor (`rocprof_*` on AMD) |
+| `:hw_counters` | `hw_counter_command`, `hw_counter_status` (rocprofv3 on AMD, ncu on NVIDIA) |
 """
 const FEATURES = (:devices, :device_props, :events, :telemetry, :telemetry_counters, :peak_flops, :fp64,
     :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix, :hw_counters)
