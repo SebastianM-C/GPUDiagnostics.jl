@@ -1,6 +1,10 @@
 using Test, GPUDiagnostics
 import Statistics
 
+struct CounterTestBackend{C <: HWCounterCollector} <: GPUDiagnostics.KA.GPU end
+GPUDiagnostics.supports(::CounterTestBackend, ::Val{:hw_counters}) = true
+GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C()
+
 @testset "hardware counters" begin
     fx = joinpath(@__DIR__, "fixtures", "rocprof")
     slots = 401 * 401 * 1666
@@ -123,12 +127,25 @@ import Statistics
     end
 
     @testset "commands and discovery" begin
-        c = hw_counter_command(:amd, `julia run.jl`; set = :occupancy, dir = "out", name = "probe")
+        for (collector, tool) in ((RocprofV3(), "rocprofv3"), (NsightCompute(), "ncu"))
+            backend = CounterTestBackend{typeof(collector)}()
+            cmd = setenv(`julia run.jl`, ["TEST_KEY=2"]; dir = "/tmp")
+            c = hw_counter_command(backend, cmd; dir = "out", name = "probe", timeout_s = nothing)
+            @test first(c.exec) == tool
+            @test c.exec == hw_counter_command(collector, cmd; dir = "out", name = "probe", timeout_s = nothing).exec
+            @test c.env == cmd.env && c.dir == cmd.dir
+            st = hw_counter_status(backend; executable = "gpudiag_no_such_profiler")
+            @test st.tool == Symbol(tool) && !st.available && ismissing(st.permitted)
+            @test !hw_counters_available(backend; executable = "gpudiag_no_such_profiler")
+            @test first(hw_counter_command(backend, cmd; dir = "out", name = "probe",
+                executable = "/custom/profiler", timeout_s = nothing).exec) == "/custom/profiler"
+        end
+        c = hw_counter_command(RocprofV3(), `julia run.jl`; set = :occupancy, dir = "out", name = "probe")
         @test c.exec[1:6] == ["timeout", "-k", "20", "600", "rocprofv3", "--kernel-trace"]
         @test c.exec[8:15] == COUNTER_SETS[:amd][:occupancy].metrics
         @test c.exec[end-2:end] == ["--", "julia", "run.jl"]
         cmd = setenv(`julia run.jl`, ["TEST_KEY=1"]; dir = "/tmp")
-        c = hw_counter_command(:nvidia, cmd; set = :fp64, dir = "out space", name = "probe",
+        c = hw_counter_command(NsightCompute(), cmd; set = :fp64, dir = "out space", name = "probe",
             kernel = r"probe.*", launch_skip = 1, launch_count = 2, timeout_s = nothing)
         @test c.env == ["TEST_KEY=1"] && c.dir == "/tmp"
         @test "out space/probe_ncu.csv" in c.exec && "regex:probe.*" in c.exec
@@ -138,16 +155,23 @@ import Statistics
         @test hw_counter_export_command("p.ncu-rep"; output = "p.csv").exec ==
             ["ncu", "--import", "p.ncu-rep", "--csv", "--page", "raw", "--print-units", "base", "--log-file", "p.csv"]
         @test !hw_counters_available(GPUDiagnostics.KA.CPU())
-        st = hw_counter_status(:nvidia; executable = "gpudiag_no_such_profiler")
+        st = hw_counter_status(NsightCompute(); executable = "gpudiag_no_such_profiler")
         @test !st.available && ismissing(st.permitted) && ismissing(st.executable)
-        @test hw_counters_available(:amd) == (Sys.which("rocprofv3") !== nothing)
+        @test hw_counters_available(RocprofV3()) == (Sys.which("rocprofv3") !== nothing)
         @test_throws BackendUnsupported hw_counter_command(GPUDiagnostics.KA.CPU(), `true`; dir = "o", name = "p")
         for opts in ((; set = :absent), (; metrics = String[]), (; timeout_s = 0),
                 (; launch_skip = -1), (; launch_count = 0), (; clock_control = :invalid), (; kill_after_s = -1))
-            @test_throws ArgumentError hw_counter_command(:nvidia, `true`; dir = "o", name = "p", opts...)
+            @test_throws ArgumentError hw_counter_command(NsightCompute(), `true`; dir = "o", name = "p", opts...)
         end
-        @test_throws ArgumentError hw_counter_command(:amd, `true`; dir = "o", name = "../p")
-        @test_throws ArgumentError hw_counter_command(:amd, `true`; dir = "o", name = "p", launch_skip = 1)
+        @test_throws ArgumentError hw_counter_command(RocprofV3(), `true`; dir = "o", name = "../p")
+        @test_throws MethodError hw_counter_command(RocprofV3(), `true`; dir = "o", name = "p", launch_skip = 1)
+        @test_throws MethodError hw_counter_command(NsightCompute(), `true`; dir = "o", name = "p", kernel_trace = false)
+        @test_throws MethodError hw_counter_command(:nvidia, `true`; dir = "o", name = "p")
+        @test_throws MethodError hw_counter_status(:amd)
+        amd = hw_counter_command(RocprofV3(), `true`; dir = "o", name = "p",
+            kernel = r"probe.*", kernel_trace = false, metrics = ["SQ_WAVES:device=0"], timeout_s = nothing)
+        @test amd.exec == ["rocprofv3", "--kernel-include-regex", "probe.*", "--pmc",
+            "SQ_WAVES:device=0", "--output-format", "csv", "-d", "o", "-o", "p", "--", "true"]
         @test all(p -> p.passes == 1, values(COUNTER_SETS[:amd]))
     end
 

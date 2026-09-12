@@ -5,8 +5,11 @@ Both produce `HWCounters`. Sampled counters, such as NVML GPM, remain in `GPUTel
 they measure a different window and have a separate capability.
 
 ```julia
+using GPUDiagnostics, CUDA, KernelAbstractions
+
+backend = CUDABackend()              # use ROCBackend() with AMDGPU for AMD
 mkpath("prof")
-cmd = hw_counter_command(:nvidia, `julia --project run.jl`;
+cmd = hw_counter_command(backend, `julia --project run.jl`;
     set = :fp64, dir = "prof", name = "cell",
     kernel = "my_kernel", launch_skip = 1, launch_count = 2)
 run(cmd)
@@ -21,11 +24,20 @@ hw_counter_summary(hc)               # medians, ranges and valid sample counts
 diagnostics_dict(hc; prefix = "hw_") # flat, schema-tagged, TOML-safe summary
 ```
 
-Use `:amd` with the same intent names. The command builder also accepts a KA backend
-once its extension is loaded; explicit vendor symbols need no GPU runtime. NVIDIA
-launch-skip/count are collector options; bound AMD workloads in the script itself.
+The backend's extension selects the profiler: `CUDABackend()` uses Nsight Compute and
+`ROCBackend()` uses rocprofv3. The same intent names apply to both. Pass the backend
+to `hw_counter_status` and `hw_counters_available` as well. Loading both extensions
+does not introduce a global default; the backend argument determines the collector.
+NVIDIA launch-skip/count are collector options; omit them for AMD and bound its workloads
+in the script itself. Other collector-specific keywords belong only to that collector.
 `hw_counter_command` executes nothing and creates no directories. It preserves the
 workload's environment and working directory; relative output paths resolve there.
+
+When preparing an external workload without loading a GPU runtime, select the collector
+explicitly with `hw_counter_command(NsightCompute(), cmd; ...)` or
+`hw_counter_command(RocprofV3(), cmd; ...)`. These collector types also work with tool
+discovery. Vendor symbols remain available for preset lookup and optional CSV parser
+selection; collection commands use backend or collector dispatch.
 
 ## Collection requirements
 
@@ -258,9 +270,9 @@ Version 0.3 removes the AMD-only public family:
 
 | Old | Replacement |
 |---|---|
-| `rocprof_command(cmd; counters = :sq_issue, ...)` | `hw_counter_command(:amd, cmd; set = :issue, ...)` |
+| `rocprof_command(cmd; counters = :sq_issue, ...)` | `hw_counter_command(ROCBackend(), cmd; set = :issue, ...)`, or `RocprofV3()` without AMDGPU |
 | `ROCPROF_COUNTER_SETS` | `COUNTER_SETS[:amd]` (`:sq_waves` → `:occupancy`, `:l1_pipe` → `:memory`) |
-| `rocprof_available()` | `hw_counters_available(:amd)` |
+| `rocprof_available()` | `hw_counters_available(ROCBackend())`, or `hw_counters_available(RocprofV3())` without AMDGPU |
 | `rocprof_counters(dir; ...)` | `hw_counters(:amd, dir; ...)` |
 | `RocprofCounters` | `HWCounters`, with metadata per `HWDispatch` |
 | `rocprof_derived(rc)` | `hw_counter_derived(hc)` returns **vectors**; summarize explicitly |

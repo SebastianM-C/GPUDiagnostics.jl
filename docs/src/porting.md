@@ -25,10 +25,12 @@ backend_kernel_isa_info
 backend_kernel_machine_code
 backend_kernel_ir_counts
 backend_versions
-backend_counter_vendor
+backend_counter_collector
 ```
 
-`:hw_counters` implements `backend_counter_vendor` and identifies the external collector.
+`:hw_counters` implements `backend_counter_collector` and returns the external collector:
+`NsightCompute()` for CUDA or `RocprofV3()` for AMDGPU. Command construction and discovery
+dispatch on that collector; the extension does not need to duplicate profiler options.
 Tool discovery is separate from the backend capability and from profiling permission.
 
 The telemetry hooks `gpu_sampler_sources` and `sampler_source` are documented in the [API reference](api.md).

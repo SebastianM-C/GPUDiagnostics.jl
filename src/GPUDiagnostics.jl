@@ -83,6 +83,7 @@ export FEATURES, supports, capabilities, BackendUnsupported,
     IR_CLASSES, IRMix, kernel_ir_mix,
     diagnostics_dict, GPUDIAGNOSTICS_SCHEMA,
     CounterSet, COUNTER_SETS, HWDispatch, HWCounters, HWCounterAvailability,
+    HWCounterCollector, RocprofV3, NsightCompute,
     hw_counter_command, hw_counter_export_command, hw_counters, hw_counter_derived,
     hw_counter_summary, hw_counter_status, hw_counters_available
 

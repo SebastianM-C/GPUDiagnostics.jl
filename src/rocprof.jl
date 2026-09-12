@@ -1,3 +1,22 @@
+"""
+    RocprofV3()
+
+rocprofv3 collector for an external AMD workload. The AMDGPU extension selects this
+automatically for `ROCBackend()`. Use it explicitly with [`hw_counter_command`](@ref)
+or [`hw_counter_status`](@ref) when no AMDGPU runtime is loaded.
+"""
+struct RocprofV3 <: HWCounterCollector end
+_counter_vendor(::RocprofV3) = :amd
+_counter_tool(::RocprofV3) = :rocprofv3
+
+function _counter_command_args(::RocprofV3, exe, metrics; dir, name, kernel, kernel_trace::Bool = true)
+    args = String[exe]
+    kernel_trace && push!(args, "--kernel-trace")
+    kernel === nothing || append!(args, ["--kernel-include-regex", kernel])
+    append!(args, ["--pmc"; metrics; "--output-format"; "csv"; "-d"; dir; "-o"; name; "--"])
+    return args
+end
+
 const _AMD_COUNTERS = Dict{Symbol, Vector{String}}(
     :sq_issue => ["GRBM_GUI_ACTIVE", "SQ_INSTS_VMEM_RD", "SQ_INSTS_VMEM_WR", "SQ_INSTS_SMEM",
         "SQ_INSTS_SALU", "SQ_INSTS_BRANCH", "SQ_INSTS_VALU_INT64", "SQ_INSTS_VALU"],
@@ -85,7 +104,7 @@ function _parse_rocprof(file; kernel = nothing, slots = nothing,
         rows[i][counter] = _counter_number(getv("Counter_Value"))
     end
     # Preserve tool file order, including distinct processes/devices with the same dispatch ID.
-    return _build_counters(:amd, file, dispatches, rows, Dict(); kernel, slots, provenance, required_metrics)
+    return _build_counters(RocprofV3(), file, dispatches, rows, Dict(); kernel, slots, provenance, required_metrics)
 end
 
 # gfx942 normalization is fixture-validated. Do not silently apply quad-cycle or

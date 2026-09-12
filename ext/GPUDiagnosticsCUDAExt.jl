@@ -11,7 +11,7 @@ import GPUCompiler
 import LLVM
 
 const GD = GPUDiagnostics
-GD.backend_counter_vendor(::CUDABackend) = :nvidia
+GD.backend_counter_collector(::CUDABackend) = NsightCompute()
 
 # NVML handle for the current CUDA device (NVML indexes by UUID, not the CUDA ordinal).
 _nvml() = NVML.Device(CUDA.uuid(CUDA.device()))

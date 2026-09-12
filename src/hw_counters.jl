@@ -83,44 +83,60 @@ struct HWCounterAvailability
 end
 
 _counter_vendor(v::Symbol) = v in (:amd, :nvidia) ? v : throw(ArgumentError("unknown counter vendor :$v"))
-_counter_vendor(b::Backend) = (_require(b, :hw_counters, :hw_counter_command); _counter_vendor(backend_counter_vendor(b)))
 
-"""    backend_counter_vendor(backend) -> Symbol
-
-Backend hook (`:hw_counters`): the external counter collector's vendor, `:amd` or `:nvidia`.
-Command construction also accepts that symbol directly, without loading a GPU runtime.
 """
-backend_counter_vendor(b::Backend) = throw(BackendUnsupported(b, :hw_counters, :hw_counter_command))
-_counter_tool(v) = v === :amd ? :rocprofv3 : :ncu
+    HWCounterCollector
 
-"""    hw_counter_status(vendor_or_backend; executable = nothing) -> HWCounterAvailability
+External profiler selected by a backend extension. Use [`RocprofV3`](@ref) or
+[`NsightCompute`](@ref) explicitly when preparing an external workload without a GPU runtime.
+"""
+abstract type HWCounterCollector end
+
+"""    backend_counter_collector(backend) -> HWCounterCollector
+
+Backend hook (`:hw_counters`): select the external profiler used by collection commands
+and tool discovery. The CUDA extension returns `NsightCompute()` and the AMDGPU extension
+returns `RocprofV3()`. CSV parsing does not use this hook or load an extension.
+"""
+backend_counter_collector(b::Backend) = throw(BackendUnsupported(b, :hw_counters, :hw_counter_command))
+
+"""    hw_counter_status(backend; executable = nothing) -> HWCounterAvailability
+    hw_counter_status(collector::HWCounterCollector; executable = nothing)
 
 Discover the profiler executable without initializing a GPU or asserting profiling
 permissions. An unsupported backend reports unavailable. A supplied path can locate a
 tool outside PATH. This does not run the tool.
 """
-function hw_counter_status(v; executable = nothing)
-    v isa Backend && !supports(v, :hw_counters) && return HWCounterAvailability(:none, missing, false, missing)
-    tool = _counter_tool(_counter_vendor(v))
+function hw_counter_status(b::Backend; kwargs...)
+    supports(b, :hw_counters) || return HWCounterAvailability(:none, missing, false, missing)
+    return hw_counter_status(backend_counter_collector(b); kwargs...)
+end
+function hw_counter_status(collector::HWCounterCollector; executable = nothing)
+    tool = _counter_tool(collector)
     path = Sys.which(executable === nothing ? String(tool) : String(executable))
     return HWCounterAvailability(tool, something(path, missing), path !== nothing, missing)
 end
 
-"""    hw_counters_available(vendor_or_backend; executable = nothing) -> Bool
+"""    hw_counters_available(backend; executable = nothing) -> Bool
+    hw_counters_available(collector::HWCounterCollector; executable = nothing)
 
 Whether the backend has a collector and its tool is discoverable. This is NOT a permission
-check; [`hw_counter_status`](@ref) reports permission as unknown until collection is attempted.
+check; [`hw_counter_status`](@ref) leaves permission unknown and does not run the collector.
 """
-hw_counters_available(v; kwargs...) = hw_counter_status(v; kwargs...).available
+hw_counters_available(v::Union{Backend, HWCounterCollector}; kwargs...) = hw_counter_status(v; kwargs...).available
 
 """
-    hw_counter_command(vendor_or_backend, cmd; set = :issue, dir, name,
+    hw_counter_command(backend, cmd; set = :issue, dir, name,
                        metrics = nothing, timeout_s = 600, kill_after_s = 20, ...)
+    hw_counter_command(collector::HWCounterCollector, cmd; kwargs...)
 
 Build a `Cmd` wrapping a workload in rocprofv3 or Nsight Compute. Nothing is run or written
 by this function. The caller creates `dir` and runs the command. Environment and working
 directory are preserved. `metrics` overrides the named preset. `executable` overrides the
 tool location. A finite timeout uses the external `timeout` utility; `nothing` disables it.
+The backend extension selects the collector. For an external workload, explicitly pass
+`RocprofV3()` or `NsightCompute()` without loading AMDGPU or CUDA. Vendor symbols are
+used only for offline parsing and preset lookup, not collector selection.
 
 AMD: `kernel_trace=true`, optional `kernel` regex filter. NVIDIA: `kernel`, `launch_skip=0`,
 `launch_count=nothing`, `clock_control=:none`, `cache_control=:all`, `replay_mode=:kernel`.
@@ -129,22 +145,19 @@ and its companion files. Preset metric availability and pass counts depend on ar
 Profiling can replay/serialize work and change cache state; profiled times are not ordinary
 execution times. Filter and warm up a small workload explicitly.
 """
-function hw_counter_command(v, cmd::Cmd; set::Symbol = :issue, dir::AbstractString,
+function hw_counter_command(b::Backend, cmd::Cmd; kwargs...)
+    _require(b, :hw_counters, :hw_counter_command)
+    return hw_counter_command(backend_counter_collector(b), cmd; kwargs...)
+end
+function hw_counter_command(collector::HWCounterCollector, cmd::Cmd; set::Symbol = :issue, dir::AbstractString,
         name::AbstractString, metrics = nothing, executable = nothing,
         timeout_s::Union{Nothing, Real} = 600, kill_after_s::Real = 20,
-        kernel = nothing, kernel_trace::Bool = true, launch_skip::Integer = 0,
-        launch_count::Union{Nothing, Integer} = nothing, clock_control::Symbol = :none,
-        cache_control::Symbol = :all, replay_mode::Symbol = :kernel)
-    vendor = _counter_vendor(v)
+        kernel = nothing, kwargs...)
+    vendor = _counter_vendor(collector)
     isempty(name) && throw(ArgumentError("name must not be empty"))
     basename(name) == name && name ∉ (".", "..") || throw(ArgumentError("name must be a file prefix, not a path"))
     timeout_s === nothing || (isfinite(timeout_s) && timeout_s > 0) || throw(ArgumentError("timeout_s must be positive and finite"))
     isfinite(kill_after_s) && kill_after_s > 0 || throw(ArgumentError("kill_after_s must be positive and finite"))
-    launch_skip >= 0 || throw(ArgumentError("launch_skip must be non-negative"))
-    launch_count === nothing || launch_count > 0 || throw(ArgumentError("launch_count must be positive"))
-    clock_control in (:none, :base, :boost) || throw(ArgumentError("invalid clock_control"))
-    cache_control in (:none, :all) || throw(ArgumentError("invalid cache_control"))
-    replay_mode in (:kernel, :application) || throw(ArgumentError("replay_mode must be :kernel or :application"))
     if metrics === nothing
         haskey(COUNTER_SETS[vendor], set) || throw(ArgumentError("unknown $vendor counter set :$set"))
         metrics = COUNTER_SETS[vendor][set].metrics
@@ -152,26 +165,9 @@ function hw_counter_command(v, cmd::Cmd; set::Symbol = :issue, dir::AbstractStri
     metrics isa AbstractVector || throw(ArgumentError("metrics must be a vector of native names"))
     pmc = String.(metrics)
     isempty(pmc) || any(isempty, pmc) ? throw(ArgumentError("metrics must not be empty")) : nothing
-    exe = executable === nothing ? String(_counter_tool(vendor)) : String(executable)
+    exe = executable === nothing ? String(_counter_tool(collector)) : String(executable)
     filter = kernel === nothing ? nothing : kernel isa Regex ? kernel.pattern : String(kernel)
-    args = if vendor === :amd
-        launch_skip == 0 && launch_count === nothing || throw(ArgumentError("launch_skip/count are NVIDIA options; bound the AMD workload itself"))
-        clock_control === :none && cache_control === :all && replay_mode === :kernel ||
-            throw(ArgumentError("clock/cache/replay controls are NVIDIA options"))
-        a = String[exe]
-        kernel_trace && push!(a, "--kernel-trace")
-        filter === nothing || append!(a, ["--kernel-include-regex", filter])
-        append!(a, ["--pmc"; pmc; "--output-format"; "csv"; "-d"; dir; "-o"; name; "--"])
-    else
-        a = String[exe, "--target-processes", "all", "--metrics", join(pmc, ','),
-            "--clock-control", String(clock_control), "--cache-control", String(cache_control),
-            "--replay-mode", String(replay_mode), "--launch-skip", string(launch_skip),
-            "--csv", "--page", "raw", "--print-units", "base",
-            "--log-file", joinpath(dir, name * "_ncu.csv"), "--export", joinpath(dir, name)]
-        filter === nothing || append!(a, ["--kernel-name", "regex:" * filter])
-        launch_count === nothing || append!(a, ["--launch-count", string(launch_count)])
-        push!(a, "--")
-    end
+    args = _counter_command_args(collector, exe, pmc; dir, name, kernel = filter, kwargs...)
     append!(args, cmd.exec)
     timeout_s === nothing || (args = ["timeout", "-k", string(kill_after_s), string(timeout_s), args...])
     return Cmd(Cmd(args); env = cmd.env, dir = cmd.dir)
@@ -266,7 +262,8 @@ function _with_slots(d::HWDispatch, slots)
     return HWDispatch(d.id, d.process_id, d.device_id, d.context_id, d.queue_id, d.kernel,
         d.start_s, d.duration_s, d.resources, d.device, slots)
 end
-function _build_counters(vendor, file, dispatches, rows, units; kernel, slots, provenance, required_metrics)
+function _build_counters(collector::HWCounterCollector, file, dispatches, rows, units; kernel, slots, provenance, required_metrics)
+    vendor = _counter_vendor(collector)
     ids, name = _select_dispatches(dispatches, kernel)
     ds = [_with_slots(d, s) for (d, s) in zip(dispatches[ids], _counter_slots(slots, length(ids)))]
     counters = sort!(unique(String[k for i in ids for k in keys(rows[i])]))
@@ -282,7 +279,7 @@ function _build_counters(vendor, file, dispatches, rows, units; kernel, slots, p
                 throw(ArgumentError("required counter $c is unavailable on one or more selected dispatches"))
         end
     end
-    return HWCounters(vendor, _counter_tool(vendor), _collection_name(file, vendor), name, ds,
+    return HWCounters(vendor, _counter_tool(collector), _collection_name(file, vendor), name, ds,
         counters, values, Dict(c => get(units, c, missing) for c in counters), _counter_provenance(provenance))
 end
 

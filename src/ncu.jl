@@ -1,3 +1,33 @@
+"""
+    NsightCompute()
+
+Nsight Compute collector for an external NVIDIA workload. The CUDA extension selects
+this automatically for `CUDABackend()`. Use it explicitly with [`hw_counter_command`](@ref)
+or [`hw_counter_status`](@ref) when no CUDA runtime is loaded.
+"""
+struct NsightCompute <: HWCounterCollector end
+_counter_vendor(::NsightCompute) = :nvidia
+_counter_tool(::NsightCompute) = :ncu
+
+function _counter_command_args(::NsightCompute, exe, metrics; dir, name, kernel,
+        launch_skip::Integer = 0, launch_count::Union{Nothing, Integer} = nothing,
+        clock_control::Symbol = :none, cache_control::Symbol = :all, replay_mode::Symbol = :kernel)
+    launch_skip >= 0 || throw(ArgumentError("launch_skip must be non-negative"))
+    launch_count === nothing || launch_count > 0 || throw(ArgumentError("launch_count must be positive"))
+    clock_control in (:none, :base, :boost) || throw(ArgumentError("invalid clock_control"))
+    cache_control in (:none, :all) || throw(ArgumentError("invalid cache_control"))
+    replay_mode in (:kernel, :application) || throw(ArgumentError("replay_mode must be :kernel or :application"))
+    args = String[exe, "--target-processes", "all", "--metrics", join(metrics, ','),
+        "--clock-control", String(clock_control), "--cache-control", String(cache_control),
+        "--replay-mode", String(replay_mode), "--launch-skip", string(launch_skip),
+        "--csv", "--page", "raw", "--print-units", "base",
+        "--log-file", joinpath(dir, name * "_ncu.csv"), "--export", joinpath(dir, name)]
+    kernel === nothing || append!(args, ["--kernel-name", "regex:" * kernel])
+    launch_count === nothing || append!(args, ["--launch-count", string(launch_count)])
+    push!(args, "--")
+    return args
+end
+
 const _NCU_COUNTERS = Dict(
     :issue => ["gpu__time_duration.sum", "smsp__inst_executed.sum", "smsp__thread_inst_executed.sum"],
     :occupancy => ["gpu__time_duration.sum", "sm__warps_active.avg.pct_of_peak_sustained_active"],
@@ -154,7 +184,7 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
         dispatches[i] = HWDispatch(d.id, d.process_id, d.device_id, d.context_id, d.queue_id,
             d.kernel, d.start_s, duration, d.resources, d.device, d.slots)
     end
-    return _build_counters(:nvidia, file, dispatches, rows, units; kernel, slots, provenance, required_metrics)
+    return _build_counters(NsightCompute(), file, dispatches, rows, units; kernel, slots, provenance, required_metrics)
 end
 
 function _nvidia_derived(raw, d, units)
