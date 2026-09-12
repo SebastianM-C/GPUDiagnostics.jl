@@ -247,8 +247,12 @@ Commands use `timeout -k` to bound the profiler and workload if collection hangs
 `timeout_s = nothing` when managing process lifetime yourself, including on systems
 without that utility.
 
-NVIDIA defaults are `clock_control = :none`, `cache_control = :all`, and
-`replay_mode = :kernel`. Profiling can replay kernels, flush caches and serialize work;
+NVIDIA defaults are `clock_control = :none`, `cache_control = :all`,
+`replay_mode = :kernel`, and `target_processes = :application` (narrower than ncu's own
+default of `all`): only the launched process is
+injected (`env` and `bash -c` wrappers exec into it and are fine); pass `:all` when the GPU work
+runs in a subprocess, knowing that precompile workers and the telemetry sampler child are then
+injected too. rocprofv3 follows children by itself. Profiling can replay kernels, flush caches and serialize work;
 its duration is not an ordinary concurrent launch duration. For application-managed
 cache priming, consider `replay_mode = :application, cache_control = :none`. This reruns
 the application, so ensure repeating its side effects is acceptable. Keep workloads small

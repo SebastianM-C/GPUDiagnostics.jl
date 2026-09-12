@@ -185,6 +185,9 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test c.exec[findfirst(==("--clock-control"), c.exec) + 1] == "none"
         @test c.exec[findfirst(==("--launch-count"), c.exec) + 1] == "2"
         @test "--print-metric-name" ∉ c.exec # unsupported with --page raw
+        @test c.exec[findfirst(==("--target-processes"), c.exec) + 1] == "application-only"
+        call = hw_counter_command(NsightCompute(), cmd; dir = "out", name = "p", target_processes = :all, timeout_s = nothing)
+        @test call.exec[findfirst(==("--target-processes"), call.exec) + 1] == "all"
         @test hw_counter_export_command("p.ncu-rep"; output = "p.csv").exec ==
             ["ncu", "--import", "p.ncu-rep", "--csv", "--page", "raw", "--print-units", "base", "--log-file", "p.csv"]
         @test !hw_counters_available(GPUDiagnostics.KA.CPU())
@@ -193,7 +196,8 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test hw_counters_available(RocprofV3()) == (Sys.which("rocprofv3") !== nothing)
         @test_throws BackendUnsupported hw_counter_command(GPUDiagnostics.KA.CPU(), `true`; dir = "o", name = "p")
         for opts in ((; set = :absent), (; metrics = String[]), (; timeout_s = 0),
-                (; launch_skip = -1), (; launch_count = 0), (; clock_control = :invalid), (; kill_after_s = -1))
+                (; launch_skip = -1), (; launch_count = 0), (; clock_control = :invalid), (; kill_after_s = -1),
+                (; target_processes = :children))
             @test_throws ArgumentError hw_counter_command(NsightCompute(), `true`; dir = "o", name = "p", opts...)
         end
         @test_throws ArgumentError hw_counter_command(RocprofV3(), `true`; dir = "o", name = "../p")

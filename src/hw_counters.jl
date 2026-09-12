@@ -138,8 +138,12 @@ The backend extension selects the collector. For an external workload, explicitl
 `RocprofV3()` or `NsightCompute()` without loading AMDGPU or CUDA. Vendor symbols are
 used only for offline parsing and preset lookup, not collector selection.
 
-AMD: `kernel_trace=true`, optional `kernel` regex filter. NVIDIA: `kernel`, `launch_skip=0`,
-`launch_count=nothing`, `clock_control=:none`, `cache_control=:all`, `replay_mode=:kernel`.
+AMD: `kernel_trace=true` (the dispatch trace rocprofv3 writes next to the counters; the parser
+does not read it, but when no counter CSV appears it shows how far the workload got), optional
+`kernel` regex filter; rocprofv3 follows child processes by itself. NVIDIA: `kernel`,
+`launch_skip=0`, `launch_count=nothing`, `clock_control=:none`, `cache_control=:all`,
+`replay_mode=:kernel`, `target_processes=:application` (`:all` when the GPU work runs in a
+subprocess of the launched command; it also injects precompile workers and the sampler child).
 NVIDIA writes `<name>_ncu.csv` and `<name>.ncu-rep`; AMD writes `<name>_counter_collection.csv`
 and its companion files. Preset metric availability and pass counts depend on architecture.
 Profiling can replay/serialize work and change cache state; profiled times are not ordinary

@@ -11,13 +11,19 @@ _counter_tool(::NsightCompute) = :ncu
 
 function _counter_command_args(::NsightCompute, exe, metrics; dir, name, kernel,
         launch_skip::Integer = 0, launch_count::Union{Nothing, Integer} = nothing,
-        clock_control::Symbol = :none, cache_control::Symbol = :all, replay_mode::Symbol = :kernel)
+        clock_control::Symbol = :none, cache_control::Symbol = :all, replay_mode::Symbol = :kernel,
+        target_processes::Symbol = :application)
     launch_skip >= 0 || throw(ArgumentError("launch_skip must be non-negative"))
     launch_count === nothing || launch_count > 0 || throw(ArgumentError("launch_count must be positive"))
     clock_control in (:none, :base, :boost) || throw(ArgumentError("invalid clock_control"))
     cache_control in (:none, :all) || throw(ArgumentError("invalid cache_control"))
     replay_mode in (:kernel, :application) || throw(ArgumentError("replay_mode must be :kernel or :application"))
-    args = String[exe, "--target-processes", "all", "--metrics", join(metrics, ','),
+    target_processes in (:application, :all) || throw(ArgumentError("target_processes must be :application or :all"))
+    # ncu's own default is `all`. `:application` injects only the launched process (`env`/`bash -c` exec into it, so those
+    # wrappers are fine); `:all` follows every child — needed when the GPU work runs in a
+    # subprocess, and otherwise a way to inject precompile workers and the telemetry sampler.
+    args = String[exe, "--target-processes", target_processes === :all ? "all" : "application-only",
+        "--metrics", join(metrics, ','),
         "--clock-control", String(clock_control), "--cache-control", String(cache_control),
         "--replay-mode", String(replay_mode), "--launch-skip", string(launch_skip),
         "--csv", "--page", "raw", "--print-units", "base",
