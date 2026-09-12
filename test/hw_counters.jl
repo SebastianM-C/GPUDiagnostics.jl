@@ -61,8 +61,41 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
     @test e["amd_elapsed_occupancy"] ≈ e["amd_resident_waves"] ./ 304 ./ 32
     @test e["amd_wave_wait_frac"] ≈ w["SQ_WAIT_ANY"] ./ w["SQ_WAVE_CYCLES"]
     @test !haskey(e, "achieved_occupancy")
-    override[devid]["architecture"] = "gfx1100"
-    @test all(ismissing, hw_counter_derived(hw_counters(fx; name = "sq1", device_overrides = override))["amd_resident_waves"])
+    @test all(d -> d.device["sq_cycle_unit"] == 4, h.dispatches)   # gfx942 agent info → CDNA quad-cycles
+    @test s["device_sq_cycle_unit"] == 4 && s["device_sq_instances"] == 32 && s["device_architecture"] == "gfx942"
+    override[devid]["architecture"] = "gfx1100"   # RDNA: AMD's OccupancyPercent uses 100·, not 400·
+    e1 = hw_counter_derived(hw_counters(fx; name = "sq1", device_overrides = override))
+    @test e1["amd_resident_waves"] ≈ e["amd_resident_waves"] ./ 4 && e1["amd_wave_cycles"] ≈ e["amd_wave_cycles"] ./ 4
+    @test e1["amd_active_clock_GHz"] ≈ e["amd_active_clock_GHz"]   # unit-independent
+    @test e1["amd_sq_busy"] ≈ e["amd_sq_busy"] .* 32 ./ 152        # SQ_BUSY_CYCLES: per SE (32) on CDNA, per WGP (304 ÷ 2) on RDNA
+    override[devid]["architecture"] = "gfx908"    # not in the table → the SQ unit is unknown, the rest stands
+    e2 = hw_counter_derived(hw_counters(fx; name = "sq1", device_overrides = override))
+    @test all(ismissing, e2["amd_resident_waves"]) && all(ismissing, e2["amd_wave_cycles"]) && all(ismissing, e2["amd_sq_busy"])
+    @test e2["amd_active_clock_GHz"] ≈ e["amd_active_clock_GHz"] && e2["amd_wave_wait_frac"] ≈ e["amd_wave_wait_frac"]
+    override[devid]["sq_cycle_unit"] = 4          # ... unless the caller supplies them
+    override[devid]["sq_instances"] = 32
+    e3 = hw_counter_derived(hw_counters(fx; name = "sq1", device_overrides = override))
+    @test e3["amd_resident_waves"] ≈ e["amd_resident_waves"] && e3["amd_sq_busy"] ≈ e["amd_sq_busy"]
+    @test hw_counter_summary(hw_counters(fx; name = "sq1", device_overrides = override))["device_sq_instances"] == 32
+    override[devid]["sq_cycle_unit"] = 0
+    @test_throws ArgumentError hw_counters(fx; name = "sq1", device_overrides = override)
+
+    @testset "gfx1100 capture: RDNA SQ layout" begin
+        S = 262144 * 100000
+        w = hw_counters(fx; name = "w7900", kernel = "fma_probe", slots = [262144 * 8, S, S])
+        dev = first(w.dispatches).device
+        @test dev["architecture"] == "gfx1100" && dev["wave_size"] == 32 && dev["n_cu"] == 96 && dev["n_xcd"] == 1
+        @test dev["sq_cycle_unit"] == 1 && dev["sq_instances"] == 48   # per WGP, not per shader engine (6)
+        d = hw_counter_derived(w)
+        @test d["amd_insts_per_slot_valu"][2] ≈ 1.00012 rtol = 1e-4        # one v_fma_f64 per slot + 12 VALU per work-item
+        @test d["amd_insts_per_slot_valu"][1] ≈ (8 + 12) / 8 rtol = 1e-3
+        @test all(x -> 0.89 < x < 0.90, d["amd_sq_busy"][2:3])            # 6 shader engines would give 7.1
+        @test all(x -> 1300 < x < 1400, d["amd_resident_waves"][2:3])     # ×4 would exceed the 3072 hardware maximum
+        @test all(x -> x < 1, d["amd_elapsed_occupancy"]) && d["amd_waves_per_cu"][2] ≈ d["amd_resident_waves"][2] / 96
+        @test all(x -> 1.02 < x < 1.04, d["amd_active_clock_GHz"][2:3])   # 959 MHz shader clock pinned by STABLE_STD; GRBM counts ~7 % faster
+        @test w["SQ_WAVES"][1:2] == [8192, 8192] && w["SQ_WAVES"][3] == 116097   # the glitch stays visible in the raw data
+        @test hw_counter_summary(w)["raw_SQ_WAVES_median"] == 8192
+    end
 
     @testset "dispatch identity and partial metadata" begin
         mktempdir() do dir

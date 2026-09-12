@@ -140,8 +140,21 @@ After collection, restore the recorded level (`AUTO` only if it was originally `
 sudo amd-smi set --gpu <gpu-index> --perf-level AUTO
 ```
 
+Restoring is not housekeeping. `STABLE_STD` fixes the shader clock at a low "standard" level and
+disables idle down-clocking: on a W7900 it held 959 MHz against a 2.9 GHz boost, so every other
+workload on that GPU ran about three times slower, and idle board power stayed at 94 W instead
+of 19 W. It also means profiled durations under `STABLE_STD` are not comparable with unprofiled
+runs of the same kernel; compare cycle counters, or time the kernel again in `AUTO`.
 When scripting, restore the original state on errors and interrupts as well. GPU indices
 can differ between amd-smi, rocprofv3, and DRM sysfs; identify the same device in each tool.
+The sysfs knob is unambiguous when the PCI address is known (`card<N>/device/uevent` lists it):
+
+```sh
+cat  /sys/class/drm/card<N>/device/power_dpm_force_performance_level          # record: auto
+echo profile_standard | sudo tee /sys/class/drm/card<N>/device/power_dpm_force_performance_level
+# ... collect ...
+echo auto | sudo tee /sys/class/drm/card<N>/device/power_dpm_force_performance_level
+```
 
 The HIP/HSA runtime must also support ROCprofiler registration. If the workload runs
 but no dispatch records appear, verify that the profiler and workload load compatible,
@@ -227,9 +240,20 @@ already cost time (rocprofv3 1.1.0 on gfx942 unless stated):
    a unit's busy fraction is `X_BUSY_sum / (cycles × n_cu)`. Never multiply them by the wavefront
    size — doing so once inflated per-slot L1 accesses 64×. Only `SQ_INSTS_*` are per-wave issues,
    and only those take `× wave_size / slots`.
-3. **SQ wave-cycle counters are quad-cycles on gfx9** (`SQ_WAVE_CYCLES`, `SQ_WAIT_ANY`,
-   `SQ_WAIT_INST_ANY`, `SQ_ACTIVE_INST_*`): ratios between them are unit-free, resident waves are
-   `4 × SQ_WAVE_CYCLES / cycles`. `SQ_BUSY_CYCLES` is plain cycles per shader engine.
+3. **SQ wave-cycle counters are quad-cycles on CDNA and plain cycles on RDNA** (`SQ_WAVE_CYCLES`,
+   `SQ_WAIT_ANY`, `SQ_WAIT_INST_ANY`, `SQ_ACTIVE_INST_*`). AMD's own `OccupancyPercent` is
+   `400 × SQ_WAVE_CYCLES / max_xcc(GRBM_GUI_ACTIVE) / CU_NUM / 32` on gfx90a, gfx940–942 and gfx950
+   and `100 × …` on gfx10, gfx11 and gfx12 (rocprofiler-sdk `counter_defs.yaml`). The parser records
+   that unit per dispatch as `device["sq_cycle_unit"]` (4, 1, or `missing` for an architecture outside
+   the table; supply it through `device_overrides` there), and resident waves are
+   `sq_cycle_unit × SQ_WAVE_CYCLES / cycles`. Ratios between the wave-cycle counters are unit-free.
+   `SQ_BUSY_CYCLES` is plain cycles everywhere but is summed over a different set of instances:
+   per shader engine on CDNA (`DIMENSION_SHADER_ENGINE`, 32 on the MI300X) and per WGP on RDNA
+   (`DIMENSION_WGP × SHADER_ARRAY × SHADER_ENGINE`, 48 on the 96-CU W7900), so `amd_sq_busy` divides
+   by `device["sq_instances"]`, resolved the same way (`n_se` on CDNA, `n_cu ÷ 2` on RDNA, or an
+   override). Note that AMD normalises by the
+   **maximum** over dies while the CSV holds the **sum**, so `/ n_xcd` is the mean over dies: the
+   same while every die is busy, below the maximum otherwise.
 4. **`amd_active_clock_GHz` is the mean active clock, not the engine clock.** Idle dies count
    no cycles, so it is a lower bound and meaningless for sub-ms dispatches. It agreed with the
    amdgpu sysfs engine clock to 0.01 GHz on the MI300X (1.70 and 1.25 GHz). The MI300X is
@@ -253,16 +277,24 @@ already cost time (rocprofv3 1.1.0 on gfx942 unless stated):
    `nvidia_fp64_pipe_peak_fraction` needs `sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active`,
    which is not in the `:fp64` preset; add it through `metrics` when the question is "is the FP64
    pipe the wall" (a kernel at 88 % pipe fraction gained only 7–9 % from removing integer work).
-8. **gfx1100 (Radeon Pro W7900) validates basic counters only.** It exposes no F64 counters,
-   so the `:fp64` preset and the gfx942 normalisation cannot be checked there. The performance
-   level matters more than it looks: an earlier attempt in `AUTO`, from an Ubuntu ROCm 7.0.2 /
-   7.2.4 container on a host without a rocprofiler package, ran `--kernel-trace` fine while
-   `--pmc` hung with the GPU idle even for one counter and even privileged; the baseline
-   collection for this release succeeded under `STABLE_STD`, so set the level first. The
-   container recipe: `rocm/dev-ubuntu-24.04` plus `libdw1`, with `--device=/dev/kfd
-   --device=/dev/dri --security-opt seccomp=unconfined --ipc=host` and `ROCR_VISIBLE_DEVICES`
-   selecting the discrete GPU (the host's integrated GPU crashed the 7.0.2 tool with
-   `unordered_map::at`).
+8. **gfx1100 (Radeon Pro W7900) is validated for the SQ counters, nothing else.** It exposes no
+   F64, TA / TD / TCP or TCC counters, so only `SQ_*` and `GRBM_GUI_ACTIVE` can be collected and
+   the `:memory`, `:fp64` and `:l2` presets do not apply. A W7900 collection (fixture `w7900_*`)
+   confirmed the RDNA row of the table: `SQ_INSTS_VALU × 32 / slots` is 1.0001 per FMA, resident
+   waves come out at 1346 of the 3072 the hardware holds (a ×4 unit would exceed it), and
+   `SQ_BUSY_CYCLES` is 0.89 of the dispatch per WGP (7.1 per shader engine). Three things to know:
+   in `AUTO` the run "succeeds" with `SQ_WAVES` correct while `GRBM_GUI_ACTIVE` and
+   `SQ_WAVE_CYCLES` read zero, and `STABLE_STD` pins the shader clock at 959 MHz, so profiled
+   durations are three times an unprofiled run; with the host's integrated GPU present,
+   `ROCR_VISIBLE_DEVICES` does not hide it from rocprofv3 1.1 and unqualified counters abort with
+   `unordered_map::at` — device-qualified names (`SQ_WAVES:device=0`) are mandatory; and
+   `SQ_WAVES` read 14× too high on one dispatch in three of five collections, so validate the
+   wave count per dispatch rather than trusting a median. `amd_active_clock_GHz` read 1.03 GHz
+   against the 959 MHz sysfs shader clock, consistent with RDNA3's front-end clock running above
+   the shader clock; treat it as the front-end clock there. The container recipe that ran:
+   `rocm/dev-ubuntu-24.04` plus `libdw1`, `--device=/dev/kfd --device=/dev/dri
+   --security-opt seccomp=unconfined --ipc=host`, the host's juliaup and depot bind-mounted with
+   `HOME` and `JULIA_DEPOT_PATH` set, and `ROCM_PATH=/opt/rocm`.
 
 Kernel names as the tools report them: KernelAbstractions kernels are `gpu_<kernel name>(…)`,
 AcceleratedKernels' `foreachindex` is `gpu__forindices_global_(…)`, and runtime-internal
@@ -293,9 +325,11 @@ hc = hw_counters(:amd, "prof"; name = "cell", kernel = "my_kernel",
         "n_cu" => 304, "wave_size" => 64, "max_waves_per_cu" => 32)))
 ```
 
-Architecture-specific AMD normalization is currently validated for gfx942. Other targets
-retain raw counters and dimension-free ratios; unvalidated cycle/occupancy estimates are
-`missing`. Use actual known device properties for overrides.
+Cycle normalisation applies wherever `n_xcd` is known (agent info or override); the only
+architecture-specific input is how the SQ block reports, taken from AMD's own definitions per
+family or from `device_overrides`: `"sq_cycle_unit"` (4 on CDNA, 1 on RDNA) and `"sq_instances"`
+(shader engines on CDNA, WGPs on RDNA). Fixture-validated on gfx942; the RDNA entries follow AMD's
+`counter_defs.yaml` and a W7900 collection. Use actual known device properties for overrides.
 
 Binary `.ncu-rep` input requires an explicit export using the system tool:
 
@@ -320,15 +354,15 @@ report the number of contributing observations.
 | `insts_per_slot_fp64_fma/add/mul` | NVIDIA predicated-on thread instructions / slots; AMD wave instructions × wave size / slots (assumes full active waves; divergence can overestimate active-lane work). |
 | `fp64_flop_per_slot` | Twice FMA plus add and multiply counts; excludes transcendental seeds and matrix work. |
 | `amd_active_clock_GHz` | `GRBM_GUI_ACTIVE / n_xcd / duration_s / 1e9`; equals engine clock only while every die stays busy. |
-| `amd_elapsed_occupancy` | On gfx942: `4 × SQ_WAVE_CYCLES / (GRBM_GUI_ACTIVE / n_xcd) / n_cu / max_waves_per_cu`. |
+| `amd_elapsed_occupancy` | `sq_cycle_unit × SQ_WAVE_CYCLES / (GRBM_GUI_ACTIVE / n_xcd) / n_cu / max_waves_per_cu`; the unit is 4 on CDNA, 1 on RDNA. |
 | `nvidia_active_occupancy` | SM active-warp percentage of sustained peak over active cycles / 100. Its averaging window differs from AMD's estimate. |
 | `amd_l2_request_hit_rate` | TCC hits / (hits + misses). |
 | `nvidia_l2_sector_hit_rate` | L2 sector lookup hit percentage / 100; sectors and requests are distinct denominators. |
 | `nvidia_fp64_pipe_peak_fraction` | FP64 pipe percentage of sustained peak over active cycles / 100; not a portable fraction of wall time issuing FP64. |
 
-AMD issue, wait, residency and unit-busy estimates keep `amd_` names. The gfx942 formulas
-retain quad-cycle SQ normalization and die/engine dimensions. Native counts remain
-available to audit them. Profiler local-memory traffic can include call-ABI stack frames
+AMD issue, wait, residency and unit-busy estimates keep `amd_` names. The formulas retain
+the SQ wave-cycle unit and the die / engine dimensions AMD's own derived metrics use. Native
+counts remain available to audit them. Profiler local-memory traffic can include call-ABI stack frames
 as well as actual register spills.
 
 ## Migration from 0.2

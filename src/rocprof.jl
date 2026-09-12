@@ -19,13 +19,18 @@
 #     is `GRBM_GUI_ACTIVE / n_xcd` (`Num_Xcc` in the agent info; 1 on single-die parts), and every
 #     per-cycle rate (unit busy, resident waves, clock) uses it. 14 GHz is the sanity check that
 #     the division was forgotten; "/38" and "/(8 × 304)" are the same per-CU normalisation.
+#     rocprofv3's own derived metrics take `max_xcc(GRBM_GUI_ACTIVE)`; the CSV sum / n_xcd is the
+#     MEAN over dies — equal while every die is busy, below the max otherwise.
 # (2) `*_sum` unit counters are summed over every instance on the device (one TA / TD / TCP per
 #     CU), so a unit's busy fraction is `X_BUSY_sum / (cycles × n_cu)`. They are EVENT counts, not
 #     per-wave issues: never multiply them by the wavefront size (doing so once inflated per-slot
 #     L1 accesses 64×).
 # (3) The SQ wave-cycle counters (`SQ_WAVE_CYCLES`, `SQ_WAIT_ANY`, `SQ_WAIT_INST_ANY`,
-#     `SQ_ACTIVE_INST_*`) are in QUAD-cycles (4 clocks) on gfx9: ratios between them are unit-free,
-#     resident waves = 4·SQ_WAVE_CYCLES / cycles. `SQ_BUSY_CYCLES` is plain cycles per shader engine.
+#     `SQ_ACTIVE_INST_*`) are in QUAD-cycles (4 clocks) on CDNA and plain cycles on RDNA: AMD's own
+#     OccupancyPercent is 400·SQ_WAVE_CYCLES/… on gfx90a / gfx94x / gfx950 and 100·… on gfx10 / 11 /
+#     12 (rocprofiler-sdk counter_defs.yaml; `_SQ_CYCLE_UNIT` is that table). Ratios between them
+#     are unit-free; resident waves = unit·SQ_WAVE_CYCLES / cycles. `SQ_BUSY_CYCLES` is plain
+#     cycles everywhere, but summed per shader engine on CDNA and per WGP on RDNA (`_SQ_FAMILY`).
 # (4) `SQ_INSTS_*` count per-WAVE instruction issues; × wavefront size (64 on CDNA) / slots is the
 #     per-slot count a static instruction mix can be held against. Validated on gfx942: the FP64
 #     classes per slot (219.1 / 44.0 / 178.1 / 15.0) matched the static hot loop exactly.
@@ -80,8 +85,9 @@ const _AMD_PRESET_NOTES = Dict{Symbol, String}(
         "One pass on gfx942 (rocprofv3 1.1.0, ROCm 7.2.4).",
     :occupancy => "Wave residency and what waves do: SQ_WAVES, SQ_BUSY_CYCLES, SQ_WAVE_CYCLES, " *
         "SQ_ACTIVE_INST_ANY/_VALU, SQ_WAIT_INST_ANY, SQ_WAIT_ANY plus GRBM_GUI_ACTIVE. The wave-cycle " *
-        "counters are QUAD-cycles on gfx9 (resident waves = 4·SQ_WAVE_CYCLES / cycles; ratios between " *
-        "them are unit-free). amd_wave_wait_frac − amd_wave_wait_inst_frac is the dependency / " *
+        "counters are QUAD-cycles on CDNA and plain cycles on RDNA (resident waves = sq_cycle_unit · " *
+        "SQ_WAVE_CYCLES / cycles, the unit from AMD's own definitions per architecture or a " *
+        "`device_overrides` entry; ratios between them are unit-free). amd_wave_wait_frac − amd_wave_wait_inst_frac is the dependency / " *
         "memory-latency wait: waves mostly waiting on data (latency-bound) vs on the arbiter " *
         "(issue-bound). amd_elapsed_occupancy is rocprofv3's OccupancyPercent / 100, an elapsed-window " *
         "figure to hold against kernel_resources' theoretical occupancy. One pass on gfx942.",
@@ -165,6 +171,7 @@ function _parse_rocprof(file; kernel = nothing, slots = nothing,
         end
         if !haskey(seen, key)
             device = _device_override(ismissing(dev) ? Dict{String, Any}() : get(agents, dev, Dict{String, Any}()), dev, device_overrides)
+            _resolve_sq_layout!(device)
             push!(dispatches, HWDispatch(id, pid, dev, missing, queue, kname,
                 ismissing(start) ? missing : start / 1e9, duration, resources, device, missing))
             push!(rows, Dict{String, Union{Missing, Float64}}())
@@ -183,9 +190,51 @@ function _parse_rocprof(file; kernel = nothing, slots = nothing,
     return _build_counters(RocprofV3(), file, dispatches, rows, Dict(); kernel, slots, provenance, required_metrics)
 end
 
-# gfx942 normalization is fixture-validated. Do not silently apply quad-cycle or
-# die-sum assumptions to other architectures. Raw data and dimension-free ratios
-# remain usable everywhere; metadata can explicitly identify a known architecture.
+# Per architecture family, how the SQ block reports: the unit of its wave-cycle counters and the
+# instances `SQ_BUSY_CYCLES` is summed over. From rocprofiler-sdk's own definitions (counter_defs.yaml,
+# `rocprofv3 --list-avail`): OccupancyPercent = 400·SQ_WAVE_CYCLES / max_xcc(GRBM_GUI_ACTIVE) / CU_NUM / 32
+# on gfx90a / gfx940–942 / gfx950 (quad-cycles) and 100·… on gfx10 / gfx11 / gfx12 (plain cycles);
+# `SQ_BUSY_CYCLES` carries DIMENSION_SHADER_ENGINE on CDNA (per SE, `Num_Shader_Banks`) and
+# DIMENSION_WGP × SHADER_ARRAY × SHADER_ENGINE on RDNA (per WGP = 2 CUs; 48 on a 96-CU gfx1100, where
+# 6.56e9 busy cycles over a 49 ms dispatch is 1.0 per WGP-cycle at 2.8 GHz, 8× too much per SE).
+# An architecture outside the table gets `missing` for both; `device_overrides` can supply
+# `"sq_cycle_unit"` and `"sq_instances"`. Fixture-validated on gfx942 (MI300X) and gfx1100 (W7900:
+# 1.0001 VALU per FMA slot, 1346 resident waves of 3072, SQ busy 0.89 per WGP); the other RDNA
+# entries follow AMD's formulas.
+const _SQ_FAMILY = Dict{String, Symbol}(
+    "gfx90a" => :cdna, "gfx940" => :cdna, "gfx941" => :cdna, "gfx942" => :cdna, "gfx950" => :cdna,
+    "gfx1010" => :rdna, "gfx1030" => :rdna, "gfx1031" => :rdna, "gfx1032" => :rdna,
+    "gfx1100" => :rdna, "gfx1101" => :rdna, "gfx1102" => :rdna, "gfx1150" => :rdna, "gfx1151" => :rdna,
+    "gfx1200" => :rdna, "gfx1201" => :rdna,
+)
+const _SQ_CYCLE_UNIT = Dict(:cdna => 4, :rdna => 1)
+function _positive_override(device, key, what)
+    u = device[key]
+    ismissing(u) || (u isa Real && isfinite(u) && u > 0) || throw(ArgumentError("$key must be a positive $what"))
+    return device
+end
+function _resolve_sq_layout!(device::Dict{String, Any})
+    arch = get(device, "architecture", missing)
+    family = ismissing(arch) ? missing : get(_SQ_FAMILY, first(split(String(arch), ':')), missing)
+    if haskey(device, "sq_cycle_unit")
+        _positive_override(device, "sq_cycle_unit", "number of clocks per SQ wave-cycle count")
+    else
+        device["sq_cycle_unit"] = ismissing(family) ? missing : _SQ_CYCLE_UNIT[family]
+    end
+    if haskey(device, "sq_instances")
+        _positive_override(device, "sq_instances", "count of SQ instances SQ_BUSY_CYCLES is summed over")
+    else
+        n_se, n_cu = get(device, "n_se", missing), get(device, "n_cu", missing)
+        device["sq_instances"] = ismissing(family) ? missing :
+            family === :cdna ? n_se : ismissing(n_cu) ? missing : n_cu ÷ 2
+    end
+    return device
+end
+
+# Cycle normalisation applies wherever the agent info (or an override) gives n_xcd; only the SQ
+# wave-cycle unit is architecture-specific, and it comes from `_SQ_CYCLE_UNIT` / an override.
+# Raw counters and dimension-free ratios need neither. Nothing here is defaulted: a missing device
+# property makes the metrics that need it `missing`.
 function _amd_derived(raw, d)
     out = Dict{String, Union{Missing, Float64}}()
     getv(c) = get(raw, c, missing)
@@ -205,9 +254,8 @@ function _amd_derived(raw, d)
             out["fp64_flop_per_slot"] = _safe_ratio((2raw[fma] + raw[add] + raw[mul]) * prop("wave_size"), d.slots)
         end
     end
-    arch = prop("architecture")
-    known = !ismissing(arch) && first(split(arch, ':')) == "gfx942"
-    cycles = known ? _safe_ratio(getv("GRBM_GUI_ACTIVE"), prop("n_xcd")) : missing
+    unit = prop("sq_cycle_unit")   # clocks per SQ wave-cycle count: 4 on CDNA, 1 on RDNA, missing if unknown (see _SQ_FAMILY)
+    cycles = _safe_ratio(getv("GRBM_GUI_ACTIVE"), prop("n_xcd"))   # one die's clocks; the CSV sums the dies
     if haskey(raw, "GRBM_GUI_ACTIVE")
         out["amd_active_clock_GHz"] = _safe_ratio(cycles, d.duration_s) / 1e9
         for c in keys(raw)
@@ -218,13 +266,13 @@ function _amd_derived(raw, d)
         haskey(raw, "TCP_PENDING_STALL_CYCLES_sum") &&
             (out["amd_tcp_pending_stall"] = _safe_ratio(raw["TCP_PENDING_STALL_CYCLES_sum"], cycles * prop("n_cu")))
         if haskey(raw, "SQ_WAVE_CYCLES")
-            resident = _safe_ratio(4raw["SQ_WAVE_CYCLES"], cycles)
+            resident = _safe_ratio(unit * raw["SQ_WAVE_CYCLES"], cycles)
             out["amd_resident_waves"] = resident
             out["amd_waves_per_cu"] = _safe_ratio(resident, prop("n_cu"))
             # This is elapsed-active-device-window occupancy, not NVIDIA's per-SM active-cycle average.
             out["amd_elapsed_occupancy"] = _safe_ratio(resident, prop("n_cu") * prop("max_waves_per_cu"))
         end
-        haskey(raw, "SQ_BUSY_CYCLES") && (out["amd_sq_busy"] = _safe_ratio(raw["SQ_BUSY_CYCLES"], cycles * prop("n_se")))
+        haskey(raw, "SQ_BUSY_CYCLES") && (out["amd_sq_busy"] = _safe_ratio(raw["SQ_BUSY_CYCLES"], cycles * prop("sq_instances")))
     end
     ratio("amd_l1_miss", "TCP_TCC_READ_REQ_sum", "TCP_TOTAL_CACHE_ACCESSES_sum")
     ratio("amd_l2_dram_read_frac", "TCC_EA0_RDREQ_DRAM_sum", "TCC_EA0_RDREQ_sum")
@@ -235,6 +283,6 @@ function _amd_derived(raw, d)
         ratio("amd_" * key, c, "SQ_WAVE_CYCLES")
     end
     haskey(raw, "SQ_WAVE_CYCLES") && haskey(raw, "SQ_WAVES") &&
-        (out["amd_wave_cycles"] = known ? _safe_ratio(4raw["SQ_WAVE_CYCLES"], raw["SQ_WAVES"]) : missing)
+        (out["amd_wave_cycles"] = _safe_ratio(unit * raw["SQ_WAVE_CYCLES"], raw["SQ_WAVES"]))
     return out
 end
