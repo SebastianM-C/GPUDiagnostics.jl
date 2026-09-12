@@ -1,5 +1,28 @@
 # Hardware counters
 
+Counters answer *what the kernel did*: instructions issued, waves resident, cache requests,
+cycles. They do not answer *how long it took*; that is [`LaunchTimer`](device_timing.md)'s job,
+with [`with_gpu_sampler`](telemetry.md) alongside for clocks and power. A performance study
+therefore runs the same kernel twice, and the split is the same on every vendor:
+
+1. **The timing run**, unprofiled, in the card's normal power state: `LaunchTimer` medians over
+   warm launches. This is the benchmark.
+2. **The counter run**, a few dispatches of the same kernel under the profiler, built with
+   `hw_counter_command`. The profiler changes how the kernel runs: Nsight Compute replays and
+   serialises launches, RDNA GPUs need a fixed performance level before some counters read at
+   all, and only CDNA parts profiled within a few percent of their event timings.
+
+Two kinds of values come out of the counter run. **Counts** — instructions per slot, waves,
+requests, hit rates, wait fractions — are exact whatever the clock did, and are the code's
+behaviour as run. **Anything divided by a duration** — the active clock, achieved bandwidth,
+the profiled duration itself — describes the clock state during the collection, which on an
+RDNA card pinned to its standard level or under `ncu`'s replay is not the state of the timing
+run. The join between the two runs is the cycle count: every preset carries `GRBM_GUI_ACTIVE`
+(or `gpu__time_duration` with the SM clock) because cycles per slot is the cost of the code
+independent of clock, and the timing run's duration turns it into the clock the kernel really
+ran at. That is also how a power-managed part is read: the same work in fewer cycles is a
+better kernel, wall time falling less than the cycles is the clock dropping.
+
 Per-dispatch counters come from rocprofv3 on AMD and Nsight Compute (`ncu`) on NVIDIA.
 Both produce `HWCounters`. Sampled counters, such as NVML GPM, remain in `GPUTelemetry`;
 they measure a different window and have a separate capability.
