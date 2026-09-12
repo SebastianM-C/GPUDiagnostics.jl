@@ -8,6 +8,7 @@ or [`hw_counter_status`](@ref) when no CUDA runtime is loaded.
 struct NsightCompute <: HWCounterCollector end
 _counter_vendor(::NsightCompute) = :nvidia
 _counter_tool(::NsightCompute) = :ncu
+_collector_keywords(::NsightCompute) = (:launch_skip, :launch_count, :clock_control, :cache_control, :replay_mode, :target_processes)
 
 function _counter_command_args(::NsightCompute, exe, metrics; dir, name, kernel,
         launch_skip::Integer = 0, launch_count::Union{Nothing, Integer} = nothing,

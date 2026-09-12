@@ -97,6 +97,22 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test hw_counter_summary(w)["raw_SQ_WAVES_median"] == 8192
     end
 
+    @testset "directory detection stops at the first header line" begin
+        mktempdir() do dir
+            cp(joinpath(fx, "w7900_counter_collection.csv"), joinpath(dir, "w7900_counter_collection.csv"))
+            trace = joinpath(dir, "w7900_kernel_trace.csv")   # a large non-counter CSV next to the collection
+            open(trace, "w") do io
+                println(io, "\"Kind\",\"Agent_Id\",\"Dispatch_Id\",\"Kernel_Name\",\"Start_Timestamp\"")
+                for i in 1:200_000; println(io, "KERNEL_DISPATCH,Agent 1,", i, ",k,", i); end
+            end
+            t = @elapsed h = hw_counters(dir)
+            @test length(h) == 3 && t < 2
+            @test GPUDiagnostics._counter_csv_vendor(trace) === nothing
+            write(joinpath(dir, "x_ncu.csv"), "==PROF== Connected\n\n\"ID\",\"Kernel Name\",\"Metric Name\",\"Metric Unit\",\"Metric Value\"\r\n")
+            @test GPUDiagnostics._counter_csv_vendor(joinpath(dir, "x_ncu.csv")) === :nvidia
+        end
+    end
+
     @testset "dispatch identity and partial metadata" begin
         mktempdir() do dir
             path = joinpath(dir, "probe_counter_collection.csv")
@@ -201,8 +217,10 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
             @test_throws ArgumentError hw_counter_command(NsightCompute(), `true`; dir = "o", name = "p", opts...)
         end
         @test_throws ArgumentError hw_counter_command(RocprofV3(), `true`; dir = "o", name = "../p")
-        @test_throws MethodError hw_counter_command(RocprofV3(), `true`; dir = "o", name = "p", launch_skip = 1)
-        @test_throws MethodError hw_counter_command(NsightCompute(), `true`; dir = "o", name = "p", kernel_trace = false)
+        err = try hw_counter_command(RocprofV3(), `true`; dir = "o", name = "p", launch_skip = 1); nothing catch e; e end
+        @test err isa ArgumentError && occursin("RocprofV3 does not accept the keyword(s) launch_skip", err.msg) && occursin("kernel_trace", err.msg)
+        err = try hw_counter_command(NsightCompute(), `true`; dir = "o", name = "p", kernel_trace = false, launch_count = 0); nothing catch e; e end
+        @test err isa ArgumentError && occursin("NsightCompute does not accept the keyword(s) kernel_trace", err.msg)
         @test_throws MethodError hw_counter_command(:nvidia, `true`; dir = "o", name = "p")
         @test_throws MethodError hw_counter_status(:amd)
         amd = hw_counter_command(RocprofV3(), `true`; dir = "o", name = "p",

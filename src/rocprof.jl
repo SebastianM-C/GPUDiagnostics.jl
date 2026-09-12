@@ -55,6 +55,7 @@ or [`hw_counter_status`](@ref) when no AMDGPU runtime is loaded.
 struct RocprofV3 <: HWCounterCollector end
 _counter_vendor(::RocprofV3) = :amd
 _counter_tool(::RocprofV3) = :rocprofv3
+_collector_keywords(::RocprofV3) = (:kernel_trace,)
 
 function _counter_command_args(::RocprofV3, exe, metrics; dir, name, kernel, kernel_trace::Bool = true)
     args = String[exe]

@@ -171,6 +171,10 @@ function hw_counter_command(collector::HWCounterCollector, cmd::Cmd; set::Symbol
     isempty(pmc) || any(isempty, pmc) ? throw(ArgumentError("metrics must not be empty")) : nothing
     exe = executable === nothing ? String(_counter_tool(collector)) : String(executable)
     filter = kernel === nothing ? nothing : kernel isa Regex ? kernel.pattern : String(kernel)
+    # Collector-specific keywords are checked here, so a keyword of the other vendor's collector is
+    # an ArgumentError naming the collector, not a MethodError from the private builder.
+    bad = [k for k in keys(kwargs) if !(k in _collector_keywords(collector))]
+    isempty(bad) || throw(ArgumentError("$(nameof(typeof(collector))) does not accept the keyword(s) $(join(bad, ", ")); it accepts $(join(_collector_keywords(collector), ", "))"))
     args = _counter_command_args(collector, exe, pmc; dir, name, kernel = filter, kwargs...)
     append!(args, cmd.exec)
     timeout_s === nothing || (args = ["timeout", "-k", string(kill_after_s), string(timeout_s), args...])
@@ -225,12 +229,16 @@ end
 hw_counters(v::Symbol, path::AbstractString; kwargs...) = hw_counters(path; vendor = v, kwargs...)
 
 _collection_name(file, v) = chopsuffix(chopsuffix(basename(file), v === :amd ? "_counter_collection.csv" : "_ncu.csv"), ".csv")
+# The header is the first line that is not an ncu `==PROF==` log line; anything else in the
+# directory (a kernel trace, agent info) is rejected after that one line, not after the whole file.
 function _counter_csv_vendor(file)
     for line in eachline(file)
         startswith(strip(line), "==") && continue
-        f = _csv_fields(line)
+        isempty(strip(line)) && continue
+        f = _csv_fields(rstrip(line, '\r'))
         "Dispatch_Id" in f && "Counter_Name" in f && return :amd
         "ID" in f && "Kernel Name" in f && ("Metric Name" in f || any(c -> occursin("__", c), f)) && return :nvidia
+        return nothing
     end
     return nothing
 end
