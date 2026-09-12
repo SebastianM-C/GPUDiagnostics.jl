@@ -37,22 +37,51 @@ const _NCU_COUNTERS = Dict(
     :l2 => ["gpu__time_duration.sum", "lts__t_sector_hit_rate.pct"],
 )
 
+# What each NVIDIA preset answers, and how its denominators differ from the AMD twin.
+const _NCU_PRESET_NOTES = Dict{Symbol, String}(
+    :issue => "Warp instructions (smsp__inst_executed.sum) and predicated-on THREAD instructions " *
+        "(smsp__thread_inst_executed.sum) with the launch duration. Thread instructions / slots " *
+        "(nvidia_insts_per_slot) is the per-slot dynamic count comparable to AMD's wave count × wave_size; " *
+        "thread / (32 × warp) below 1 is divergence. Instruction counts are exact under replay; the " *
+        "duration is ncu's serialized, cache-controlled replay, not a benchmark. One pass on sm_120.",
+    :occupancy => "sm__warps_active.avg.pct_of_peak_sustained_active: achieved warps per SM as a " *
+        "fraction of the SM maximum, averaged over ACTIVE cycles only (nvidia_active_occupancy). Idle " *
+        "tails do not dilute it, so it is not the AMD elapsed-window estimate; hold it against " *
+        "kernel_resources' theoretical occupancy, not against amd_elapsed_occupancy. One pass on sm_120.",
+    :memory => "dram__bytes.sum: DRAM traffic of the launch; / duration is the achieved bandwidth. " *
+        "There is no L1-pipe busy analogue in this preset — the nearest ncu metrics are the " *
+        "l1tex__* family, passed as a custom `metrics` list. One pass on sm_120.",
+    :fp64 => "Predicated-on DFMA / DADD / DMUL thread instructions: per-THREAD counts, so / slots " *
+        "directly (no wave factor); fp64_flop_per_slot = 2·FMA + ADD + MUL. Add " *
+        "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active to `metrics` for " *
+        "nvidia_fp64_pipe_peak_fraction, the question 'is the FP64 pipe the wall' (a kernel at 88 % " *
+        "pipe fraction gained only 7–9 % from removing integer work). Three replay passes on sm_120.",
+    :l2 => "lts__t_sector_hit_rate.pct: L2 hit rate over 32 B SECTOR lookups (nvidia_l2_sector_hit_rate). " *
+        "Sectors are not AMD's TCC requests, so the two hit rates have different denominators and are " *
+        "not directly comparable. Three replay passes on sm_120.",
+)
+
 """
     COUNTER_SETS
 
 Intent-based presets: `COUNTER_SETS[:amd][:issue]` / `COUNTER_SETS[:nvidia][:issue]`,
-plus `:occupancy`, `:memory`, `:fp64`, and `:l2`. Each value is a [`CounterSet`](@ref).
-AMD sets are validated on gfx942 with rocprofv3 1.1.0, ROCm 7.2.4, and each fits one pass
-there. NVIDIA presets were collected on sm_120 with ncu 2025.4.1; their recorded pass counts
-apply to a bounded FMA probe only, not to arbitrary workloads or other GPUs. Raw custom `metrics` remain available. Unsupported
-metrics are errors from the collector, never silently replaced with different measurements.
+plus `:occupancy`, `:memory`, `:fp64`, and `:l2`. Each value is a [`CounterSet`](@ref) whose
+`notes` say what the preset answers, how its raw values must be read (which counters are
+per-wave, per-thread, event counts or quad-cycles) and the trap specific to it — read them
+before interpreting a collection. AMD sets are validated on gfx942 with rocprofv3 1.1.0,
+ROCm 7.2.4, and each fits one pass there; the L2 set is at the TCC block's four-counter
+capacity, and exceeding a block's capacity aborts rocprofv3 and hangs the workload (hence
+`timeout -k` in [`hw_counter_command`](@ref)). NVIDIA presets were collected on sm_120 with ncu
+2025.4.1; their recorded pass counts apply to a bounded FMA probe only, not to arbitrary
+workloads or other GPUs. Raw custom `metrics` remain available. Unsupported metrics are
+errors from the collector, never silently replaced with different measurements.
 """
 const COUNTER_SETS = Dict(
     :amd => Dict(k => CounterSet(copy(_AMD_COUNTERS[v]), ["gfx942 / rocprofv3 1.1.0 / ROCm 7.2.4"], 1,
-        "One pass on the validated architecture; query rocprofv3 for other devices.") for (k, v) in
+        _AMD_PRESET_NOTES[k]) for (k, v) in
         (:issue => :sq_issue, :occupancy => :sq_waves, :memory => :l1_pipe, :fp64 => :fp64, :l2 => :l2)),
     :nvidia => Dict(k => CounterSet(copy(v), ["sm_120 / ncu 2025.4.1 / bounded FMA probe"], k in (:fp64, :l2) ? 3 : 1,
-        "Observed passes for the validation probe only; query ncu on other devices and workloads.") for (k, v) in _NCU_COUNTERS),
+        _NCU_PRESET_NOTES[k]) for (k, v) in _NCU_COUNTERS),
 )
 
 const _NCU_IDENTITY = ("ID", "Process ID", "Process Name", "Host Name", "Kernel Name", "Context",

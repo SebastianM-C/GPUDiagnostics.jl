@@ -173,6 +173,12 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test amd.exec == ["rocprofv3", "--kernel-include-regex", "probe.*", "--pmc",
             "SQ_WAVES:device=0", "--output-format", "csv", "-d", "o", "-o", "p", "--", "true"]
         @test all(p -> p.passes == 1, values(COUNTER_SETS[:amd]))
+        for v in (:amd, :nvidia)   # the notes are the per-preset reading guide, not boilerplate
+            notes = [COUNTER_SETS[v][k].notes for k in (:issue, :occupancy, :memory, :fp64, :l2)]
+            @test all(n -> length(n) > 200, notes) && allunique(notes)
+        end
+        @test occursin("FOUR counters", COUNTER_SETS[:amd][:l2].notes) && occursin("per-WAVE", COUNTER_SETS[:amd][:issue].notes)
+        @test occursin("EVENT counts", COUNTER_SETS[:amd][:memory].notes) && occursin("per-THREAD", COUNTER_SETS[:nvidia][:fp64].notes)
     end
 
     @testset "real NVIDIA FP64 collection" begin

@@ -179,6 +179,18 @@ wave width: 4096 work-items correspond to 128 waves at width 32, or 64 at width 
 
 ## Presets and collection behavior
 
+| Intent | AMD (rocprofv3) answers | NVIDIA (ncu) answers |
+|---|---|---|
+| `:issue` | per-wave issue by class → `amd_insts_per_slot_<class>`, the dynamic mix to hold against the static `kernel_instruction_mix` hot loop | warp and thread instructions → `nvidia_insts_per_slot`; thread / (32 × warp) below 1 is divergence |
+| `:occupancy` | resident waves and wait fractions (quad-cycle SQ counters) → latency-bound vs issue-bound | achieved warps per SM over active cycles → `nvidia_active_occupancy` |
+| `:memory` | TA / TD busy, TCP stalls, L1 miss → is the in-order vector-memory pipe the wall | DRAM bytes → achieved bandwidth |
+| `:fp64` | FMA / ADD / MUL / TRANS F64 per wave → `fp64_flop_per_slot` against the algorithmic count | DFMA / DADD / DMUL per thread → `fp64_flop_per_slot` |
+| `:l2` | TCC hits / misses, fabric and HBM reads → does the working set live in L2 or HBM | L2 sector hit rate → `nvidia_l2_sector_hit_rate` |
+
+Each `CounterSet.notes` carries the long form: what the counters are (per-wave, per-thread,
+event counts, quad-cycles), the derived keys, the validation and the trap specific to that
+preset. Print `COUNTER_SETS[:amd][:memory].notes` before interpreting a collection.
+
 `COUNTER_SETS[vendor][intent]` is a `CounterSet` with native metrics, validation context,
 known pass count (or `missing`), and notes. Intents are `:issue`, `:occupancy`, `:memory`,
 `:fp64`, and `:l2`. Use `metrics = ["native_metric", ...]` for a custom collection.
@@ -200,6 +212,61 @@ its duration is not an ordinary concurrent launch duration. For application-mana
 cache priming, consider `replay_mode = :application, cache_control = :none`. This reruns
 the application, so ensure repeating its side effects is acceptable. Keep workloads small
 and record the settings. See the [NVIDIA profiling guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html).
+
+## Reading the counters
+
+The raw values are the profiler's, in the profiler's units. These are the readings that have
+already cost time (rocprofv3 1.1.0 on gfx942 unless stated):
+
+1. **Every AMD counter is summed over its hardware dimensions.** `GRBM_GUI_ACTIVE` has
+   `DIMENSION_XCC[0:7]` on the MI300X, so a 40 ms dispatch reports 5.7e8 "cycles", a 14 GHz clock,
+   until divided by the eight dies. The dispatch's cycle count is `GRBM_GUI_ACTIVE / n_xcd`
+   (`Num_Xcc` in the agent info; 1 on single-die parts) and every per-cycle rate uses it. 14 GHz
+   means the division was forgotten; "/38" and "/(8 × 304)" are the same per-CU normalisation.
+2. **`*_sum` unit counters are event counts summed over instances** (one TA / TD / TCP per CU):
+   a unit's busy fraction is `X_BUSY_sum / (cycles × n_cu)`. Never multiply them by the wavefront
+   size — doing so once inflated per-slot L1 accesses 64×. Only `SQ_INSTS_*` are per-wave issues,
+   and only those take `× wave_size / slots`.
+3. **SQ wave-cycle counters are quad-cycles on gfx9** (`SQ_WAVE_CYCLES`, `SQ_WAIT_ANY`,
+   `SQ_WAIT_INST_ANY`, `SQ_ACTIVE_INST_*`): ratios between them are unit-free, resident waves are
+   `4 × SQ_WAVE_CYCLES / cycles`. `SQ_BUSY_CYCLES` is plain cycles per shader engine.
+4. **`amd_active_clock_GHz` is the mean active clock, not the engine clock.** Idle dies count
+   no cycles, so it is a lower bound and meaningless for sub-ms dispatches. It agreed with the
+   amdgpu sysfs engine clock to 0.01 GHz on the MI300X (1.70 and 1.25 GHz). The MI300X is
+   power-managed: the same kernel ran at 1.70 GHz at 7 waves/CU and 1.25 GHz at 14 waves/CU
+   against the 750 W board cap, so a launch doing 1.8× the work per cycle finished only 1.27×
+   sooner. Compare two runs of the same work in **cycles** (`GRBM_GUI_ACTIVE / n_xcd`,
+   `SQ_BUSY_CYCLES`), not seconds, and report the clock next to the timing.
+5. **Counter capacity is per hardware block and per pass.** The TCC block takes four counters
+   on gfx942; a fifth (`TCC_REQ_sum`, `TCC_READ_sum`) makes rocprofv3 log
+   `Request exceeds the capabilities of the hardware to collect`, abort with SIGABRT and leave
+   the profiled child hung. `hw_counter_command` wraps the collection in `timeout -k` for exactly
+   that failure (the child then exits 137); grep the profiler log for `exceeds the capabilities`
+   or `caught signal` when a collection produced no CSV.
+6. **AMD profiled durations are close to device-event timings** (26.8–27.4 ms per dispatch
+   against a 28.0 ms `LaunchTimer` median): kernels run at speed under `--pmc` and the overhead
+   is the counter read. **NVIDIA durations are replays** under `clock_control` / `cache_control`
+   and are not benchmarks; instruction counts are exact either way. On the MI300X the FP64 preset
+   reproduced the static hot loop's FMA / ADD / MUL / TRANS counts per slot exactly, bit-identical
+   across dispatches — the check to repeat on a new architecture before trusting a preset.
+7. **NVIDIA thread-instruction metrics are per thread**, so `/ slots` directly, no wave factor.
+   `nvidia_fp64_pipe_peak_fraction` needs `sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active`,
+   which is not in the `:fp64` preset; add it through `metrics` when the question is "is the FP64
+   pipe the wall" (a kernel at 88 % pipe fraction gained only 7–9 % from removing integer work).
+8. **gfx1100 (Radeon Pro W7900) validates basic counters only.** It exposes no F64 counters,
+   so the `:fp64` preset and the gfx942 normalisation cannot be checked there. The performance
+   level matters more than it looks: an earlier attempt in `AUTO`, from an Ubuntu ROCm 7.0.2 /
+   7.2.4 container on a host without a rocprofiler package, ran `--kernel-trace` fine while
+   `--pmc` hung with the GPU idle even for one counter and even privileged; the baseline
+   collection for this release succeeded under `STABLE_STD`, so set the level first. The
+   container recipe: `rocm/dev-ubuntu-24.04` plus `libdw1`, with `--device=/dev/kfd
+   --device=/dev/dri --security-opt seccomp=unconfined --ipc=host` and `ROCR_VISIBLE_DEVICES`
+   selecting the discrete GPU (the host's integrated GPU crashed the 7.0.2 tool with
+   `unordered_map::at`).
+
+Kernel names as the tools report them: KernelAbstractions kernels are `gpu_<kernel name>(…)`,
+AcceleratedKernels' `foreachindex` is `gpu__forindices_global_(…)`, and runtime-internal
+`__amd_rocclr_*` dispatches are excluded by the default kernel selection.
 
 ## Portable input and retained data
 
@@ -278,6 +345,7 @@ Version 0.3 removes the AMD-only public family:
 | `rocprof_derived(rc)` | `hw_counter_derived(hc)` returns **vectors**; summarize explicitly |
 | `rocprof_median(rc, counter)` | `Statistics.median(skipmissing(hc[counter]))` when samples exist |
 | `rocprof_summary(rc)` | `hw_counter_summary(hc)` |
+| `fp64_flop_per_slot` = 2·FMA + ADD + MUL + TRANS | `fp64_flop_per_slot` = 2·FMA + ADD + MUL on both vendors; the AMD TRANS count stays in `amd_insts_per_slot_valu_trans_f64` |
 
 Schema 2 replaces counter summary keys with `raw_<name>_median` and
 `derived_<name>_median`, plus ranges and valid sample counts. Other result layouts are
