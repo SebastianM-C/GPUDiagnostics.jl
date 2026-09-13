@@ -46,11 +46,13 @@ const _NCU_COUNTERS = Dict(
 
 # What each NVIDIA preset answers, and how its denominators differ from the AMD twin.
 const _NCU_PRESET_NOTES = Dict{Symbol, String}(
-    :issue => "Warp instructions (smsp__inst_executed.sum) and predicated-on THREAD instructions " *
-        "(smsp__thread_inst_executed.sum) with the launch duration. Thread instructions / slots " *
-        "(nvidia_insts_per_slot) is the per-slot dynamic count comparable to AMD's wave count × wave_size; " *
-        "thread / (32 × warp) below 1 is divergence. Instruction counts are exact under replay; the " *
-        "duration is ncu's serialized, cache-controlled replay, not a benchmark. One pass on sm_120.",
+    :issue => "Warp instructions (smsp__inst_executed.sum) and THREAD instructions " *
+        "(smsp__thread_inst_executed.sum: every lane, predicated-off included; " *
+        "smsp__thread_inst_executed_pred_on.sum is the predicated-on count) with the launch duration. " *
+        "Thread instructions / slots (nvidia_insts_per_slot) is the per-slot dynamic count comparable " *
+        "to AMD's wave count × wave_size; thread / (32 × warp) below 1 means partially populated or " *
+        "divergent warps. Instruction counts are exact under replay; the duration is ncu's serialized, " *
+        "cache-controlled replay, not a benchmark. One pass on sm_120.",
     :occupancy => "sm__warps_active.avg.pct_of_peak_sustained_active: achieved warps per SM as a " *
         "fraction of the SM maximum, averaged over ACTIVE cycles only (nvidia_active_occupancy). Idle " *
         "tails do not dilute it, so it is not the AMD elapsed-window estimate; hold it against " *
@@ -141,7 +143,6 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
     units = Dict{String, Union{Missing, String}}()
     dispatches = HWDispatch[]
     rows = Dict{String, Union{Missing, Float64}}[]
-    passes = Union{Missing, Int}[]
     seen = Dict{Tuple, Int}()
     function setunit(c, u)
         u = ismissing(u) || isempty(u) ? missing : String(u)
@@ -170,7 +171,6 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
             resources = Dict{String, Any}("grid" => getv("Grid Size"), "block" => getv("Block Size"))
             push!(dispatches, HWDispatch(id, pid, dev, ctx, stream, kname, missing, missing, resources, device, missing))
             push!(rows, Dict{String, Union{Missing, Float64}}())
-            push!(passes, missing)
             seen[key] = length(rows)
         end
         i = seen[key]
@@ -188,16 +188,13 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
             # `device` / `resources` (under their native names) and to `provenance["passes"]`, so
             # `counters` keeps only what the hardware measured.
             if c == "device__attribute_display_name"
-                dispatches[i].device["name"] = value
+                _set_metadata!(dispatches[i].device, "name", value, "device name", id)
                 continue
             elseif any(pre -> startswith(c, pre), ("device__", "nvlink__", "c2clink__", "numa__"))
-                dispatches[i].device[c] = _metadata_value(value)   # device attributes and topology
+                _set_metadata!(dispatches[i].device, c, value, "device attribute", id)   # attributes and topology
                 continue
-            elseif startswith(c, "launch__")
-                dispatches[i].resources[c] = _metadata_value(value)
-                continue
-            elseif c == "profiler__replayer_passes"
-                passes[i] = _counter_int(value)
+            elseif startswith(c, "launch__") || c == "profiler__replayer_passes"
+                _set_metadata!(dispatches[i].resources, c, value, "launch metadata", id)
                 continue
             elseif startswith(c, "profiler__")
                 continue
@@ -215,31 +212,40 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
         r = rows[i]
         duration = _ncu_seconds(get(r, "gpu__time_duration.sum", missing), get(units, "gpu__time_duration.sum", missing))
         !ismissing(duration) && duration < 0 && throw(ArgumentError("negative ncu duration"))
+        # The common fields derive from routed launch metadata; a non-numeric cell there is `missing`, not an error.
         for (key, c) in (("registers", "launch__registers_per_thread"), ("shared_mem_bytes", "launch__shared_mem_per_block_static"))
-            d.resources[key] = get(d.resources, c, missing)
+            d.resources[key] = _numeric_or_missing(get(d.resources, c, missing))
         end
-        blocks = get(d.resources, "launch__grid_size", _ncu_dim_product(get(d.resources, "grid", missing)))
-        threads = get(d.resources, "launch__block_size", _ncu_dim_product(get(d.resources, "block", missing)))
+        blocks = _numeric_or_missing(get(d.resources, "launch__grid_size", _ncu_dim_product(get(d.resources, "grid", missing))))
+        threads = _numeric_or_missing(get(d.resources, "launch__block_size", _ncu_dim_product(get(d.resources, "block", missing))))
         d.resources["grid_blocks"] = blocks
         d.resources["workgroup_size"] = threads
         d.resources["grid_size"] = blocks * threads  # common field: work-items, as on AMD
         dispatches[i] = HWDispatch(d.id, d.process_id, d.device_id, d.context_id, d.queue_id,
             d.kernel, d.start_s, duration, d.resources, d.device, d.slots)
     end
-    # The tool's own pass count is provenance when every dispatch agrees and the caller did not set it.
-    prov = Dict{String, Any}(String(k) => v for (k, v) in pairs(provenance))
-    if !haskey(prov, "passes") && !isempty(passes) && all(!ismissing, passes) && allequal(passes)
-        prov["passes"] = first(passes)
-    end
-    return _build_counters(NsightCompute(), file, dispatches, rows, units; kernel, slots, provenance = prov, required_metrics)
+    return _build_counters(NsightCompute(), file, dispatches, rows, units; kernel, slots, provenance, required_metrics)
 end
 
-# A metadata cell: numeric where it parses as a number, the string otherwise, missing when empty.
+# A metadata cell: numeric where it parses as a number, the string otherwise, `missing` for the
+# tools' no-value cells. Metadata repeated across a dispatch's rows must agree, as counters must.
 function _metadata_value(value)
     ismissing(value) && return missing
-    v = tryparse(Float64, replace(strip(String(value)), "," => ""))
+    t = strip(String(value))
+    lowercase(t) in _MISSING_CELLS && return missing
+    v = tryparse(Float64, replace(t, "," => ""))
     return v === nothing ? String(value) : isinteger(v) ? Int(v) : v
 end
+function _set_metadata!(dict, key, value, what, id)
+    v = _metadata_value(value)
+    if haskey(dict, key) && !ismissing(dict[key])   # `missing` is unset (an identity column the export lacked)
+        ismissing(v) || isequal(dict[key], v) || throw(ArgumentError("conflicting $what $key for ncu dispatch $id"))
+    else
+        dict[key] = v
+    end
+    return dict
+end
+_numeric_or_missing(x) = x isa Real ? x : missing
 
 function _nvidia_derived(raw, d, units)
     out = Dict{String, Union{Missing, Float64}}()

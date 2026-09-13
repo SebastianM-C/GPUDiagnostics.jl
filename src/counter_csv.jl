@@ -60,10 +60,12 @@ function _csv_get(header, row, name, default = missing)
     j = findfirst(==(name), header)
     return j === nothing || isempty(row[j]) ? default : row[j]
 end
+# Cells the tools write for "no value": the same set for counters and for routed metadata.
+const _MISSING_CELLS = ("", "n/a", "nan", "-", "not supported", "not available")
 function _counter_number(s)
     ismissing(s) && return missing
     t = strip(String(s))
-    lowercase(t) in ("", "n/a", "nan", "-", "not supported", "not available") && return missing
+    lowercase(t) in _MISSING_CELLS && return missing
     v = tryparse(Float64, replace(t, "," => ""))
     v === nothing && throw(ArgumentError("invalid numeric counter value: $(repr(s))"))
     return _finite_metric(v)

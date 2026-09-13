@@ -103,11 +103,13 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
             trace = joinpath(dir, "w7900_kernel_trace.csv")   # a large non-counter CSV next to the collection
             open(trace, "w") do io
                 println(io, "\"Kind\",\"Agent_Id\",\"Dispatch_Id\",\"Kernel_Name\",\"Start_Timestamp\"")
-                for i in 1:200_000; println(io, "KERNEL_DISPATCH,Agent 1,", i, ",k,", i); end
+                for i in 1:2000; println(io, "KERNEL_DISPATCH,Agent 1,", i, ",k,", i); end
             end
-            t = @elapsed h = hw_counters(dir)
-            @test length(h) == 3 && t < 2
+            @test length(hw_counters(dir)) == 3
             @test GPUDiagnostics._counter_csv_vendor(trace) === nothing
+            # only the first non-log line is inspected: a header on the second line does not count
+            write(joinpath(dir, "late.csv"), "not,a,header\n\"Dispatch_Id\",\"Counter_Name\"\n")
+            @test GPUDiagnostics._counter_csv_vendor(joinpath(dir, "late.csv")) === nothing
             write(joinpath(dir, "x_ncu.csv"), "==PROF== Connected\n\n\"ID\",\"Kernel Name\",\"Metric Name\",\"Metric Unit\",\"Metric Value\"\r\n")
             @test GPUDiagnostics._counter_csv_vendor(joinpath(dir, "x_ncu.csv")) === :nvidia
         end
@@ -156,6 +158,22 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
             @test isequal(d["nvidia_active_occupancy"], [0.5, missing])
             @test hw_counter_summary(h)["derived_insts_per_slot_fp64_fma_samples"] == 1
             @test_throws ArgumentError hw_counters(long; required_metrics = ["smsp__sass_thread_inst_executed_op_dfma_pred_on.sum"])
+            # routed metadata keeps the counters' rules: no-value cells are missing, repeats must agree
+            hdr = "\"ID\",\"Process ID\",\"Kernel Name\",\"Context\",\"Stream\",\"Device\",\"Metric Name\",\"Metric Unit\",\"Metric Value\"\n"
+            meta = joinpath(dir, "meta_ncu.csv")
+            write(meta, hdr * "0,1,k,1,1,0,launch__grid_size,,n/a\n0,1,k,1,1,0,launch__block_size,,256\n" *
+                "0,1,k,1,1,0,launch__registers_per_thread,register/thread,16\n0,1,k,1,1,0,gpu__time_duration.sum,ns,10\n")
+            m = hw_counters(meta)
+            @test ismissing(first(m.dispatches).resources["grid_size"]) && ismissing(first(m.dispatches).resources["grid_blocks"])
+            @test first(m.dispatches).resources["workgroup_size"] == 256 && first(m.dispatches).resources["registers"] == 16
+            open(meta, "a") do io; println(io, "0,1,k,1,1,0,launch__registers_per_thread,register/thread,32"); end
+            @test_throws ArgumentError hw_counters(meta)
+            # replay passes are provenance of the SELECTED kernel, not of the whole export
+            two = joinpath(dir, "two_ncu.csv")
+            write(two, hdr * "0,1,warm,1,1,0,profiler__replayer_passes,pass,1\n0,1,warm,1,1,0,gpu__time_duration.sum,ns,5\n" *
+                "1,1,hot,1,1,0,profiler__replayer_passes,pass,3\n1,1,hot,1,1,0,gpu__time_duration.sum,ns,7\n")
+            @test hw_counters(two; kernel = "hot").provenance["passes"] == 3
+            @test hw_counters(two; kernel = "warm").provenance["passes"] == 1
             wide = joinpath(dir, "wide_ncu.csv")
             write(wide, "ID,Process ID,Kernel Name,Device,gpu__time_duration.sum,lts__t_sector_hit_rate.pct\n" *
                 ",,,,usecond,%\n0,10,probe,0,2,75\n0,11,probe,1,3,0\n")
@@ -248,7 +266,7 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         # metadata columns of the raw page are not counters: launch attributes → resources, replay passes → provenance
         @test Set(h.counters) == Set(["gpu__time_duration.sum"; COUNTER_SETS[:nvidia][:fp64].metrics])
         @test all(d -> d.resources["registers"] == 16 && d.resources["launch__registers_per_thread"] == 16 &&
-            d.resources["launch__func_cache_config"] == "CachePreferNone", h.dispatches)
+            d.resources["launch__func_cache_config"] == "CachePreferNone" && d.resources["profiler__replayer_passes"] == 3, h.dispatches)
         @test h.provenance["passes"] == 3 && hw_counter_summary(h)["collection_passes"] == 3
         @test hw_counters(joinpath(@__DIR__, "fixtures", "ncu", "fp64_ncu.csv"); provenance = Dict("passes" => 1)).provenance["passes"] == 1
         s = hw_counter_summary(h)

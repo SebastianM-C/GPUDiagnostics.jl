@@ -291,8 +291,15 @@ function _build_counters(collector::HWCounterCollector, file, dispatches, rows, 
                 throw(ArgumentError("required counter $c is unavailable on one or more selected dispatches"))
         end
     end
+    prov = _counter_provenance(provenance)
+    # The tool's own replay pass count is provenance of THIS selection: every selected dispatch must
+    # agree, and a caller-supplied value wins. (ncu writes it per launch as profiler__replayer_passes.)
+    if !haskey(prov, "passes")
+        ps = [get(d.resources, "profiler__replayer_passes", missing) for d in ds]
+        !isempty(ps) && all(x -> x isa Integer, ps) && allequal(ps) && (prov["passes"] = first(ps))
+    end
     return HWCounters(vendor, _counter_tool(collector), _collection_name(file, vendor), name, ds,
-        counters, values, Dict(c => get(units, c, missing) for c in counters), _counter_provenance(provenance))
+        counters, values, Dict(c => get(units, c, missing) for c in counters), prov)
 end
 
 _safe_ratio(a, b) = ismissing(a) || ismissing(b) || b <= 0 ? missing : a / b
