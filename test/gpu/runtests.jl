@@ -243,7 +243,12 @@ end
             end
             log = joinpath(dir, "collector.log")
             ok = success(pipeline(ignorestatus(cmd); stdout = log, stderr = log))
-            ok || @error "collector failed" cmd log = read(log, String)
+            if !ok   # the signature lines first (permission, capacity, crash), then the tail
+                lines = readlines(log)
+                sig = filter(l -> occursin(r"ERR_|==ERROR==|exceeds the capabilities|caught signal|denied|failed"i, l), lines)
+                @error "collector failed" cmd
+                foreach(l -> println(stderr, "  | ", l), unique(vcat(sig, lines[max(1, end - 12):end])))
+            end
             @test ok
             hc = hw_counters(dir; name, kernel = "counter_probe", slots)
             @info "hardware counters" tool = hc.tool dispatches = length(hc) counters = hc.counters

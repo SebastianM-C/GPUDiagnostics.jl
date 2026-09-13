@@ -13,15 +13,17 @@ therefore runs the same kernel twice, and the split is the same on every vendor:
    all, and only CDNA parts profiled within a few percent of their event timings.
 
 Two kinds of values come out of the counter run. **Counts** — instructions per slot, waves,
-requests, hit rates, wait fractions — are exact whatever the clock did, and are the code's
-behaviour as run. **Anything divided by a duration** — the active clock, achieved bandwidth,
-the profiled duration itself — describes the clock state during the collection, which on an
-RDNA card pinned to its standard level or under `ncu`'s replay is not the state of the timing
-run. The join between the two runs is the cycle count: every preset carries `GRBM_GUI_ACTIVE`
-(or `gpu__time_duration` with the SM clock) because cycles per slot is the cost of the code
-independent of clock, and the timing run's duration turns it into the clock the kernel really
-ran at. That is also how a power-managed part is read: the same work in fewer cycles is a
-better kernel, wall time falling less than the cycles is the clock dropping.
+requests, hit rates, wait fractions — are exact whatever the clock did and are the code's
+behaviour as run, with one caveat: `ncu`'s replay and `cache_control = :all` change cache state,
+so traffic and hit rates describe the profiled conditions. **Anything divided by a duration or a
+cycle count** describes the state during the collection. Cycles are the nearest thing to a
+clock-independent cost, but only for work that does not wait: memory latency counted in core
+cycles shrinks as the core clock drops, and replay changes stalls. So read cycle counts under
+their collection conditions, and take the clock the timing run ran at from the sampler beside
+it (`sm_clock_MHz_busy_median`), not from counter cycles divided by the timing run's duration.
+Every preset carries `GRBM_GUI_ACTIVE` so that two collections under the *same* conditions
+compare per cycle: on a power-managed part the same work in fewer cycles is a better kernel,
+and wall time falling less than the cycles is the clock dropping.
 
 Per-dispatch counters come from rocprofv3 on AMD and Nsight Compute (`ncu`) on NVIDIA.
 Both produce `HWCounters`. Sampled counters, such as NVML GPM, remain in `GPUTelemetry`;
@@ -222,7 +224,7 @@ tool is not found; `GPUDIAGNOSTICS_COUNTER_TOOL` points at one outside `PATH` an
 
 | Intent | AMD (rocprofv3) answers | NVIDIA (ncu) answers |
 |---|---|---|
-| `:issue` | per-wave issue by class → `amd_insts_per_slot_<class>`, the dynamic mix to hold against the static `kernel_instruction_mix` hot loop | warp and thread instructions → `nvidia_insts_per_slot`; thread / (32 × warp) below 1 is divergence |
+| `:issue` | per-wave issue by class → `amd_insts_per_slot_<class>`, the dynamic mix to hold against the static `kernel_instruction_mix` hot loop | warp and thread instructions (all lanes) → `nvidia_insts_per_slot`; thread / (32 × warp) below 1 is partially populated or divergent warps |
 | `:occupancy` | resident waves and wait fractions (quad-cycle SQ counters) → latency-bound vs issue-bound | achieved warps per SM over active cycles → `nvidia_active_occupancy` |
 | `:memory` | TA / TD busy, TCP stalls, L1 miss → is the in-order vector-memory pipe the wall | DRAM bytes → achieved bandwidth |
 | `:fp64` | FMA / ADD / MUL / TRANS F64 per wave → `fp64_flop_per_slot` against the algorithmic count | DFMA / DADD / DMUL per thread → `fp64_flop_per_slot` |
