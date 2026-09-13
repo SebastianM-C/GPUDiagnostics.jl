@@ -59,7 +59,7 @@ on 55 of 56 busy samples, `power_throttled_fraction` = `power_capped_fraction` =
 clock at 2.74 GHz. And whether an SR-IOV
 virtual function (a cloud MI300X) exposes `gpu_metrics` at all is up to the host; the columns
 are simply absent when the file is. `amd_gpu_metrics(path)` decodes one snapshot offline for
-inspection; `tools/gen_gpu_metrics_layouts.py` regenerates the layout table from the kernel
+inspection; `tools/gen_gpu_metrics_layouts.jl` regenerates the layout table from the kernel
 header when a new revision appears.
 
 `gpu_sample` is exactly what the sampler child calls per tick. The child is a Julia process
