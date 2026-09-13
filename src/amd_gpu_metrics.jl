@@ -25,34 +25,20 @@
 # Nothing here is defaulted: an unknown revision, a size that matches no known layout, or an
 # absent field yields `missing` (and NaN in the telemetry), never a guess.
 
-# Generated from the Linux kernel's kgd_pp_interface.h (struct gpu_metrics_v*): for each
-# (format, content) revision, the C-aligned structure size and the byte offset of each field the
-# sampler reads, as (offset, width_bytes, count). A second entry with the packed size covers a
-# driver that emits the struct without implicit padding; the header's structure_size selects.
-const _GPU_METRICS_LAYOUTS = Dict{Tuple{Int, Int, Int}, Dict{Symbol, Tuple{Int, Int, Int}}}(
-    (1, 0, 80) => Dict(:hotspot_C => (18, 2, 1), :mem_temperature_C => (20, 2, 1), :gfx_activity => (28, 2, 1), :umc_activity => (30, 2, 1), :socket_power_W => (34, 2, 1), :gfxclk_MHz => (54, 2, 1), :throttle_status => (68, 4, 1)),
-    (1, 0, 72) => Dict(:hotspot_C => (14, 2, 1), :mem_temperature_C => (16, 2, 1), :gfx_activity => (24, 2, 1), :umc_activity => (26, 2, 1), :socket_power_W => (30, 2, 1), :gfxclk_MHz => (50, 2, 1), :throttle_status => (64, 4, 1)),
-    (1, 1, 96) => Dict(:hotspot_C => (6, 2, 1), :mem_temperature_C => (8, 2, 1), :gfx_activity => (16, 2, 1), :umc_activity => (18, 2, 1), :socket_power_W => (22, 2, 1), :gfxclk_MHz => (54, 2, 1), :throttle_status => (68, 4, 1)),
-    (1, 2, 104) => Dict(:hotspot_C => (6, 2, 1), :mem_temperature_C => (8, 2, 1), :gfx_activity => (16, 2, 1), :umc_activity => (18, 2, 1), :socket_power_W => (22, 2, 1), :gfxclk_MHz => (54, 2, 1), :throttle_status => (68, 4, 1)),
-    (1, 3, 120) => Dict(:hotspot_C => (6, 2, 1), :mem_temperature_C => (8, 2, 1), :gfx_activity => (16, 2, 1), :umc_activity => (18, 2, 1), :socket_power_W => (22, 2, 1), :gfxclk_MHz => (54, 2, 1), :throttle_status => (68, 4, 1), :indep_throttle_status => (112, 8, 1)),
-    (1, 4, 288) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :throttle_status => (40, 4, 1), :gfxclk_MHz => (240, 2, 8)),
-    (1, 4, 284) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :throttle_status => (40, 4, 1), :gfxclk_MHz => (240, 2, 8)),
-    (1, 5, 360) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :throttle_status => (104, 4, 1), :gfxclk_MHz => (312, 2, 8)),
-    (1, 5, 356) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :throttle_status => (104, 4, 1), :gfxclk_MHz => (312, 2, 8)),
-    (1, 6, 312) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :accumulation_counter => (32, 4, 1), :prochot_residency_acc => (36, 4, 1), :ppt_residency_acc => (40, 4, 1), :socket_thm_residency_acc => (44, 4, 1), :vr_thm_residency_acc => (48, 4, 1), :hbm_thm_residency_acc => (52, 4, 1), :gfxclk_MHz => (264, 2, 8)),
-    (1, 6, 308) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :accumulation_counter => (32, 4, 1), :prochot_residency_acc => (36, 4, 1), :ppt_residency_acc => (40, 4, 1), :socket_thm_residency_acc => (44, 4, 1), :vr_thm_residency_acc => (48, 4, 1), :hbm_thm_residency_acc => (52, 4, 1), :gfxclk_MHz => (260, 2, 8)),
-    (1, 7, 344) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :accumulation_counter => (40, 4, 1), :prochot_residency_acc => (44, 4, 1), :ppt_residency_acc => (48, 4, 1), :socket_thm_residency_acc => (52, 4, 1), :vr_thm_residency_acc => (56, 4, 1), :hbm_thm_residency_acc => (60, 4, 1), :gfxclk_MHz => (296, 2, 8)),
-    (1, 7, 334) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :accumulation_counter => (40, 4, 1), :prochot_residency_acc => (44, 4, 1), :ppt_residency_acc => (48, 4, 1), :socket_thm_residency_acc => (52, 4, 1), :vr_thm_residency_acc => (56, 4, 1), :hbm_thm_residency_acc => (60, 4, 1), :gfxclk_MHz => (286, 2, 8)),
-    (1, 8, 344) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :accumulation_counter => (40, 4, 1), :prochot_residency_acc => (44, 4, 1), :ppt_residency_acc => (48, 4, 1), :socket_thm_residency_acc => (52, 4, 1), :vr_thm_residency_acc => (56, 4, 1), :hbm_thm_residency_acc => (60, 4, 1), :gfxclk_MHz => (296, 2, 8)),
-    (1, 8, 334) => Dict(:hotspot_C => (4, 2, 1), :mem_temperature_C => (6, 2, 1), :socket_power_W => (10, 2, 1), :gfx_activity => (12, 2, 1), :umc_activity => (14, 2, 1), :accumulation_counter => (40, 4, 1), :prochot_residency_acc => (44, 4, 1), :ppt_residency_acc => (48, 4, 1), :socket_thm_residency_acc => (52, 4, 1), :vr_thm_residency_acc => (56, 4, 1), :hbm_thm_residency_acc => (60, 4, 1), :gfxclk_MHz => (286, 2, 8)),
-    (2, 0, 120) => Dict(:gfx_activity => (40, 2, 1), :socket_power_W => (44, 2, 1), :gfxclk_MHz => (80, 2, 1), :throttle_status => (112, 4, 1)),
-    (2, 0, 116) => Dict(:gfx_activity => (36, 2, 1), :socket_power_W => (40, 2, 1), :gfxclk_MHz => (76, 2, 1), :throttle_status => (108, 4, 1)),
-    (2, 1, 120) => Dict(:gfx_activity => (28, 2, 1), :socket_power_W => (40, 2, 1), :gfxclk_MHz => (76, 2, 1), :throttle_status => (108, 4, 1)),
-    (2, 2, 128) => Dict(:gfx_activity => (28, 2, 1), :socket_power_W => (40, 2, 1), :gfxclk_MHz => (76, 2, 1), :throttle_status => (108, 4, 1), :indep_throttle_status => (120, 8, 1)),
-    (2, 3, 152) => Dict(:gfx_activity => (28, 2, 1), :socket_power_W => (40, 2, 1), :gfxclk_MHz => (76, 2, 1), :throttle_status => (108, 4, 1), :indep_throttle_status => (120, 8, 1)),
-    (2, 4, 168) => Dict(:gfx_activity => (28, 2, 1), :socket_power_W => (40, 2, 1), :gfxclk_MHz => (76, 2, 1), :throttle_status => (108, 4, 1), :indep_throttle_status => (120, 8, 1)),
-    (2, 4, 164) => Dict(:gfx_activity => (28, 2, 1), :socket_power_W => (40, 2, 1), :gfxclk_MHz => (76, 2, 1), :throttle_status => (108, 4, 1), :indep_throttle_status => (120, 8, 1)),
-)
+# The field offsets per (format, content, structure_size) live in assets/gpu_metrics_layouts.toml,
+# written from the kernel header by tools/gen_gpu_metrics_layouts.jl and baked in at precompile
+# time. Each entry: field => (byte offset, width in bytes, count).
+const _GPU_METRICS_LAYOUTS_FILE = joinpath(@__DIR__, "..", "assets", "gpu_metrics_layouts.toml")
+include_dependency(_GPU_METRICS_LAYOUTS_FILE)
+function _load_gpu_metrics_layouts(path::AbstractString)
+    out = Dict{Tuple{Int, Int, Int}, Dict{Symbol, Tuple{Int, Int, Int}}}()
+    for l in TOML.parsefile(path)["layout"]
+        out[(Int(l["format"]), Int(l["content"]), Int(l["size"]))] =
+            Dict(Symbol(k) => (Int(v[1]), Int(v[2]), Int(v[3])) for (k, v) in l["fields"])
+    end
+    return out
+end
+const _GPU_METRICS_LAYOUTS = _load_gpu_metrics_layouts(_GPU_METRICS_LAYOUTS_FILE)
 
 # The driver's vendor-independent throttler bits (amdgpu_smu.h SMU_THROTTLER_*_BIT), in bit order.
 # Bits 0–7 are power limiters, 16–23 current/EDC limiters, 32–47 thermal and PROCHOT, 56–57 other.
