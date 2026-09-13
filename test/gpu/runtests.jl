@@ -244,7 +244,9 @@ end
             log = joinpath(dir, "collector.log")
             ok = success(pipeline(ignorestatus(cmd); stdout = log, stderr = log))
             if !ok   # the signature lines first (permission, capacity, crash), then the tail
-                lines = readlines(log)
+                # ncu writes its own ==PROF== / ==ERROR== lines into `--log-file`, i.e. into the CSV, not to stderr
+                csv = joinpath(dir, name * "_ncu.csv")
+                lines = vcat(isfile(csv) ? filter(startswith("=="), readlines(csv)) : String[], readlines(log))
                 sig = filter(l -> occursin(r"ERR_|==ERROR==|exceeds the capabilities|caught signal|denied|failed"i, l), lines)
                 @error "collector failed" cmd
                 foreach(l -> println(stderr, "  | ", l), unique(vcat(sig, lines[max(1, end - 12):end])))

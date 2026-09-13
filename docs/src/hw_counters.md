@@ -214,7 +214,7 @@ tool is not found; `GPUDIAGNOSTICS_COUNTER_TOOL` points at one outside `PATH` an
 | Symptom | First check |
 |---|---|
 | Collector not found | Installation, `PATH`, or explicit `executable` |
-| NVIDIA `ERR_NVGPUCTRPERM` | Driver profiling permissions for the collecting process |
+| NVIDIA `ERR_NVGPUCTRPERM` | Driver profiling permissions for the collecting process. ncu writes it as an `==ERROR==` line into `<name>_ncu.csv` (its `--log-file`), not to stderr; `hw_counters` then rejects the file as incomplete |
 | AMD workload runs but no dispatch CSV appears | HIP/HSA profiler registration, loaded runtime paths, and kernel filter |
 | AMD wave counts are plausible but GRBM counts are zero | RDNA performance state before collection |
 | rocprofv3 1.0.0 throws `unordered_map::at` with mixed GPUs | Device-qualified metrics for the supported target |
