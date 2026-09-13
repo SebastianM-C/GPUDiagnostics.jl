@@ -73,15 +73,16 @@ struct SysfsSource <: SamplerSource
     temp_edge::Union{String, Nothing}
     temp_hot::Union{String, Nothing}
     power_cap::Union{String, Nothing}
+    gpu_metrics::Union{String, Nothing}   # the driver's binary snapshot: throttler state, per-XCD clocks
 end
-const _SYSFS_FIELDS = 10   # device + 9 files; the 5-field form of older parents is still accepted
+const _SYSFS_FIELDS = 11   # device + 10 files; the 5-field form of older parents is still accepted
 function _sampler_source(::Val{:sysfs}, rest::AbstractString, ::Symbol)
     f = split(rest, ':')
     5 <= length(f) <= _SYSFS_FIELDS ||
         throw(ArgumentError("sysfs source spec needs 5 to $_SYSFS_FIELDS fields, got $(length(f)): $rest"))
     opt(i) = (i > length(f) || f[i] == "-") ? nothing : String(f[i])
     return SysfsSource(parse(Int, f[1]), String(f[2]), String(f[3]), opt(4), String(f[5]),
-        opt(6), opt(7), opt(8), opt(9), opt(10))
+        opt(6), opt(7), opt(8), opt(9), opt(10), opt(11))
 end
 function _read_number(path)
     try
@@ -92,36 +93,50 @@ function _read_number(path)
     end
 end
 _read_number(::Nothing) = NaN
-# throttle_reasons: the amdgpu driver reports throttling only inside the `gpu_metrics` binary
-# blob (throttle_status), not decoded yet → NaN on AMD.
-sample!(s::SysfsSource) = (
-    power_W = _read_number(s.power) / 1.0e6,
-    compute_util = _read_number(s.busy) / 100,
-    mem_util = _read_number(s.membusy) / 100,
-    vram_used_B = _read_number(s.vram),
-    sm_clock_MHz = _read_number(s.sclk) / 1.0e6,
-    mem_clock_MHz = _read_number(s.mclk) / 1.0e6,
-    temperature_C = _read_number(s.temp_edge) / 1000,
-    hotspot_C = _read_number(s.temp_hot) / 1000,
-    power_limit_W = _read_number(s.power_cap) / 1.0e6,
-    throttle_reasons = NaN,
-)
+# `throttle_reasons` is NVML's bitmask and stays NaN on AMD; the amdgpu throttler state lives in the
+# `gpu_metrics` blob and arrives as its own columns (`amd_throttle_status`, the MI300 residency
+# accumulators, the per-XCD clock spread — see amd_gpu_metrics.jl) when the parent handed us the file.
+function sample!(s::SysfsSource)
+    base = (
+        power_W = _read_number(s.power) / 1.0e6,
+        compute_util = _read_number(s.busy) / 100,
+        mem_util = _read_number(s.membusy) / 100,
+        vram_used_B = _read_number(s.vram),
+        sm_clock_MHz = _read_number(s.sclk) / 1.0e6,
+        mem_clock_MHz = _read_number(s.mclk) / 1.0e6,
+        temperature_C = _read_number(s.temp_edge) / 1000,
+        hotspot_C = _read_number(s.temp_hot) / 1000,
+        power_limit_W = _read_number(s.power_cap) / 1.0e6,
+        throttle_reasons = NaN,
+    )
+    s.gpu_metrics === nothing && return base
+    return merge(base, _gpu_metrics_columns(s.gpu_metrics))
+end
 
 # Deterministic fake device for tests of the child protocol (and a handy `gpu_sample` stand-in on
-# the CPU backend): device 1 is "busy", device 2 idle with a counter it does not expose.
+# the CPU backend): device 1 is "busy", device 2 idle with a counter it does not expose, device 3 an
+# MI300-like part under its power cap: the AMD throttler bitmask and residency accumulators that
+# advance by 100 counts per sample, 80 of them power-limited.
 struct SyntheticSource <: SamplerSource
     device::Int
     counters::Bool
+    tick::Base.RefValue{Int}
 end
 _sampler_source(::Val{:synthetic}, rest::AbstractString, counters::Symbol) =
-    SyntheticSource(parse(Int, rest), counters != :none)
+    SyntheticSource(parse(Int, rest), counters != :none, Ref(0))
 function sample!(s::SyntheticSource)
-    busy = s.device == 1
+    busy = s.device != 2
     base = (power_W = 100.0 + 50 * (s.device - 1), compute_util = busy ? 0.9 : 0.1,
         mem_util = s.device == 2 ? NaN : 0.5, vram_used_B = 1000.0 * s.device,
         sm_clock_MHz = busy ? 1800.0 : 300.0, mem_clock_MHz = 1200.0,
         temperature_C = busy ? 70.0 : 40.0, hotspot_C = s.device == 2 ? NaN : 85.0,
-        power_limit_W = 100.0 + 50 * (s.device - 1), throttle_reasons = busy ? 36.0 : 0.0)   # 36 = sw_power_cap | sw_thermal_slowdown
+        power_limit_W = 100.0 + 50 * (s.device - 1), throttle_reasons = s.device == 1 ? 36.0 : s.device == 2 ? 0.0 : NaN)   # 36 = sw_power_cap | sw_thermal_slowdown
+    if s.device == 3
+        k = (s.tick[] += 1)
+        base = merge(base, (amd_throttle_status = 1.0, xcd_clock_min_MHz = 1250.0, xcd_clock_max_MHz = 1300.0,   # 1 = :ppt0
+            throttle_acc_counter = 1000.0 + 100k, power_throttle_acc = 500.0 + 80k, thermal_throttle_acc = 100.0,
+            hbm_throttle_acc = 0.0, vr_throttle_acc = 0.0, prochot_acc = 0.0))
+    end
     s.counters || return base
     return merge(base, (sm_util = busy ? 0.9 : 0.1, sm_occupancy = busy ? 0.3 : 0.1, fp64_util = busy ? 0.8 : NaN))
 end
@@ -477,7 +492,7 @@ function _plausible_row(columns, vals)
             0 <= v <= 20000 || return false
         elseif c == "temperature_C" || c == "hotspot_C"
             -50 <= v <= 200 || return false
-        elseif c == "throttle_reasons"
+        elseif c == "throttle_reasons" || c == "amd_throttle_status" || endswith(c, "_acc") || c == "throttle_acc_counter"
             (v >= 0 && isinteger(v)) || return false
         end
     end
@@ -492,8 +507,16 @@ the rows whose `busy_column` is ≥ `busy_threshold`, i.e. the kernel-active par
 without the idle JIT / upload / drain phases diluting it (the number to hold against a kernel's
 theoretical occupancy) — plus `samples` (ticks), `busy_samples` (rows) and, when both `power_W`
 and `power_limit_W` are present, `power_capped_fraction`: the share of busy rows at
-`power_W ≥ 0.95 × power_limit_W`, i.e. running into the power cap. Empty when there are no
-rows."""
+`power_W ≥ 0.95 × power_limit_W`, i.e. running into the power cap. From the throttler bitmasks
+(`throttle_reasons` on NVIDIA, `amd_throttle_status` on AMD), `power_throttled_fraction` and
+`thermal_throttled_fraction`: the share of busy rows in which the device reported a power
+limiter (NVML `sw_power_cap` / `hw_power_brake_slowdown`; AMD PPT / SPL / SPPT / TDC / EDC) or a
+thermal one. From the MI300 residency accumulators, `power_violation_fraction`,
+`thermal_violation_fraction`, `hbm_thermal_violation_fraction`, `vr_thermal_violation_fraction`
+and `prochot_fraction`: Δresidency / Δaccumulation_counter between the first and last busy row
+of each device (all rows when none is busy), summed over devices — AMD's own PVIOL / TVIOL
+definition, the direct reading of "held at the power cap" vs "held by a temperature". Empty
+when there are no rows."""
 function gpu_telemetry_stats(t::GPUTelemetry; busy_column::Symbol = :compute_util, busy_threshold::Real = 0.5)
     out = Dict{String, Any}()
     n = size(t.samples, 1)
@@ -523,5 +546,53 @@ function gpu_telemetry_stats(t::GPUTelemetry; busy_column::Symbol = :compute_uti
         end
         n_ok == 0 || (out["power_capped_fraction"] = capped / n_ok)
     end
+    _throttled_fractions!(out, t, busy)
+    _violation_fractions!(out, t, busy)
     return out
+end
+
+# Busy rows whose throttler bitmask names a power limiter / a thermal limiter, on either vendor's
+# column (a row with both columns counts once).
+function _throttled_fractions!(out, t, busy)
+    masks = [(c, pb, tb) for (c, pb, tb) in ((:throttle_reasons, _NVML_POWER_BITS, _NVML_THERMAL_BITS),
+                 (:amd_throttle_status, _AMD_POWER_BITS, _AMD_THERMAL_BITS)) if haskey(t, c)]
+    isempty(masks) && return
+    n_ok = 0; pw = 0; th = 0
+    for i in 1:size(t.samples, 1)
+        busy[i] || continue
+        vals = [(UInt64(t[c][i]), pb, tb) for (c, pb, tb) in masks
+                if (v = t[c][i]; !isnan(v) && v >= 0 && isinteger(v) && v < 2.0^63)]
+        isempty(vals) && continue
+        n_ok += 1
+        any(x -> x[1] & x[2] != 0, vals) && (pw += 1)
+        any(x -> x[1] & x[3] != 0, vals) && (th += 1)
+    end
+    n_ok == 0 && return
+    out["power_throttled_fraction"] = pw / n_ok
+    out["thermal_throttled_fraction"] = th / n_ok
+    return
+end
+
+# MI300 residency accumulators: Δresidency / Δaccumulation_counter over the sampled window, per
+# device between its first and last busy row (all its rows when none is busy), summed over devices.
+function _violation_fractions!(out, t, busy)
+    haskey(t, :throttle_acc_counter) || return
+    dev, cnt = t[:device], t[:throttle_acc_counter]
+    for (key, col) in (("power_violation_fraction", :power_throttle_acc), ("thermal_violation_fraction", :thermal_throttle_acc),
+            ("hbm_thermal_violation_fraction", :hbm_throttle_acc), ("vr_thermal_violation_fraction", :vr_throttle_acc),
+            ("prochot_fraction", :prochot_acc))
+        haskey(t, col) || continue
+        acc = t[col]
+        num = 0.0; den = 0.0
+        for d in unique(dev)
+            rows = [i for i in eachindex(dev) if dev[i] == d && !isnan(cnt[i]) && !isnan(acc[i])]
+            b = filter(i -> busy[i], rows)
+            isempty(b) || (rows = b)
+            length(rows) >= 2 || continue
+            den += cnt[last(rows)] - cnt[first(rows)]
+            num += acc[last(rows)] - acc[first(rows)]
+        end
+        den > 0 && (out[key] = clamp(num / den, 0.0, 1.0))
+    end
+    return
 end
