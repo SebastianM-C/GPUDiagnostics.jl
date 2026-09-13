@@ -64,6 +64,7 @@ import Adapt
 import KernelAbstractions
 import KernelAbstractions as KA
 import Statistics
+import TOML
 using LinearAlgebra: LinearAlgebra
 import Tables
 using KernelAbstractions: Backend, @kernel, @index, @Const

@@ -61,6 +61,13 @@ end
         @test all(isnan, values(GPUDiagnostics._gpu_metrics_columns("/nonexistent/gpu_metrics")))
         @test all(isnan, values(GPUDiagnostics._gpu_metrics_columns(nothing)))
     end
+    @testset "layout data file" begin
+        L = GPUDiagnostics._load_gpu_metrics_layouts(GPUDiagnostics._GPU_METRICS_LAYOUTS_FILE)
+        @test L == GPUDiagnostics._GPU_METRICS_LAYOUTS && length(L) >= 20
+        @test L[(1, 3, 120)][:indep_throttle_status] == (112, 8, 1) && L[(1, 3, 120)][:gfxclk_MHz] == (54, 2, 1)
+        @test L[(1, 8, 344)][:ppt_residency_acc] == (48, 4, 1) && L[(1, 8, 344)][:gfxclk_MHz] == (296, 2, 8)
+        @test all(v -> all(x -> x[1] >= 4 && x[2] in (1, 2, 4, 8) && x[3] >= 1, values(v)), values(L))
+    end
     @testset "throttler bit names" begin
         @test amd_throttle_reasons(0) == Symbol[] && amd_throttle_reasons(NaN) == Symbol[]
         @test amd_throttle_reasons(1) == [:ppt0] && amd_throttle_reasons(2.0^36) == [:temp_hotspot]
