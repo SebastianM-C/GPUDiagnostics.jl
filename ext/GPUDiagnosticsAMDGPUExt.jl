@@ -98,9 +98,10 @@ end
 # driver's counters (VRAM included, via `mem_info_vram_used` — no hipMemGetInfo) directly, immune
 # to this process's HIP locks and Julia's GC/timer coupling. Sysfs paths contain no ':' so the
 # spec join is safe. No hardware counters here (`counters` is ignored). Spec:
-# `sysfs:<device>:<power>:<busy>:<membusy>:<vram>:<sclk>:<mclk>:<temp_edge>:<temp_hot>:<power_cap>`,
+# `sysfs:<device>:<power>:<busy>:<membusy>:<vram>:<sclk>:<mclk>:<temp_edge>:<temp_hot>:<power_cap>:<gpu_metrics>`,
 # `-` for a file the device lacks; the hwmon files are `freq1_input` (sclk, Hz), `freq2_input`
-# (mclk, Hz), `temp1_input` (edge, m°C), `temp2_input` (junction, m°C), `power1_cap` (µW).
+# (mclk, Hz), `temp1_input` (edge, m°C), `temp2_input` (junction, m°C), `power1_cap` (µW);
+# `gpu_metrics` is the driver's binary snapshot (throttler state, per-XCD clocks; amd_gpu_metrics.jl).
 function GD.gpu_sampler_sources(::ROCBackend, device_ids::AbstractVector{<:Integer}, ::Symbol)
     specs = map(device_ids) do i
         card = _amd_device_sysfs(AMDGPU.devices()[i])
@@ -110,7 +111,7 @@ function GD.gpu_sampler_sources(::ROCBackend, device_ids::AbstractVector{<:Integ
             opt(joinpath(card, "mem_busy_percent")), joinpath(card, "mem_info_vram_used"),
             opt(joinpath(hw, "freq1_input")), opt(joinpath(hw, "freq2_input")),
             opt(joinpath(hw, "temp1_input")), opt(joinpath(hw, "temp2_input")),
-            opt(joinpath(hw, "power1_cap"))], ":")
+            opt(joinpath(hw, "power1_cap")), opt(joinpath(card, "gpu_metrics"))], ":")
     end
     return (specs = specs, packages = Base.PkgId[])
 end

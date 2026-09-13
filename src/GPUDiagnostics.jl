@@ -82,6 +82,7 @@ export FEATURES, supports, capabilities, BackendUnsupported,
     instruction_mix, kernel_instruction_mix, fp64_issue_floor,
     IR_CLASSES, IRMix, kernel_ir_mix,
     diagnostics_dict, GPUDIAGNOSTICS_SCHEMA,
+    amd_gpu_metrics, amd_throttle_reasons, AMD_THROTTLER_BITS,
     CounterSet, COUNTER_SETS, HWDispatch, HWCounters, HWCounterAvailability,
     HWCounterCollector, RocprofV3, NsightCompute,
     hw_counter_command, hw_counter_export_command, hw_counters, hw_counter_derived,
@@ -89,6 +90,7 @@ export FEATURES, supports, capabilities, BackendUnsupported,
 
 include("capabilities.jl")   # supports/capabilities trait + BackendUnsupported; declared per backend by ext/
 include("device_api.jl")   # generics + CPU fallbacks + LaunchTimer; vendor methods in ext/ (hooks: backend_*)
+include("amd_gpu_metrics.jl")   # the amdgpu `gpu_metrics` blob: throttler state, MI300 residencies, per-XCD clocks
 include("sampler.jl")      # gpu_sample sources, the telemetry child, with_gpu_sampler, gpu_telemetry_stats
 include("peakflops.jl")    # FMA-chain FP64 peak probe
 include("resources.jl")    # compile-time resource report: registers / spills / LDS / occupancy
