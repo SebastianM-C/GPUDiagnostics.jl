@@ -130,6 +130,21 @@ function conformance(backend; kernel = nothing, peak_threads = 2^12)
             end
         end
 
+        @testset ":hw_counters" begin
+            if has(:hw_counters)
+                collector = GPUDiagnostics.backend_counter_collector(backend)
+                @test collector isa HWCounterCollector
+                st = hw_counter_status(backend)
+                @test st isa HWCounterAvailability && st.tool in (:ncu, :rocprofv3)
+                @test ismissing(st.permitted)
+                @test hw_counter_command(backend, `true`; dir = "out", name = "probe").exec ==
+                    hw_counter_command(collector, `true`; dir = "out", name = "probe").exec
+            else
+                @test !hw_counters_available(backend)
+                @test_throws BackendUnsupported hw_counter_command(backend, `true`; dir = "out", name = "probe")
+            end
+        end
+
         @testset ":native_mix" begin
             if has(:native_mix)
                 if kernel !== nothing

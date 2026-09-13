@@ -4,6 +4,13 @@
 #     GPUDIAGNOSTICS_GPU=cuda julia --project=test/gpu -e 'using Pkg; Pkg.resolve(); Pkg.instantiate(); include("test/gpu/runtests.jl")'
 #     GPUDIAGNOSTICS_GPU=rocm …
 #
+# The hardware-counter section runs `counter_probe.jl` under the vendor's collector when that tool
+# is found; it is skipped (not failed) otherwise. `GPUDIAGNOSTICS_COUNTER_TOOL=/path/to/ncu|rocprofv3`
+# locates a tool that is not on PATH; `GPUDIAGNOSTICS_COUNTER_DEVICE=N` qualifies the AMD counter
+# names (`SQ_WAVES:device=N`), mandatory when rocprofv3 also enumerates an integrated GPU. On RDNA
+# the performance level must be STABLE_STD first (see the hardware-counter guide), or the GRBM
+# cycle counters read zero and the section fails on purpose.
+#
 # `Pkg.resolve()` first: the env dev-tracks the package, and a manifest resolved before a dependency
 # was added to Project.toml is not refreshed by `instantiate` alone.
 # One vendor per process (loading both vendor packages is not the point). The kernel under
@@ -203,5 +210,75 @@ end
         @test occursin("ticks", sprint(show, MIME"text/plain"(), telem))
         @info "clocks" sm_clock_busy_median = st["sm_clock_MHz_busy_median"] power_capped_fraction = st["power_capped_fraction"] temperature_peak = get(st, "temperature_C_peak", NaN)
         @info "telemetry" ticks = telem.ticks first_sample_s = telem.first_sample_s power_W_mean = st["power_W_mean"] starved = telem.starved
+    end
+
+    @testset "hardware counters (skipped without the collector)" begin
+        @test supports(backend, :hw_counters)
+        collector = GPUDiagnostics.backend_counter_collector(backend)
+        @test collector isa (VENDOR == "cuda" ? NsightCompute : RocprofV3)
+        # The collector is a system tool, not a dependency: PATH or GPUDIAGNOSTICS_COUNTER_TOOL.
+        # Discovery says nothing about permission; that is only known once a collection ran.
+        exe = get(ENV, "GPUDIAGNOSTICS_COUNTER_TOOL", nothing)
+        st = hw_counter_status(backend; executable = exe)
+        @test ismissing(st.permitted)
+        if !st.available
+            @info "hardware counters: collector not found, skipping the collection" tool = st.tool
+        else
+            dir = mktempdir()
+            name = "probe"
+            # counter_probe.jl: 3 launches × 4096 work-items × 32 FP64 FMAs each; the first launch carries the JIT.
+            probe = joinpath(@__DIR__, "counter_probe.jl")
+            workload = addenv(`$(Base.julia_cmd()) --startup-file=no --project=$(dirname(Base.active_project())) $probe`,
+                "GPUDIAGNOSTICS_GPU" => VENDOR)
+            slots = 4096 * 32
+            if VENDOR == "cuda"
+                cmd = hw_counter_command(backend, workload; set = :fp64, dir, name, executable = exe,
+                    kernel = "counter_probe", launch_skip = 1, launch_count = 2)
+            else
+                # Two counters every AMD architecture exposes, so the section says the same thing on
+                # CDNA and RDNA; the presets are validated separately against fixtures.
+                q = haskey(ENV, "GPUDIAGNOSTICS_COUNTER_DEVICE") ? ":device=" * ENV["GPUDIAGNOSTICS_COUNTER_DEVICE"] : ""
+                cmd = hw_counter_command(backend, workload; metrics = ["GRBM_GUI_ACTIVE" * q, "SQ_WAVES" * q],
+                    dir, name, executable = exe, kernel = "counter_probe")
+            end
+            log = joinpath(dir, "collector.log")
+            ok = success(pipeline(ignorestatus(cmd); stdout = log, stderr = log))
+            if !ok   # the signature lines first (permission, capacity, crash), then the tail
+                # ncu writes its own ==PROF== / ==ERROR== lines into `--log-file`, i.e. into the CSV, not to stderr
+                csv = joinpath(dir, name * "_ncu.csv")
+                lines = vcat(isfile(csv) ? filter(startswith("=="), readlines(csv)) : String[], readlines(log))
+                sig = filter(l -> occursin(r"ERR_|==ERROR==|exceeds the capabilities|caught signal|denied|failed"i, l), lines)
+                @error "collector failed" cmd
+                foreach(l -> println(stderr, "  | ", l), unique(vcat(sig, lines[max(1, end - 12):end])))
+            end
+            @test ok
+            hc = hw_counters(dir; name, kernel = "counter_probe", slots)
+            @info "hardware counters" tool = hc.tool dispatches = length(hc) counters = hc.counters
+            @test startswith(hc.kernel, "gpu_counter_probe_")
+            @test all(d -> d.resources["grid_size"] == 4096 && d.resources["workgroup_size"] == 256, hc.dispatches)
+            @test all(d -> !ismissing(d.duration_s) && 0 < d.duration_s < 1, hc.dispatches)
+            if VENDOR == "cuda"
+                @test length(hc) == 2   # launch_skip = 1, launch_count = 2
+                @test hc["smsp__sass_thread_inst_executed_op_dfma_pred_on.sum"] == [slots, slots]   # one DFMA per slot, exactly
+                @test all(==(0), hc["smsp__sass_thread_inst_executed_op_dadd_pred_on.sum"])
+                @test hw_counter_derived(hc)["fp64_flop_per_slot"] == [2, 2]
+                @test !any(c -> startswith(c, "launch__") || startswith(c, "profiler__"), hc.counters)
+                @test haskey(hc.provenance, "passes") && hc.provenance["passes"] ≥ 1
+                @info "ncu" passes = hc.provenance["passes"] device = first(hc.dispatches).device["name"] registers = first(hc.dispatches).resources["registers"]
+            else
+                @test length(hc) == 3
+                d = first(hc.dispatches)
+                @test !ismissing(d.device["wave_size"]) && d.device["n_cu"] > 0
+                waves = 4096 ÷ d.device["wave_size"]
+                # Per dispatch, not a median: one glitched SQ_WAVES dispatch in three has been seen on gfx1100.
+                @test count(==(waves), skipmissing(hc["SQ_WAVES"])) ≥ 2
+                @test all(x -> !ismissing(x) && x > 0, hc["GRBM_GUI_ACTIVE"])   # zero on RDNA = performance level not STABLE_STD
+                @info "AMD SQ layout" architecture = d.device["architecture"] wave_size = d.device["wave_size"] sq_cycle_unit = d.device["sq_cycle_unit"] sq_instances = d.device["sq_instances"] waves = hc["SQ_WAVES"]
+            end
+            dd = diagnostics_dict(hc; prefix = "hw_")
+            @test dd["gpudiagnostics_schema"] == GPUDIAGNOSTICS_SCHEMA && dd["hw_dispatches"] == length(hc)
+            @test all(k -> k == "gpudiagnostics_schema" || startswith(k, "hw_"), keys(dd))
+            @test occursin("dispatches", sprint(show, hc))
+        end
     end
 end

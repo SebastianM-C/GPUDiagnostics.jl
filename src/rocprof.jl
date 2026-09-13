@@ -1,75 +1,71 @@
-# AMD hardware counters through rocprofv3 (ROCm 6.2+ / 7.x). There is no in-process counter API
-# AMDGPU.jl could call (nothing like NVIDIA's GPM), so the model is the profiler's: rocprofv3 wraps
-# a WHOLE PROCESS —
-#     rocprofv3 --kernel-trace --pmc <counters> --output-format csv -d <dir> -o <name> -- <command>
-# — and writes `<dir>/<name>_counter_collection.csv` (one row per dispatch × counter, with the
-# dispatch's timestamps and register/LDS/scratch footprint), `<name>_kernel_trace.csv` (every
-# dispatch) and `<name>_agent_info.csv` (the device: CU / XCD / SE / SIMD counts, wavefront size).
-# `rocprof_command` builds that wrapper around a `Cmd` (under `timeout -k`, because a counter
-# request the hardware refuses aborts rocprofv3 with SIGABRT and leaves the profiled child hung),
-# `rocprof_counters` parses the output for one kernel into a `RocprofCounters` table, and
-# `rocprof_derived` / `rocprof_summary` (and `diagnostics_dict`) reduce it: medians with
-# spreads across dispatches plus derived metrics with the normalisation rocprofv3's OWN
-# derived-metric definitions use on gfx942 (`rocprofv3 --list-avail`, rocprofv3 1.1.0):
+# AMD per-dispatch hardware counters through rocprofv3 (ROCm 6.2+ / 7.x). AMDGPU.jl has no
+# in-process counter API (nothing like NVIDIA's GPM), so the model is the profiler's: rocprofv3
+# wraps a whole process (or, in recent releases, attaches to one) and writes
+# `<name>_counter_collection.csv` (one row per dispatch × counter, with the dispatch's timestamps
+# and register / LDS / scratch footprint), `<name>_kernel_trace.csv` and `<name>_agent_info.csv`
+# (the device: CU / XCD / SE / SIMD counts, wavefront size). Kernels run at speed under `--pmc`;
+# the overhead is the counter read per dispatch, so profiled durations sit close to device-event
+# timings (26.8–27.4 ms vs a 28.0 ms event median on gfx942) — unlike ncu's replayed durations.
+#
+# How the raw values must be read (the normalisation rocprofv3's OWN derived metrics use on
+# gfx942, `rocprofv3 --list-avail`, rocprofv3 1.1.0):
 #
 #     OccupancyPercent = 400·Σ SQ_WAVE_CYCLES / max_xcc(GRBM_GUI_ACTIVE) / CU_NUM / 32
 #     SALUBusy         = 100·Σ SQ_INST_CYCLES_SALU / CU_NUM / max_xcc(GRBM_GUI_ACTIVE)
 #
-# i.e. (1) the CSV reports every counter SUMMED over its hardware dimensions — on the MI300X
-# `GRBM_GUI_ACTIVE` has DIMENSION_XCC[0:7], so the reported value is 8× the cycles one die saw
-# (a 40 ms dispatch shows 5.7e8 "cycles" = 14 GHz); the cycle count of the dispatch is
-# `GRBM_GUI_ACTIVE / n_xcd` (`Num_Xcc` in the agent info; 1 on single-die parts). (2) `*_sum`
-# unit counters are summed over every instance on the device (one TA/TD/TCP per CU), so a unit's
-# busy fraction is `X_BUSY_sum / (cycles × n_cu)` with the device's CU count (304 on the MI300X).
+# (1) Every counter is reported SUMMED over its hardware dimensions. `GRBM_GUI_ACTIVE` has
+#     DIMENSION_XCC[0:7] on the MI300X, so the CSV value is 8× the cycles one die saw: a 40 ms
+#     dispatch shows 5.7e8 "cycles" = 14 GHz until divided by the dies. The dispatch's cycle count
+#     is `GRBM_GUI_ACTIVE / n_xcd` (`Num_Xcc` in the agent info; 1 on single-die parts), and every
+#     per-cycle rate (unit busy, resident waves, clock) uses it. 14 GHz is the sanity check that
+#     the division was forgotten; "/38" and "/(8 × 304)" are the same per-CU normalisation.
+#     rocprofv3's own derived metrics take `max_xcc(GRBM_GUI_ACTIVE)`; the CSV sum / n_xcd is the
+#     MEAN over dies — equal while every die is busy, below the max otherwise.
+# (2) `*_sum` unit counters are summed over every instance on the device (one TA / TD / TCP per
+#     CU), so a unit's busy fraction is `X_BUSY_sum / (cycles × n_cu)`. They are EVENT counts, not
+#     per-wave issues: never multiply them by the wavefront size (doing so once inflated per-slot
+#     L1 accesses 64×).
 # (3) The SQ wave-cycle counters (`SQ_WAVE_CYCLES`, `SQ_WAIT_ANY`, `SQ_WAIT_INST_ANY`,
-# `SQ_ACTIVE_INST_*`) are in QUAD-cycles (4 cycles) — ratios between them are unit-free, but
-# resident waves = 4·SQ_WAVE_CYCLES / cycles; `SQ_BUSY_CYCLES` is plain cycles per shader engine.
-# (4) `SQ_INSTS_*` count per-WAVE instruction issues; × wavefront size (64 on CDNA) / slots gives
-# the per-slot (per work-item iteration) count a static instruction mix can be held against.
-# Nothing here needs AMDGPU.jl: the parser is plain Julia and runs (and is tested) on any host.
+#     `SQ_ACTIVE_INST_*`) are in QUAD-cycles (4 clocks) on CDNA and plain cycles on RDNA: AMD's own
+#     OccupancyPercent is 400·SQ_WAVE_CYCLES/… on gfx90a / gfx94x / gfx950 and 100·… on gfx10 / 11 /
+#     12 (rocprofiler-sdk counter_defs.yaml; `_SQ_CYCLE_UNIT` is that table). Ratios between them
+#     are unit-free; resident waves = unit·SQ_WAVE_CYCLES / cycles. `SQ_BUSY_CYCLES` is plain
+#     cycles everywhere, but summed per shader engine on CDNA and per WGP on RDNA (`_SQ_FAMILY`).
+# (4) `SQ_INSTS_*` count per-WAVE instruction issues; × wavefront size (64 on CDNA) / slots is the
+#     per-slot count a static instruction mix can be held against. Validated on gfx942: the FP64
+#     classes per slot (219.1 / 44.0 / 178.1 / 15.0) matched the static hot loop exactly.
+# (5) `cycles / duration` is the MEAN ACTIVE clock, not the engine clock: idle dies count no cycles,
+#     so it is a lower bound and meaningless for sub-ms dispatches. The MI300X is power-managed
+#     (1.70 GHz at 7 waves/CU, 1.25 GHz at 14 waves/CU on the same kernel, against the 750 W board
+#     cap; sysfs agreed to 0.01 GHz), so compare two runs of the SAME work in CYCLES, not seconds.
+# (6) Counter capacity is per hardware block and per pass. The TCC block takes FOUR counters on
+#     gfx942; a fifth makes rocprofv3 log "Request exceeds the capabilities of the hardware to
+#     collect", abort with SIGABRT and leave the profiled child hung — `hw_counter_command` wraps
+#     the collection in `timeout -k` for exactly that failure (the child then exits 137).
+# The parser needs neither AMDGPU.jl nor a GPU; the gfx942 fixtures under test/fixtures/rocprof
+# are trimmed real MI300X collections.
 
-"""    ROCPROF_COUNTER_SETS
+"""
+    RocprofV3()
 
-Named `rocprofv3 --pmc` counter sets for [`rocprof_command`](@ref)`(…; counters = :name)`. Each
-set is ONE pass (rocprofv3 collects a set per dispatch; the hardware's counter capacity is the
-limit — a set that exceeds it aborts the profiled process, see below). What each answers, and
-what [`rocprof_derived`](@ref) computes from it:
+rocprofv3 collector for an external AMD workload. The AMDGPU extension selects this
+automatically for `ROCBackend()`. Use it explicitly with [`hw_counter_command`](@ref)
+or [`hw_counter_status`](@ref) when no AMDGPU runtime is loaded.
+"""
+struct RocprofV3 <: HWCounterCollector end
+_counter_vendor(::RocprofV3) = :amd
+_counter_tool(::RocprofV3) = :rocprofv3
+_collector_keywords(::RocprofV3) = (:kernel_trace,)
 
-- `:sq_issue` — instruction issue per wave, by class: `SQ_INSTS_VMEM_RD/_WR`, `_SMEM`, `_SALU`,
-  `_BRANCH`, `_VALU_INT64`, `_VALU` (+ `GRBM_GUI_ACTIVE`). → `insts_per_slot_<class>` (× wave
-  size / slots): the dynamic instruction mix per slot to hold against the static
-  `kernel_instruction_mix` of the hot loop; is the kernel load-, integer- or branch-heavy.
-- `:sq_waves` — wave residency and what waves do: `SQ_WAVES`, `SQ_BUSY_CYCLES`, `SQ_WAVE_CYCLES`,
-  `SQ_ACTIVE_INST_ANY/_VALU`, `SQ_WAIT_INST_ANY`, `SQ_WAIT_ANY` (+ `GRBM_GUI_ACTIVE`). →
-  `resident_waves`, `waves_per_cu`, `occupancy` (achieved, vs `kernel_occupancy` at compile
-  time), `wave_wait_frac` (waiting for anything), `wave_wait_inst_frac` (waiting for an
-  instruction to ISSUE — the difference to `wave_wait_frac` is the dependency / memory-latency
-  wait), `wave_active_inst_frac`, `wave_active_valu_frac`, `sq_busy`: latency-bound (waves
-  mostly waiting on data) vs issue-bound (waiting on the arbiter).
-- `:l1_pipe` — the vector-memory pipe: `TA_TA_BUSY_sum`, `TD_TD_BUSY_sum`,
-  `TCP_PENDING_STALL_CYCLES_sum`, `TCP_TOTAL_READ_sum`, `TCP_TCC_READ_REQ_sum`,
-  `TCP_TOTAL_CACHE_ACCESSES_sum` (+ `GRBM_GUI_ACTIVE`). → `ta_busy`, `td_busy`,
-  `tcp_pending_stall` (fractions of the dispatch, per CU), `l1_miss` (L1 → L2 read requests per
-  cache access): is the address/data path saturated, does the working set fit L1.
-- `:fp64` — FP64 VALU issue: `SQ_INSTS_VALU_FMA_F64`, `_ADD_F64`, `_MUL_F64`, `_TRANS_F64`
-  (+ `GRBM_GUI_ACTIVE`). → `insts_per_slot_valu_fma_f64` etc. and `fp64_flop_per_slot`
-  (2·FMA + ADD + MUL + TRANS, per slot): the hardware's own FLOP count per slot to hold against
-  the algorithmic `[flops].flop_per_slot`.
-- `:l2` — the L2 (TCC) and what leaves the die: `TCC_HIT_sum`, `TCC_MISS_sum`,
-  `TCC_EA0_RDREQ_sum` (L2 → fabric read requests), `TCC_EA0_RDREQ_DRAM_sum` (of those, to HBM)
-  (+ `GRBM_GUI_ACTIVE`). → `l2_hit`, `l2_dram_read_frac`; the `_median` values / slots give the
-  L2 requests and HBM reads per slot: does the working set live in L2 or in HBM.
+function _counter_command_args(::RocprofV3, exe, metrics; dir, name, kernel, kernel_trace::Bool = true)
+    args = String[exe]
+    kernel_trace && push!(args, "--kernel-trace")
+    kernel === nothing || append!(args, ["--kernel-include-regex", kernel])
+    append!(args, ["--pmc"; metrics; "--output-format"; "csv"; "-d"; dir; "-o"; name; "--"])
+    return args
+end
 
-Verified on gfx942 (MI300X VF, ROCm 7.2.4, rocprofv3 1.1.0): `:sq_issue`, `:sq_waves` and
-`:l1_pipe` collect in one pass on the production field kernel; `:fp64` and `:l2` on a test kernel
-(`c = a + b * 1.5` over 2^22 doubles = 65 536 waves: exactly 1.00 `ADD_F64` + 1.00 `MUL_F64` per
-element from `× 64 / slots`, and TCC hits / misses / fabric / HBM reads all populated). The TCC
-block's capacity is FOUR counters per pass: adding `TCC_REQ_sum` as a fifth — with or without
-`TCC_READ_sum` as a sixth, the original six-counter L2 set — makes rocprofv3 log "Request exceeds
-the capabilities of the hardware to collect", abort with signal 6 and leave the profiled child
-hung until `timeout -k` kills it (exit 137; hence the timeout in [`rocprof_command`](@ref)).
-Sets are `Vector{String}` so a caller can pass its own list instead of a name."""
-const ROCPROF_COUNTER_SETS = Dict{Symbol, Vector{String}}(
+const _AMD_COUNTERS = Dict{Symbol, Vector{String}}(
     :sq_issue => ["GRBM_GUI_ACTIVE", "SQ_INSTS_VMEM_RD", "SQ_INSTS_VMEM_WR", "SQ_INSTS_SMEM",
         "SQ_INSTS_SALU", "SQ_INSTS_BRANCH", "SQ_INSTS_VALU_INT64", "SQ_INSTS_VALU"],
     :sq_waves => ["SQ_WAVES", "SQ_BUSY_CYCLES", "GRBM_GUI_ACTIVE", "SQ_WAVE_CYCLES",
@@ -81,414 +77,213 @@ const ROCPROF_COUNTER_SETS = Dict{Symbol, Vector{String}}(
     :l2 => ["GRBM_GUI_ACTIVE", "TCC_HIT_sum", "TCC_MISS_sum", "TCC_EA0_RDREQ_sum", "TCC_EA0_RDREQ_DRAM_sum"],
 )
 
-# The SQ counters rocprofv3 reports in quad-cycles (4 clock cycles) on gfx9 — see `--list-avail`.
-const _ROCPROF_QUAD_CYCLE = 4
+# What each AMD preset answers, and the trap specific to it. Surfaced through `CounterSet.notes`.
+const _AMD_PRESET_NOTES = Dict{Symbol, String}(
+    :issue => "Instruction issue per wave by class (SQ_INSTS_VMEM_RD/_WR, _SMEM, _SALU, _BRANCH, " *
+        "_VALU_INT64, _VALU) plus GRBM_GUI_ACTIVE. SQ_INSTS_* are per-WAVE issues: × wave_size / slots " *
+        "(`amd_insts_per_slot_<class>`) is the dynamic per-slot mix to hold against the static " *
+        "kernel_instruction_mix of the hot loop — is the kernel load-, integer- or branch-heavy. " *
+        "One pass on gfx942 (rocprofv3 1.1.0, ROCm 7.2.4).",
+    :occupancy => "Wave residency and what waves do: SQ_WAVES, SQ_BUSY_CYCLES, SQ_WAVE_CYCLES, " *
+        "SQ_ACTIVE_INST_ANY/_VALU, SQ_WAIT_INST_ANY, SQ_WAIT_ANY plus GRBM_GUI_ACTIVE. The wave-cycle " *
+        "counters are QUAD-cycles on CDNA and plain cycles on RDNA (resident waves = sq_cycle_unit · " *
+        "SQ_WAVE_CYCLES / cycles, the unit from AMD's own definitions per architecture or a " *
+        "`device_overrides` entry; ratios between them are unit-free). amd_wave_wait_frac − amd_wave_wait_inst_frac is the dependency / " *
+        "memory-latency wait: waves mostly waiting on data (latency-bound) vs on the arbiter " *
+        "(issue-bound). amd_elapsed_occupancy is rocprofv3's OccupancyPercent / 100, an elapsed-window " *
+        "figure to hold against kernel_resources' theoretical occupancy. One pass on gfx942.",
+    :memory => "The vector-memory pipe: TA_TA_BUSY_sum, TD_TD_BUSY_sum, TCP_PENDING_STALL_CYCLES_sum, " *
+        "TCP_TOTAL_READ_sum, TCP_TCC_READ_REQ_sum, TCP_TOTAL_CACHE_ACCESSES_sum plus GRBM_GUI_ACTIVE. " *
+        "*_sum counters are summed over every instance (one TA/TD/TCP per CU): busy = X_sum / " *
+        "(cycles × n_cu). They are EVENT counts, not per-wave issues — do not multiply by wave_size. " *
+        "amd_l1_miss = L1→L2 read requests per L1 access: does the working set fit L1; an in-order " *
+        "pipe at 85–95 % TD busy with waves 70 % waiting is memory-pipe-bound, not FLOP-bound. One pass on gfx942.",
+    :fp64 => "FP64 VALU issue per wave: SQ_INSTS_VALU_FMA_F64, _ADD_F64, _MUL_F64, _TRANS_F64 plus " *
+        "GRBM_GUI_ACTIVE. × wave_size / slots is the hardware's own FLOP count per slot " *
+        "(fp64_flop_per_slot = 2·FMA + ADD + MUL; TRANS is reported separately as " *
+        "amd_insts_per_slot_valu_trans_f64). Validated on gfx942: 219.1 / 44.0 / 178.1 / 15.0 per slot " *
+        "matched the static hot loop + second Newton pass exactly, bit-identical across dispatches; a " *
+        "`c = a + b·1.5` probe gave 1.00 ADD + 1.00 MUL per element. gfx1100 exposes no F64 counters. One pass on gfx942.",
+    :l2 => "The L2 (TCC) and what leaves the die: TCC_HIT_sum, TCC_MISS_sum, TCC_EA0_RDREQ_sum (L2→fabric " *
+        "reads), TCC_EA0_RDREQ_DRAM_sum (of those, to HBM) plus GRBM_GUI_ACTIVE: does the working set live " *
+        "in L2 or in HBM (amd_l2_request_hit_rate, amd_l2_dram_read_frac; the medians / slots are requests " *
+        "per slot). The TCC block collects FOUR counters per pass on gfx942: a fifth (TCC_REQ_sum, " *
+        "TCC_READ_sum) makes rocprofv3 log \"Request exceeds the capabilities of the hardware to collect\", " *
+        "abort with SIGABRT and leave the profiled child hung until `timeout -k` kills it (exit 137). One pass on gfx942.",
+)
 
-"""    rocprof_available() -> Bool
-
-Whether `rocprofv3` is on the PATH (ROCm 6.2+; the counter path of [`rocprof_command`](@ref))."""
-rocprof_available() = Sys.which("rocprofv3") !== nothing
-
-"""
-    rocprof_command(cmd::Cmd; counters, dir, name, timeout_s = 600, kernel_trace = true,
-                    kill_after_s = 20, rocprofv3 = "rocprofv3") -> Cmd
-
-Wrap `cmd` (environment and working directory preserved) in a rocprofv3 counter collection:
-
-    timeout -k <kill_after_s> <timeout_s> rocprofv3 [--kernel-trace] --pmc <counters…>
-        --output-format csv -d <dir> -o <name> -- <cmd>
-
-`counters` is a name from [`ROCPROF_COUNTER_SETS`](@ref) or a vector of counter names. The
-outputs land in `dir` as `<name>_counter_collection.csv` / `_kernel_trace.csv` / `_agent_info.csv`
-for [`rocprof_counters`](@ref)`(dir; name)`. rocprofv3 multiplies each dispatch's time by
-roughly its counter-read overhead only (kernels run at speed), but a counter request the hardware
-cannot serve aborts rocprofv3 (signal 6) and leaves the profiled child hung — `timeout` signals
-the whole process group when it expires and SIGKILLs it `kill_after_s` later, so the child dies
-too. `run` the result, or `pipeline` it into a log."""
-function rocprof_command(cmd::Cmd; counters, dir::AbstractString, name::AbstractString,
-        timeout_s::Real = 600, kernel_trace::Bool = true, kill_after_s::Real = 20,
-        rocprofv3::AbstractString = "rocprofv3")
-    pmc = counters isa Symbol ? _rocprof_counter_set(counters) : String[String(c) for c in counters]
-    isempty(pmc) && throw(ArgumentError("rocprof_command: no counters requested"))
-    isempty(name) && throw(ArgumentError("rocprof_command: `name` (the output prefix) must not be empty"))
-    timeout_s > 0 || throw(ArgumentError("rocprof_command: timeout_s must be positive"))
-    trace = kernel_trace ? ["--kernel-trace"] : String[]
-    wrapped = `timeout -k $(string(kill_after_s)) $(string(timeout_s)) $rocprofv3 $trace --pmc $pmc --output-format csv -d $dir -o $name -- $(cmd.exec)`
-    return Cmd(wrapped; env = cmd.env, dir = cmd.dir)
-end
-function _rocprof_counter_set(s::Symbol)
-    haskey(ROCPROF_COUNTER_SETS, s) ||
-        throw(ArgumentError("rocprof_command: unknown counter set :$s — one of $(sort!(collect(keys(ROCPROF_COUNTER_SETS))))"))
-    return ROCPROF_COUNTER_SETS[s]
-end
-
-# ── CSV ──────────────────────────────────────────────────────────────────────────────────────
-# rocprofv3's CSV quotes strings (kernel names contain commas and angle brackets) and leaves
-# numbers bare; RFC 4180 doubled quotes inside a quoted field are honoured.
-function _csv_fields(line::AbstractString)
-    out = String[]
-    buf = IOBuffer()
-    inq = false
-    i = firstindex(line)
-    n = lastindex(line)
-    while i <= n
-        c = line[i]
-        if inq
-            if c == '"'
-                j = nextind(line, i)
-                if j <= n && line[j] == '"'
-                    write(buf, '"')
-                    i = j
-                else
-                    inq = false
-                end
-            else
-                write(buf, c)
-            end
-        elseif c == '"'
-            inq = true
-        elseif c == ','
-            push!(out, String(take!(buf)))
-        else
-            write(buf, c)
-        end
-        i = nextind(line, i)
-    end
-    push!(out, String(take!(buf)))
-    return out
+function _agent_id(s)
+    ismissing(s) && return missing
+    m = match(r"^(?:Agent\s+)?(\d+)$", strip(s))
+    m === nothing && throw(ArgumentError("invalid agent id $s"))
+    return parse(Int, m[1])
 end
 
-function _read_csv(path::AbstractString)
-    header = String[]
-    rows = Vector{String}[]
-    for line in eachline(path)
-        isempty(strip(line)) && continue
-        f = _csv_fields(rstrip(line, '\r'))
-        if isempty(header)
-            header = f
-        else
-            length(f) == length(header) || throw(ArgumentError("$(basename(path)): row with $(length(f)) fields, header has $(length(header))"))
-            push!(rows, f)
-        end
-    end
-    isempty(header) && throw(ArgumentError("$(basename(path)) is empty"))
-    return header, rows
-end
-
-function _csv_column(header::Vector{String}, name::AbstractString, path)
-    j = findfirst(==(name), header)
-    j === nothing && throw(ArgumentError("$(basename(path)): no column '$name' (columns: $(join(header, ", ")))"))
-    return j
-end
-
-_int(s) = (v = tryparse(Int, s); v === nothing ? round(Int, parse(Float64, s)) : v)
-
-# ── The table ────────────────────────────────────────────────────────────────────────────────
-
-"""    RocprofCounters
-
-Per-dispatch hardware counters of ONE kernel from a rocprofv3 run, built by
-[`rocprof_counters`](@ref): `counters` (names), `dispatch_ids`, `values` (dispatches × counters),
-`duration_s` (from the dispatch timestamps), `resources` (`grid_size`, `workgroup_size`,
-`vgpr_count`, `agpr_count`, `sgpr_count`, `lds_bytes`, `scratch_bytes` of the kernel),
-`device` (`name`, `product`, `n_cu`, `n_xcd`, `n_se`, `n_simd`, `wave_size`, `max_waves_per_cu`
-from the agent info, 0 = unknown), `slots` (per dispatch, as given by the caller, or `nothing`),
-`kernel` (the matched name) and `dispatches` (every dispatch of the run: `id`, `kernel`,
-`duration_s`). Index a counter by name: `rc["SQ_WAVES"]` (a vector over dispatches);
-`haskey(rc, "SQ_WAVES")`; `median(rc, "SQ_WAVES")` via [`rocprof_median`](@ref)."""
-struct RocprofCounters
-    dir::String
-    name::String
-    kernel::String
-    counters::Vector{String}
-    dispatch_ids::Vector{Int}
-    values::Matrix{Float64}
-    duration_s::Vector{Float64}
-    resources::NamedTuple{(:grid_size, :workgroup_size, :vgpr_count, :agpr_count, :sgpr_count, :lds_bytes, :scratch_bytes), NTuple{7, Int}}
-    device::NamedTuple{(:name, :product, :n_cu, :n_xcd, :n_se, :n_simd, :wave_size, :max_waves_per_cu), Tuple{String, String, Int, Int, Int, Int, Int, Int}}
-    slots::Union{Nothing, Int}
-    dispatches::Vector{NamedTuple{(:id, :kernel, :duration_s), Tuple{Int, String, Float64}}}
-end
-
-function Base.getindex(rc::RocprofCounters, c::AbstractString)
-    j = findfirst(==(c), rc.counters)
-    j === nothing && throw(KeyError(c))
-    return rc.values[:, j]
-end
-Base.haskey(rc::RocprofCounters, c::AbstractString) = c in rc.counters
-Base.keys(rc::RocprofCounters) = rc.counters
-Base.length(rc::RocprofCounters) = length(rc.dispatch_ids)
-Base.show(io::IO, rc::RocprofCounters) = print(io, "RocprofCounters(", rc.name, ": ", length(rc), " dispatches of ",
-    _kernel_head(rc.kernel), " × ", length(rc.counters), " counters, median ",
-    round(_median(rc.duration_s) * 1e3; digits = 2), " ms, device ", rc.device.name, ")")
-
-_kernel_head(name::AbstractString) = String(first(split(name, '('; limit = 2)))
-
-_median(v::AbstractVector{<:Real}) = isempty(v) ? NaN : Float64(Statistics.median(v))
-# Spread across dispatches relative to the median: (max − min) / |median|, 0 for a constant.
-function _rel_spread(v::AbstractVector{<:Real})
-    m = _median(v)
-    (isempty(v) || m == 0) && return 0.0
-    return (maximum(v) - minimum(v)) / abs(m)
-end
-
-"""    rocprof_median(rc, counter) -> Float64
-
-Median of `counter` over the dispatches of a [`RocprofCounters`](@ref)."""
-rocprof_median(rc::RocprofCounters, c::AbstractString) = _median(rc[c])
-
-# `<name>_agent_info.csv`: one row per HSA agent; the GPU that ran the dispatches is matched by
-# node id ("Agent 1" in the counter file ⇒ Node_Id 1), else the first GPU row.
-const _NO_DEVICE = (name = "", product = "", n_cu = 0, n_xcd = 0, n_se = 0, n_simd = 0, wave_size = 0, max_waves_per_cu = 0)
-function _rocprof_agent(path::AbstractString, agent_id::Union{Int, Nothing})
-    isfile(path) || return _NO_DEVICE
+function _rocprof_devices(path)
+    devices = Dict{Int, Dict{String, Any}}()
+    isfile(path) || return devices
     header, rows = _read_csv(path)
-    col(n) = _csv_column(header, n, path)
-    gpus = filter(r -> r[col("Agent_Type")] == "GPU", rows)
-    isempty(gpus) && return _NO_DEVICE
-    r = agent_id === nothing ? nothing : findfirst(r -> _int(r[col("Node_Id")]) == agent_id, gpus)
-    row = gpus[something(r, 1)]
-    get_int(n) = (j = findfirst(==(n), header); j === nothing ? 0 : _int(row[j]))
-    return (name = row[col("Name")], product = row[col("Product_Name")], n_cu = get_int("Cu_Count"),
-        n_xcd = get_int("Num_Xcc"), n_se = get_int("Num_Shader_Banks"), n_simd = get_int("Simd_Count"),
-        wave_size = get_int("Wave_Front_Size"), max_waves_per_cu = get_int("Max_Waves_Per_Cu"))
-end
-
-function _rocprof_name(dir::AbstractString, name)
-    name === nothing || return String(name)
-    files = filter(f -> endswith(f, "_counter_collection.csv"), readdir(dir))
-    length(files) == 1 && return String(chopsuffix(first(files), "_counter_collection.csv"))
-    isempty(files) && throw(ArgumentError("rocprof_counters: no *_counter_collection.csv in $dir"))
-    throw(ArgumentError("rocprof_counters: several counter collections in $dir — pass `name`: $(join(chopsuffix.(files, "_counter_collection.csv"), ", "))"))
-end
-
-_kernel_matches(kernel::Regex, name) = occursin(kernel, name)
-_kernel_matches(kernel::AbstractString, name) = occursin(kernel, name)
-_kernel_matches(::Nothing, name) = !startswith(name, "__amd_rocclr_")   # every user kernel
-
-"""
-    rocprof_counters(dir; name = nothing, kernel = nothing, slots = nothing,
-                     n_cu = nothing, n_xcd = nothing, wave_size = nothing) -> RocprofCounters
-
-Parse the rocprofv3 outputs `<dir>/<name>_counter_collection.csv` (+ `_kernel_trace.csv` and
-`_agent_info.csv` when present; `name` may be omitted when `dir` holds exactly one collection)
-into the per-dispatch counter table of the kernel whose name matches `kernel` (a `Regex` or
-substring; the match must resolve to ONE distinct kernel name). With `kernel = nothing` the
-run must contain exactly one user kernel (runtime-internal `__amd_rocclr_*` dispatches are
-ignored) and that kernel is selected; otherwise the error lists the kernel names to choose
-from. KernelAbstractions kernels are named `gpu_<kernel name>(…)` (AcceleratedKernels'
-`foreachindex` is `gpu__forindices_global_(…)`). `slots` is the number of
-inner-loop iterations (work-items × per-item iterations) of ONE dispatch, the caller's knowledge,
-for the per-slot metrics. `n_cu`, `n_xcd` and `wave_size` override the agent info — required when
-the run has no `_agent_info.csv` (the KNOWN device values; nothing is defaulted). `n_xcd` is the
-trap: every die (XCD) has its own GRBM block and the CSV reports `GRBM_GUI_ACTIVE` SUMMED over
-them (`DIMENSION_XCC[0:7]` on gfx942), so a 40 ms dispatch shows 5.7e8 "cycles" — 14 GHz — until
-divided by the 8 dies; the agent info's `Num_Xcc` is 8 on the MI300X and 1 on single-die parts,
-and every per-cycle rate below (unit busy, resident waves, clock) uses `GRBM_GUI_ACTIVE / n_xcd`.
-See [`rocprof_derived`](@ref) for what is computed from the table."""
-function rocprof_counters(dir::AbstractString; name = nothing, kernel = nothing, slots = nothing,
-        n_cu = nothing, n_xcd = nothing, wave_size = nothing)
-    isdir(dir) || throw(ArgumentError("rocprof_counters: no such directory $dir"))
-    nm = _rocprof_name(dir, name)
-    path = joinpath(dir, nm * "_counter_collection.csv")
-    isfile(path) || throw(ArgumentError("rocprof_counters: $path not found"))
-    header, rows = _read_csv(path)
-    col(n) = _csv_column(header, n, path)
-    jid, jk, jc, jv, jt0, jt1 = col("Dispatch_Id"), col("Kernel_Name"), col("Counter_Name"), col("Counter_Value"),
-        col("Start_Timestamp"), col("End_Timestamp")
-
-    # group rows by dispatch, in dispatch order
-    by_id = Dict{Int, Vector{Vector{String}}}()
-    order = Int[]
-    for r in rows
-        id = _int(r[jid])
-        haskey(by_id, id) || push!(order, id)
-        push!(get!(() -> Vector{String}[], by_id, id), r)
-    end
-    sort!(order)
-    isempty(order) && throw(ArgumentError("rocprof_counters: $path has no dispatches"))
-
-    ids = [id for id in order if _kernel_matches(kernel, first(by_id[id])[jk])]
-    isempty(ids) && throw(ArgumentError("rocprof_counters: no dispatch of $path matches kernel $kernel — kernels: " *
-        join(unique(_kernel_head(first(by_id[id])[jk]) for id in order), ", ")))
-    names = unique(first(by_id[id])[jk] for id in ids)
-    length(names) == 1 || throw(ArgumentError("rocprof_counters: " *
-        (kernel === nothing ? "the run has $(length(names)) kernels — pass `kernel`: " :
-                              "kernel $kernel matches $(length(names)) distinct kernels — be more specific: ") *
-        join(_kernel_head.(names), ", ")))
-    kname = only(names)
-
-    counters = String[]
-    for id in ids, r in by_id[id]
-        r[jc] in counters || push!(counters, r[jc])
-    end
-    values = fill(NaN, length(ids), length(counters))
-    duration = zeros(length(ids))
-    for (i, id) in enumerate(ids)
-        rs = by_id[id]
-        for r in rs
-            values[i, findfirst(==(r[jc]), counters)] = parse(Float64, r[jv])
+    for row in rows
+        isequal(_csv_get(header, row, "Agent_Type"), "GPU") || continue
+        id = _counter_int(_csv_get(header, row, "Node_Id"))
+        ismissing(id) && continue
+        d = Dict{String, Any}("architecture" => _csv_get(header, row, "Name"),
+            "name" => _csv_get(header, row, "Product_Name"))
+        for (key, column) in (("n_cu", "Cu_Count"), ("n_xcd", "Num_Xcc"),
+                ("n_se", "Num_Shader_Banks"), ("n_simd", "Simd_Count"),
+                ("wave_size", "Wave_Front_Size"), ("max_waves_per_cu", "Max_Waves_Per_Cu"))
+            n = _counter_int(_csv_get(header, row, column))
+            d[key] = ismissing(n) || n <= 0 ? missing : n
         end
-        duration[i] = (_int(first(rs)[jt1]) - _int(first(rs)[jt0])) / 1.0e9
+        devices[id] = d
     end
+    return devices
+end
 
-    r1 = first(by_id[first(ids)])
-    res_int(n) = _int(r1[col(n)])
-    resources = (grid_size = res_int("Grid_Size"), workgroup_size = res_int("Workgroup_Size"),
-        vgpr_count = res_int("VGPR_Count"), agpr_count = res_int("Accum_VGPR_Count"), sgpr_count = res_int("SGPR_Count"),
-        lds_bytes = res_int("LDS_Block_Size"), scratch_bytes = res_int("Scratch_Size"))
+function _parse_rocprof(file; kernel = nothing, slots = nothing,
+        device_overrides = Dict(), provenance = Dict(), required_metrics = nothing)
+    header, records = _read_csv(file)
+    for c in ("Dispatch_Id", "Kernel_Name", "Counter_Name", "Counter_Value")
+        _csv_column(header, c, file)
+    end
+    agents = _rocprof_devices(joinpath(dirname(file), _collection_name(file, :amd) * "_agent_info.csv"))
+    dispatches = HWDispatch[]
+    rows = Dict{String, Union{Missing, Float64}}[]
+    seen = Dict{Tuple, Int}()
+    for row in records
+        getv(n) = _csv_get(header, row, n)
+        id = _counter_int(getv("Dispatch_Id"))
+        ismissing(id) && throw(ArgumentError("missing Dispatch_Id"))
+        pid = _counter_int(getv("Process_Id"))
+        dev = _agent_id(getv("Agent_Id"))
+        queue = _counter_int(getv("Queue_Id"))
+        key = (pid, dev, queue, id)
+        kname = getv("Kernel_Name")
+        ismissing(kname) && throw(ArgumentError("missing kernel name"))
+        start = _counter_int(getv("Start_Timestamp"))
+        stop = _counter_int(getv("End_Timestamp"))
+        duration = ismissing(start) || ismissing(stop) ? missing : (stop - start) / 1e9
+        !ismissing(duration) && duration < 0 && throw(ArgumentError("negative dispatch duration"))
+        resources = Dict{String, Any}()
+        for (k, c) in (("grid_size", "Grid_Size"), ("workgroup_size", "Workgroup_Size"),
+                ("vgpr_count", "VGPR_Count"), ("agpr_count", "Accum_VGPR_Count"),
+                ("sgpr_count", "SGPR_Count"), ("lds_bytes", "LDS_Block_Size"), ("scratch_bytes", "Scratch_Size"))
+            resources[k] = _reported(_counter_int(getv(c)))
+        end
+        if !haskey(seen, key)
+            device = _device_override(ismissing(dev) ? Dict{String, Any}() : get(agents, dev, Dict{String, Any}()), dev, device_overrides)
+            _resolve_sq_layout!(device)
+            push!(dispatches, HWDispatch(id, pid, dev, missing, queue, kname,
+                ismissing(start) ? missing : start / 1e9, duration, resources, device, missing))
+            push!(rows, Dict{String, Union{Missing, Float64}}())
+            seen[key] = length(rows)
+        end
+        i = seen[key]
+        d = dispatches[i]
+        d.kernel == kname && isequal(d.duration_s, duration) && isequal(d.resources, resources) ||
+            throw(ArgumentError("conflicting metadata for dispatch $id; collections cannot be merged by dispatch id"))
+        counter = getv("Counter_Name")
+        ismissing(counter) && throw(ArgumentError("missing counter name"))
+        haskey(rows[i], counter) && throw(ArgumentError("duplicate counter $counter for dispatch $id"))
+        rows[i][counter] = _counter_number(getv("Counter_Value"))
+    end
+    # Preserve tool file order, including distinct processes/devices with the same dispatch ID.
+    return _build_counters(RocprofV3(), file, dispatches, rows, Dict(); kernel, slots, provenance, required_metrics)
+end
 
-    agent_id = (ja = findfirst(==("Agent_Id"), header); ja === nothing ? nothing :
-        (m = match(r"(\d+)", r1[ja]); m === nothing ? nothing : parse(Int, m[1])))
-    dev = _rocprof_agent(joinpath(dir, nm * "_agent_info.csv"), agent_id)
-    dev = merge(dev, (n_cu = something(n_cu, dev.n_cu), n_xcd = something(n_xcd, dev.n_xcd),
-        wave_size = something(wave_size, dev.wave_size)))
-
-    trace = joinpath(dir, nm * "_kernel_trace.csv")
-    dispatches = if isfile(trace)
-        th, trows = _read_csv(trace)
-        tc(n) = _csv_column(th, n, trace)
-        [(id = _int(r[tc("Dispatch_Id")]), kernel = r[tc("Kernel_Name")],
-            duration_s = (_int(r[tc("End_Timestamp")]) - _int(r[tc("Start_Timestamp")])) / 1.0e9) for r in trows]
+# Per architecture family, how the SQ block reports: the unit of its wave-cycle counters and the
+# instances `SQ_BUSY_CYCLES` is summed over. From rocprofiler-sdk's own definitions (counter_defs.yaml,
+# `rocprofv3 --list-avail`): OccupancyPercent = 400·SQ_WAVE_CYCLES / max_xcc(GRBM_GUI_ACTIVE) / CU_NUM / 32
+# on gfx90a / gfx940–942 / gfx950 (quad-cycles) and 100·… on gfx10 / gfx11 / gfx12 (plain cycles);
+# `SQ_BUSY_CYCLES` carries DIMENSION_SHADER_ENGINE on CDNA (per SE, `Num_Shader_Banks`) and
+# DIMENSION_WGP × SHADER_ARRAY × SHADER_ENGINE on RDNA (per WGP = 2 CUs; 48 on a 96-CU gfx1100, where
+# 6.56e9 busy cycles over a 49 ms dispatch is 1.0 per WGP-cycle at 2.8 GHz, 8× too much per SE).
+# An architecture outside the table gets `missing` for both; `device_overrides` can supply
+# `"sq_cycle_unit"` and `"sq_instances"`. Fixture-validated on gfx942 (MI300X) and gfx1100 (W7900:
+# 1.0001 VALU per FMA slot, 1346 resident waves of 3072, SQ busy 0.89 per WGP); the other RDNA
+# entries follow AMD's formulas.
+const _SQ_FAMILY = Dict{String, Symbol}(
+    "gfx90a" => :cdna, "gfx940" => :cdna, "gfx941" => :cdna, "gfx942" => :cdna, "gfx950" => :cdna,
+    "gfx1010" => :rdna, "gfx1030" => :rdna, "gfx1031" => :rdna, "gfx1032" => :rdna,
+    "gfx1100" => :rdna, "gfx1101" => :rdna, "gfx1102" => :rdna, "gfx1150" => :rdna, "gfx1151" => :rdna,
+    "gfx1200" => :rdna, "gfx1201" => :rdna,
+)
+const _SQ_CYCLE_UNIT = Dict(:cdna => 4, :rdna => 1)
+function _positive_override(device, key, what)
+    u = device[key]
+    ismissing(u) || (u isa Real && isfinite(u) && u > 0) || throw(ArgumentError("$key must be a positive $what"))
+    return device
+end
+function _resolve_sq_layout!(device::Dict{String, Any})
+    arch = get(device, "architecture", missing)
+    family = ismissing(arch) ? missing : get(_SQ_FAMILY, first(split(String(arch), ':')), missing)
+    if haskey(device, "sq_cycle_unit")
+        _positive_override(device, "sq_cycle_unit", "number of clocks per SQ wave-cycle count")
     else
-        [(id = id, kernel = first(by_id[id])[jk],
-            duration_s = (_int(first(by_id[id])[jt1]) - _int(first(by_id[id])[jt0])) / 1.0e9) for id in order]
+        device["sq_cycle_unit"] = ismissing(family) ? missing : _SQ_CYCLE_UNIT[family]
     end
-    sort!(dispatches; by = d -> d.id)
-
-    slots === nothing || slots > 0 || throw(ArgumentError("rocprof_counters: slots must be positive"))
-    return RocprofCounters(String(dir), nm, kname, counters, ids, values, duration, resources, dev,
-        slots === nothing ? nothing : Int(slots), dispatches)
+    if haskey(device, "sq_instances")
+        _positive_override(device, "sq_instances", "count of SQ instances SQ_BUSY_CYCLES is summed over")
+    else
+        n_se, n_cu = get(device, "n_se", missing), get(device, "n_cu", missing)
+        device["sq_instances"] = ismissing(family) ? missing :
+            family === :cdna ? n_se : ismissing(n_cu) ? missing : n_cu ÷ 2
+    end
+    return device
 end
 
-# ── Derived metrics ──────────────────────────────────────────────────────────────────────────
-
-"""
-    rocprof_derived(rc::RocprofCounters) -> Dict{String, Float64}
-
-Derived metrics of the kernel, each computed PER DISPATCH and reduced by the median — only
-those whose counters the run collected (a set from [`ROCPROF_COUNTER_SETS`](@ref) yields the
-metrics its docstring lists). With `cycles = GRBM_GUI_ACTIVE / n_xcd` (the dispatch's clock
-cycles on one die; the CSV sums the counter over the dies), `n_cu` / `n_se` / `wave_size` /
-`max_waves_per_cu` from `rc.device` and `slots` from the caller:
-
-- `clock_GHz = cycles / duration` — the MEAN ACTIVE clock over the dispatch: `GRBM_GUI_ACTIVE`
-  counts cycles while a die's GUI is active, so this equals the engine clock only while every
-  die is busy for the whole dispatch and is a lower bound otherwise (idle tails count no cycles;
-  it is meaningless for sub-ms dispatches, whose counter window exceeds the kernel). It is also
-  the `n_xcd` sanity check (14 GHz means the die sum was not divided). Validated against the
-  amdgpu sysfs engine clock (`freq1_input` sampled at 65 Hz through the same launches): 1.70 vs
-  1.70 GHz and 1.25 vs 1.26 GHz median. The clock is power-managed on the MI300X (1.7 GHz at
-  7 waves/CU, 1.25 GHz at 14 waves/CU on the same kernel — at the 750 W board cap), so compare
-  two runs of the SAME work in CYCLES (`GRBM_GUI_ACTIVE / n_xcd`, `SQ_BUSY_CYCLES`), not in
-  seconds: fewer cycles = more work per cycle; wall time falling less than the cycles = the clock
-  dropped.
-- `insts_per_slot_<class> = SQ_INSTS_<CLASS> × wave_size / slots` for every `SQ_INSTS_*`
-  counter (`vmem_rd`, `valu`, `valu_fma_f64`, …); `fp64_flop_per_slot = (2·FMA + ADD + MUL +
-  TRANS) × wave_size / slots` when the four FP64 classes are present.
-- `<unit>_busy = <UNIT>_<UNIT>_BUSY_sum / (cycles × n_cu)` for every `*_BUSY_sum` counter
-  (`ta_busy`, `td_busy`, …); `tcp_pending_stall = TCP_PENDING_STALL_CYCLES_sum / (cycles × n_cu)`.
-- `l1_miss = TCP_TCC_READ_REQ_sum / TCP_TOTAL_CACHE_ACCESSES_sum`; `l2_hit = TCC_HIT_sum /
-  (TCC_HIT_sum + TCC_MISS_sum)`; `l2_dram_read_frac = TCC_EA0_RDREQ_DRAM_sum / TCC_EA0_RDREQ_sum`.
-- `wave_wait_frac = SQ_WAIT_ANY / SQ_WAVE_CYCLES` (waiting for anything), `wave_wait_inst_frac
-  = SQ_WAIT_INST_ANY / SQ_WAVE_CYCLES` (waiting for an instruction to issue; the difference is
-  the dependency / memory-latency wait), `wave_active_inst_frac = SQ_ACTIVE_INST_ANY / SQ_WAVE_CYCLES`,
-  `wave_active_valu_frac = SQ_ACTIVE_INST_VALU / SQ_WAVE_CYCLES` (all quad-cycle counters, so
-  unit-free); `resident_waves = 4·SQ_WAVE_CYCLES / cycles`, `waves_per_cu = resident_waves /
-  n_cu`, `occupancy = waves_per_cu / max_waves_per_cu` (rocprofv3's `OccupancyPercent` / 100);
-  `wave_cycles = 4·SQ_WAVE_CYCLES / SQ_WAVES` (mean wave lifetime in cycles); `sq_busy =
-  SQ_BUSY_CYCLES / (cycles × n_se)`.
-
-Throws an `ArgumentError` naming the missing device value when a metric needs `n_xcd`, `n_cu`
-or `wave_size` and neither the agent info nor the caller supplied it; per-slot metrics need
-`slots` and are skipped without it."""
-function rocprof_derived(rc::RocprofCounters)
-    out = Dict{String, Float64}()
-    dev = rc.device
-    has(c) = haskey(rc, c)
-    need(field, what) = (v = getfield(dev, field); v > 0 ? v :
-        throw(ArgumentError("rocprof_derived: $what needs `$field` — not in the agent info; pass it to rocprof_counters (n_xcd = 8 on gfx942 / MI300X, 1 on single-die parts; n_cu = 304 on the MI300X)")))
-    put!(key, v::AbstractVector) = (out[key] = _median(v); nothing)
-
-    cycles = has("GRBM_GUI_ACTIVE") ? rc["GRBM_GUI_ACTIVE"] ./ need(:n_xcd, "the dispatch cycle count") : nothing
-    cycles === nothing || put!("clock_GHz", cycles ./ rc.duration_s ./ 1.0e9)
-
-    if rc.slots !== nothing
-        for c in rc.counters
+# Cycle normalisation applies wherever the agent info (or an override) gives n_xcd; only the SQ
+# wave-cycle unit is architecture-specific, and it comes from `_SQ_CYCLE_UNIT` / an override.
+# Raw counters and dimension-free ratios need neither. Nothing here is defaulted: a missing device
+# property makes the metrics that need it `missing`.
+function _amd_derived(raw, d)
+    out = Dict{String, Union{Missing, Float64}}()
+    getv(c) = get(raw, c, missing)
+    prop(c) = get(d.device, c, missing)
+    ratio(key, a, b) = haskey(raw, a) && haskey(raw, b) && (out[key] = _safe_ratio(raw[a], raw[b]))
+    if !ismissing(d.slots)
+        for c in keys(raw)
             startswith(c, "SQ_INSTS_") || continue
-            put!("insts_per_slot_" * lowercase(c[10:end]), rc[c] .* need(:wave_size, "per-slot instruction counts") ./ rc.slots)
+            out["amd_insts_per_slot_" * lowercase(c[10:end])] = _safe_ratio(raw[c] * prop("wave_size"), d.slots)
         end
-        f64 = ("SQ_INSTS_VALU_FMA_F64", "SQ_INSTS_VALU_ADD_F64", "SQ_INSTS_VALU_MUL_F64", "SQ_INSTS_VALU_TRANS_F64")
-        if all(has, f64)
-            flop = 2 .* rc[f64[1]] .+ rc[f64[2]] .+ rc[f64[3]] .+ rc[f64[4]]
-            put!("fp64_flop_per_slot", flop .* need(:wave_size, "fp64_flop_per_slot") ./ rc.slots)
+        for (op, native) in (("fma", "FMA"), ("add", "ADD"), ("mul", "MUL"))
+            c = "SQ_INSTS_VALU_" * native * "_F64"
+            haskey(raw, c) && (out["insts_per_slot_fp64_" * op] = _safe_ratio(raw[c] * prop("wave_size"), d.slots))
+        end
+        fma, add, mul = "SQ_INSTS_VALU_FMA_F64", "SQ_INSTS_VALU_ADD_F64", "SQ_INSTS_VALU_MUL_F64"
+        if all(c -> haskey(raw, c), (fma, add, mul))
+            out["fp64_flop_per_slot"] = _safe_ratio((2raw[fma] + raw[add] + raw[mul]) * prop("wave_size"), d.slots)
         end
     end
-
-    if cycles !== nothing
-        for c in rc.counters
+    unit = prop("sq_cycle_unit")   # clocks per SQ wave-cycle count: 4 on CDNA, 1 on RDNA, missing if unknown (see _SQ_FAMILY)
+    cycles = _safe_ratio(getv("GRBM_GUI_ACTIVE"), prop("n_xcd"))   # one die's clocks; the CSV sums the dies
+    if haskey(raw, "GRBM_GUI_ACTIVE")
+        out["amd_active_clock_GHz"] = _safe_ratio(cycles, d.duration_s) / 1e9
+        for c in keys(raw)
             m = match(r"^([A-Z]+)_[A-Z]+_BUSY_sum$", c)
             m === nothing && continue
-            put!(lowercase(m[1]) * "_busy", rc[c] ./ (cycles .* need(:n_cu, "$c unit-busy fraction")))
+            out["amd_" * lowercase(m[1]) * "_busy"] = _safe_ratio(raw[c], cycles * prop("n_cu"))
         end
-        has("TCP_PENDING_STALL_CYCLES_sum") &&
-            put!("tcp_pending_stall", rc["TCP_PENDING_STALL_CYCLES_sum"] ./ (cycles .* need(:n_cu, "tcp_pending_stall")))
-        if has("SQ_WAVE_CYCLES")
-            resident = _ROCPROF_QUAD_CYCLE .* rc["SQ_WAVE_CYCLES"] ./ cycles
-            put!("resident_waves", resident)
-            if dev.n_cu > 0
-                put!("waves_per_cu", resident ./ dev.n_cu)
-                dev.max_waves_per_cu > 0 && put!("occupancy", resident ./ (dev.n_cu * dev.max_waves_per_cu))
-            end
+        haskey(raw, "TCP_PENDING_STALL_CYCLES_sum") &&
+            (out["amd_tcp_pending_stall"] = _safe_ratio(raw["TCP_PENDING_STALL_CYCLES_sum"], cycles * prop("n_cu")))
+        if haskey(raw, "SQ_WAVE_CYCLES")
+            resident = _safe_ratio(unit * raw["SQ_WAVE_CYCLES"], cycles)
+            out["amd_resident_waves"] = resident
+            out["amd_waves_per_cu"] = _safe_ratio(resident, prop("n_cu"))
+            # This is elapsed-active-device-window occupancy, not NVIDIA's per-SM active-cycle average.
+            out["amd_elapsed_occupancy"] = _safe_ratio(resident, prop("n_cu") * prop("max_waves_per_cu"))
         end
-        has("SQ_BUSY_CYCLES") && dev.n_se > 0 && put!("sq_busy", rc["SQ_BUSY_CYCLES"] ./ (cycles .* dev.n_se))
+        haskey(raw, "SQ_BUSY_CYCLES") && (out["amd_sq_busy"] = _safe_ratio(raw["SQ_BUSY_CYCLES"], cycles * prop("sq_instances")))
     end
-    ratio(key, num, den) = has(num) && has(den) && put!(key, rc[num] ./ rc[den])
-    ratio("l1_miss", "TCP_TCC_READ_REQ_sum", "TCP_TOTAL_CACHE_ACCESSES_sum")
-    ratio("l2_dram_read_frac", "TCC_EA0_RDREQ_DRAM_sum", "TCC_EA0_RDREQ_sum")
-    has("TCC_HIT_sum") && has("TCC_MISS_sum") && put!("l2_hit", rc["TCC_HIT_sum"] ./ (rc["TCC_HIT_sum"] .+ rc["TCC_MISS_sum"]))
-    ratio("wave_wait_frac", "SQ_WAIT_ANY", "SQ_WAVE_CYCLES")
-    ratio("wave_wait_inst_frac", "SQ_WAIT_INST_ANY", "SQ_WAVE_CYCLES")
-    ratio("wave_active_inst_frac", "SQ_ACTIVE_INST_ANY", "SQ_WAVE_CYCLES")
-    ratio("wave_active_valu_frac", "SQ_ACTIVE_INST_VALU", "SQ_WAVE_CYCLES")
-    has("SQ_WAVE_CYCLES") && has("SQ_WAVES") && put!("wave_cycles", _ROCPROF_QUAD_CYCLE .* rc["SQ_WAVE_CYCLES"] ./ rc["SQ_WAVES"])
+    ratio("amd_l1_miss", "TCP_TCC_READ_REQ_sum", "TCP_TOTAL_CACHE_ACCESSES_sum")
+    ratio("amd_l2_dram_read_frac", "TCC_EA0_RDREQ_DRAM_sum", "TCC_EA0_RDREQ_sum")
+    haskey(raw, "TCC_HIT_sum") && haskey(raw, "TCC_MISS_sum") &&
+        (out["amd_l2_request_hit_rate"] = _safe_ratio(raw["TCC_HIT_sum"], raw["TCC_HIT_sum"] + raw["TCC_MISS_sum"]))
+    for (key, c) in (("wave_wait_frac", "SQ_WAIT_ANY"), ("wave_wait_inst_frac", "SQ_WAIT_INST_ANY"),
+            ("wave_active_inst_frac", "SQ_ACTIVE_INST_ANY"), ("wave_active_valu_frac", "SQ_ACTIVE_INST_VALU"))
+        ratio("amd_" * key, c, "SQ_WAVE_CYCLES")
+    end
+    haskey(raw, "SQ_WAVE_CYCLES") && haskey(raw, "SQ_WAVES") &&
+        (out["amd_wave_cycles"] = _safe_ratio(unit * raw["SQ_WAVE_CYCLES"], raw["SQ_WAVES"]))
     return out
 end
-
-"""
-    rocprof_summary(rc::RocprofCounters) -> Dict{String, Any}
-
-Flat, manifest-ready reduction of a [`RocprofCounters`](@ref): `kernel` (name up to its
-signature), `dispatches`, `dispatch_median_s` / `_min_s` / `_max_s` / `_total_s`, the kernel's
-`grid_size`, `workgroup_size`, `vgpr_count`, `agpr_count`, `sgpr_count`, `lds_bytes`,
-`scratch_bytes`, the device's `device`, `n_cu`, `n_xcd`, `n_se`, `wave_size`,
-`max_waves_per_cu`, `slots` (when given), `counters` (the names), `<COUNTER>_median` and
-`<COUNTER>_rel_spread` ((max − min) / |median| across dispatches) for every counter, and the
-[`rocprof_derived`](@ref) metrics."""
-function rocprof_summary(rc::RocprofCounters)
-    out = Dict{String, Any}(
-        "kernel" => _kernel_head(rc.kernel),
-        "dispatches" => length(rc),
-        "dispatch_median_s" => _median(rc.duration_s),
-        "dispatch_min_s" => minimum(rc.duration_s),
-        "dispatch_max_s" => maximum(rc.duration_s),
-        "dispatch_total_s" => sum(rc.duration_s),
-        "counters" => copy(rc.counters),
-    )
-    for k in keys(rc.resources)
-        out[String(k)] = getfield(rc.resources, k)
-    end
-    out["device"] = rc.device.product
-    for k in (:n_cu, :n_xcd, :n_se, :wave_size, :max_waves_per_cu)
-        v = getfield(rc.device, k)
-        v > 0 && (out[String(k)] = v)
-    end
-    rc.slots === nothing || (out["slots"] = rc.slots)
-    for c in rc.counters
-        out[c * "_median"] = _median(rc[c])
-        out[c * "_rel_spread"] = _rel_spread(rc[c])
-    end
-    merge!(out, rocprof_derived(rc))
-    return out
-end
-

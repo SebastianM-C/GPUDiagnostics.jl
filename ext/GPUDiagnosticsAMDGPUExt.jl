@@ -12,6 +12,7 @@ import GPUCompiler
 import LLVM
 
 const GD = GPUDiagnostics
+GD.backend_counter_collector(::ROCBackend) = RocprofV3()
 
 # AMDGPU device ids are already 1-based (HIPDevice(id=1, …)), matching the common API — no offset.
 # Everything but GPM-style in-sample counters (no in-process counter API on AMD; the

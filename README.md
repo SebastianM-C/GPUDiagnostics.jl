@@ -21,7 +21,7 @@ Not registered yet: `pkg> add https://github.com/SebastianM-C/GPUDiagnostics.jl`
 | What does a launch cost; what is this host, really? | `measure_launch_overhead`, `host_snapshot` (threads vs cgroup quota, driver / runtime versions) | [probes](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/peaks_probes/) |
 | Registers, spills, shared memory, theoretical occupancy of the kernels that actually ran? | `compiled_kernels`, `kernel_resources` → `KernelResources` | [resource report](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/resources_mix/) |
 | What instructions is the kernel made of — here, or on a GPU I have not rented yet? | `kernel_instruction_mix` (AMD ISA / NVIDIA SASS by class, per loop; `target = "gfx942"` cross-compiles), `kernel_ir_mix`, `fp64_issue_floor` | [instruction mix](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/resources_mix/) |
-| Hardware counters per dispatch on AMD? | `rocprof_command`, `rocprof_counters`, `rocprof_derived` (rocprofv3 wrapper + parser) | [hardware counters](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/hw_counters/) |
+| Hardware counters per dispatch on AMD or NVIDIA? | `hw_counter_command`, `hw_counters`, `hw_counter_derived` (rocprofv3 / Nsight Compute) | [hardware counters](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/hw_counters/) |
 | How do I store or read all of that? | `diagnostics_dict(x; prefix)` (flat TOML-safe dicts, stable keys), `show`, Tables.jl on `GPUTelemetry` | [report layer](https://SebastianM-C.github.io/GPUDiagnostics.jl/dev/report/) |
 
 Which of these a backend implements is declared through `supports(backend, :feature)` /
@@ -66,7 +66,7 @@ decision guide for coding agents.
 
 ## Testing
 
-`Pkg.test()` runs without a GPU (CPU fallbacks, fixtures of real rocprofv3 collections, a conformance
+`Pkg.test()` runs without a GPU (CPU fallbacks, fixtures of real rocprofv3 and ncu collections, a conformance
 suite over the capability declarations). The hand-run hardware suite exercises the vendor paths:
 
 ```
@@ -88,7 +88,7 @@ GPUCompiler job over LLVM IR) is the one every GPU backend should have.
 - [GPUInspector.jl](https://github.com/pc2/GPUInspector.jl) — NVIDIA-only inspection and micro-benchmarks
   (peak FLOPS, memory bandwidth, host-device / peer-to-peer transfers, stress tests). GPUDiagnostics is
   vendor-neutral through the KernelAbstractions backend, and adds the compile-time / static-code side
-  (resource report, instruction mix, cross-compilation) plus the AMD rocprofv3 wrapper; it does not
+  (resource report, instruction mix, cross-compilation) plus the rocprofv3 / Nsight Compute collectors; it does not
   duplicate the bandwidth benchmarks.
 - [NVTX.jl](https://github.com/JuliaGPU/NVTX.jl) — range and mark annotations for Nsight Systems
   timelines. Complementary: NVTX labels host regions for a profiler GUI, `LaunchTimer` measures

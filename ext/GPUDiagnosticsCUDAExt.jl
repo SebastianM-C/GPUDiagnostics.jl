@@ -11,14 +11,16 @@ import GPUCompiler
 import LLVM
 
 const GD = GPUDiagnostics
+GD.backend_counter_collector(::CUDABackend) = NsightCompute()
 
 # NVML handle for the current CUDA device (NVML indexes by UUID, not the CUDA ordinal).
 _nvml() = NVML.Device(CUDA.uuid(CUDA.device()))
 
-# Everything but the AMD-only counter path. GPM counters are a per-device runtime question
+# Counter access is a per-device runtime question; these capabilities describe the API.
+# GPM counters depend on the device and driver
 # (Hopper+ and recent consumer drivers); the FEATURE is the sampler knowing how to ask.
 for f in (:devices, :device_props, :events, :telemetry, :telemetry_counters, :peak_flops, :fp64,
-        :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix)
+        :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix, :hw_counters)
     @eval GD.supports(::CUDABackend, ::Val{$(QuoteNode(f))}) = true
 end
 
