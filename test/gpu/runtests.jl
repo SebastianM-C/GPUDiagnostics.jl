@@ -189,7 +189,8 @@ end
         s = gpu_sample(backend)
         @test s.power_W > 0 && 0 ≤ s.compute_util ≤ 1 && s.vram_used_B > 0
         # #3 columns: clocks, temperature, power limit, throttle bitmask (NaN where the vendor has none)
-        @test s.sm_clock_MHz > 0 && s.mem_clock_MHz > 0 && 0 < s.temperature_C < 120 && s.power_limit_W > 0
+        # amdgpu's hwmon reports 0 Hz for a clock in its deepest idle state, so the clocks are checked for presence, not for being nonzero
+        @test s.sm_clock_MHz >= 0 && s.mem_clock_MHz >= 0 && 0 < s.temperature_C < 120 && s.power_limit_W > 0
         if VENDOR == "cuda"
             @test isfinite(s.throttle_reasons) && isinteger(s.throttle_reasons) && throttle_reasons(s.throttle_reasons) isa Vector{Symbol}
         else
