@@ -86,6 +86,45 @@ end
         odd = copy(b); odd[9 + 1] = 0xfc; odd[9 + 2] = (odd[9 + 2] & 0xf0) | 0x0f   # id bits 10..19 → 1023
         @test haskey(amd_gpu_metrics(odd).attrs, :attr_1023)
     end
+    @testset "MI300X v1.9 under load: residency fractions through the stats path" begin
+        fa = joinpath(@__DIR__, "fixtures", "amdgpu", "mi300x_gpu_metrics_v1_9_load_a.bin")
+        fb = joinpath(@__DIR__, "fixtures", "amdgpu", "mi300x_gpu_metrics_v1_9_load_b.bin")
+        a, b = amd_gpu_metrics(fa), amd_gpu_metrics(fb)
+        @test a.version == v"1.9" && a.known && b.known
+        @test a.accumulation_counter == 55257356 && a.ppt_residency_acc == 749905 && a.socket_thm_residency_acc == 0 && a.hbm_thm_residency_acc == 0
+        @test b.accumulation_counter == 55262364 && b.ppt_residency_acc == 754247
+        @test a.gfxclk_MHz == [1304, 1275, 1317, 1283, 1298, 1281, 1309, 1287] && a.hotspot_C == 59 && a.socket_power_W == 705
+        @test b.gfxclk_MHz == [1292, 1262, 1306, 1272, 1289, 1270, 1296, 1272] && b.hotspot_C == 68 && b.socket_power_W == 707
+        @test a.gfx_activity == 1.0
+        ca, cb = GPUDiagnostics._gpu_metrics_columns(fa), GPUDiagnostics._gpu_metrics_columns(fb)
+        @test ca.xcd_clock_min_MHz == 1275 && ca.xcd_clock_max_MHz == 1317
+        # two busy rows of one device, exactly as the sampler child would have written them
+        cols = vcat([:t_rel_s, :device, :compute_util], collect(keys(ca)))
+        rows = [[0.0, 1.0, a.gfx_activity, values(ca)...], [5.0, 1.0, b.gfx_activity, values(cb)...]]
+        tel = GPUTelemetry(cols, permutedims(hcat(rows...)), 2, 5.0, 5.0, 0.0, false, nothing, :none)
+        st = gpu_telemetry_stats(tel)
+        @test isapprox(st["power_violation_fraction"], 4342 / 5008; atol = 1e-3)   # ≈ 0.867
+        @test st["thermal_violation_fraction"] == 0 && st["hbm_thermal_violation_fraction"] == 0
+        @test st["vr_thermal_violation_fraction"] == 0 && st["prochot_fraction"] == 0
+        @test st["xcd_clock_min_MHz_busy_median"] == (1275 + 1262) / 2
+    end
+    @testset "MI300X v1.6, AMD DKMS variant (1664 bytes, idle)" begin
+        f = joinpath(@__DIR__, "fixtures", "amdgpu", "mi300x_gpu_metrics_v1_6_dkms_idle.bin")
+        m = amd_gpu_metrics(f)
+        @test m.version == v"1.6" && m.structure_size == 1664 && m.known
+        @test m.hotspot_C == 42 && m.mem_temperature_C == 40 && m.socket_power_W == 120
+        @test m.gfx_activity == 0.01 && m.umc_activity == 0
+        @test m.gfxclk_MHz == [160, 160, 160, 160, 159, 159, 158, 159] && length(m.gfxclk_MHz) == 8
+        @test m.accumulation_counter == 10657785 && m.prochot_residency_acc == 0 && m.vr_thm_residency_acc == 0
+        # the firmware quirk on this driver: three residencies read as the whole accumulation counter at idle
+        @test m.ppt_residency_acc == m.socket_thm_residency_acc == m.hbm_thm_residency_acc == 10657785
+        @test ismissing(m.throttle_status) && isempty(m.attrs)
+        cols = GPUDiagnostics._gpu_metrics_columns(f)
+        @test cols.throttle_acc_counter == 10657785 && cols.power_throttle_acc == 10657785
+        @test cols.xcd_clock_min_MHz == 158 && cols.xcd_clock_max_MHz == 160
+        L = GPUDiagnostics._GPU_METRICS_LAYOUTS
+        @test L[(1, 6, 1664)] == L[(1, 6, 312)]   # the vendor variant shares every offset with upstream
+    end
     @testset "unknown revisions and bad input" begin
         m = amd_gpu_metrics(UInt8[0x14, 0x00, 0x09, 0x09, zeros(UInt8, 16)...])
         @test m.version == v"9.9" && !m.known && ismissing(m.throttle_status) && isempty(m.gfxclk_MHz)
@@ -97,7 +136,7 @@ end
     end
     @testset "layout data file" begin
         L = GPUDiagnostics._load_gpu_metrics_layouts(GPUDiagnostics._GPU_METRICS_LAYOUTS_FILE)
-        @test L == GPUDiagnostics._GPU_METRICS_LAYOUTS && length(L) >= 20
+        @test L == GPUDiagnostics._GPU_METRICS_LAYOUTS && length(L) >= 21
         @test L[(1, 3, 120)][:indep_throttle_status] == (112, 8, 1) && L[(1, 3, 120)][:gfxclk_MHz] == (54, 2, 1)
         @test L[(1, 8, 344)][:ppt_residency_acc] == (48, 4, 1) && L[(1, 8, 344)][:gfxclk_MHz] == (296, 2, 8)
         @test all(v -> all(x -> x[1] >= 4 && x[2] in (1, 2, 4, 8) && x[3] >= 1, values(v)), values(L))

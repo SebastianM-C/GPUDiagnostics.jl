@@ -61,6 +61,12 @@ virtual function (a cloud MI300X) exposes `gpu_metrics` at all is up to the host
 are simply absent when the file is. `amd_gpu_metrics(path)` decodes one snapshot offline for
 inspection; the field offsets are data, `assets/gpu_metrics_layouts.toml`, which
 `tools/gen_gpu_metrics_layouts.jl` rewrites from the kernel header when a new revision appears.
+AMD's DKMS driver (ROCm 6.3-era amdgpu 6.10) reports a v1.6 of 1664 bytes — the upstream struct
+with `xcp_stats` appended, same leading offsets — which the table carries as a vendor variant.
+A caveat observed on such a host: at idle its PPT, socket-thermal and HBM-thermal residencies all
+equalled the accumulation counter (nominally 100 % residency each), where a v1.9 host read a
+credible 1.2 % PPT residency. Treat residency fractions from that driver/firmware pair as
+unverified until a delta under a known load has been checked.
 One revision needs no offsets: v1.9, which MI300-class parts report under amdgpu 6.16-era drivers
 (a cloud SR-IOV virtual function included — the file is there, and it describes the whole
 card), is a self-describing attribute table (an `int32` count, then packed entries of a `u64`

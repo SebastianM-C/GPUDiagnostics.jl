@@ -22,6 +22,12 @@
 # sysfs file needs neither, works inside a container, and is what the sampler child already does
 # for hwmon. Whether an SR-IOV virtual function exposes the file at all is per host.
 #
+#   AMD's DKMS amdgpu 6.10 (ROCm 6.3-era) ships a v1.6 with xcp_stats appended (1664 bytes; same
+#   leading offsets — a vendor-variant entry in the layout table). Firmware quirk seen on such a
+#   host: at idle the PPT, socket-thermal and HBM-thermal residencies all EQUAL the accumulation
+#   counter (a nominal 100 % residency each), while a v1.9 host read 1.2 % PPT at idle. Residency
+#   fractions from that driver/firmware pair are not to be believed without a delta check under
+#   known conditions; the columns are still recorded, the judgement is the reader's.
 # - v1.9 (MI300-class parts on amdgpu 6.16-era drivers, including the SR-IOV virtual functions the
 #   cloud hands out): no fixed struct any more but a SELF-DESCRIBING ATTRIBUTE TABLE — after the
 #   4-byte header an `int32` count, then packed entries of a `u64` encoding (unit ≪ 24 | type ≪ 20 |
