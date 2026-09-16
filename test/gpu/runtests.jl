@@ -28,11 +28,13 @@ if VENDOR == "cuda"
     const backend = CUDABackend()
     const isa_vendor = :nvidia
     const cross_target = "sm_90"
+    const alt_cross_target = "sm_80"       # when the device itself is the cross target
 else
     using AMDGPU
     const backend = ROCBackend()
     const isa_vendor = :amd
     const cross_target = "gfx942"
+    const alt_cross_target = "gfx90a"      # when the device itself is gfx942 (an MI300X)
 end
 
 @kernel function gpudiag_probe_kernel!(out, @Const(x), n_iters)
@@ -119,8 +121,9 @@ end
         @test irm.counts == m.ir.counts
         fl = fp64_issue_floor(m; n_slots = n * 100, peak_fp64_flops = 1e12, kernel_time_s = 1e-3)
         @test fl.floor_s > 0 && !ismissing(fl.fp64_issue_fraction)
-        mx = kernel_instruction_mix(backend, ck; target = cross_target, ir = false)
-        @test !mx.native && mx.target == cross_target && mx.total > 0 && mx.coverage ≥ 0.98
+        ct = m.target == cross_target ? alt_cross_target : cross_target   # a real cross-compile, not the device itself
+        mx = kernel_instruction_mix(backend, ck; target = ct, ir = false)
+        @test !mx.native && mx.target == ct && mx.total > 0 && mx.coverage ≥ 0.98
         @info "instruction mix" native_total = m.total hot_loop = m.hot_loop.total confidence = m.hot_loop_confidence cross_total = mx.total unclassified = m.unclassified_opcodes
     end
 
@@ -190,7 +193,9 @@ end
         @test s.power_W > 0 && 0 ≤ s.compute_util ≤ 1 && s.vram_used_B > 0
         # #3 columns: clocks, temperature, power limit, throttle bitmask (NaN where the vendor has none)
         # amdgpu's hwmon reports 0 Hz for a clock in its deepest idle state, so the clocks are checked for presence, not for being nonzero
-        @test s.sm_clock_MHz >= 0 && s.mem_clock_MHz >= 0 && 0 < s.temperature_C < 120 && s.power_limit_W > 0
+        # a cloud MI300X VF has no edge sensor (no hwmon temp1_input) → temperature_C is NaN there while hotspot_C is present
+        @test s.sm_clock_MHz >= 0 && s.mem_clock_MHz >= 0 && (isnan(s.temperature_C) || 0 < s.temperature_C < 120) && s.power_limit_W > 0
+        @test 0 < s.temperature_C < 120 || 0 < s.hotspot_C < 120
         if VENDOR == "cuda"
             @test isfinite(s.throttle_reasons) && isinteger(s.throttle_reasons) && throttle_reasons(s.throttle_reasons) isa Vector{Symbol}
         else
