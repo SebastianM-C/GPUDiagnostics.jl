@@ -44,7 +44,8 @@ for dev in 1:gpu_device_count(backend)
         clk = get(st, "sm_clock_MHz_busy_median", missing)
         pw = get(st, "power_W_busy_mean", missing)
         cap = get(st, "power_limit_W_mean", missing)
-        println("  during the probe: SM clock busy median ", clk, " MHz, power ", pw, " W (cap ", cap, " W), ",
+        r1(x) = x === missing ? "missing" : string(round(x; digits = 1))
+        println("  during the probe: SM clock busy median ", r1(clk), " MHz, power ", r1(pw), " W (cap ", r1(cap), " W), ",
             st["busy_samples"], " busy samples")
     end
     p32 = peak_flops_probe(backend, Float32; trials = 3)
