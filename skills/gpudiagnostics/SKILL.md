@@ -57,9 +57,10 @@ KernelAbstractions `Backend`; load CUDA.jl or AMDGPU.jl for the vendor methods.
   `GRBM_GUI_ACTIVE / n_xcd` (14 GHz means the die sum was not divided). NVIDIA `smsp__*thread*` metrics are
   per-thread. Read `COUNTER_SETS[vendor][set].notes` before interpreting. On a power-capped part compare
   runs of the same work in cycles, not seconds; ncu durations are replays, not timings.
-- **Peak probe.** `measure_peak_flops(backend, T)` is the FMA-chain rate at the clocks the device holds
-  (≈ 91 % of spec on an H100, ≈ 54 % on an A100 — a known probe-geometry question), never a matrix-unit
-  peak; `Float64` requires the `:fp64` capability.
+- **Peak probe.** `peak_flops_probe(backend, T)` sweeps chains × launch size and returns a `PeakProbe`
+  (rate + winning geometry + sweep; `measure_peak_flops` is the rate alone), the FMA-chain rate at the
+  clocks the device holds, never a matrix-unit peak (`measure_gemm_flops` is that, an upper reference);
+  `Float64` requires the `:fp64` capability. Record the sampler's clock next to it on power-managed parts.
 
 ## Storing results (manifest convention)
 

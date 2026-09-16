@@ -20,7 +20,7 @@ const GPUDIAGNOSTICS_SCHEMA = 2
     diagnostics_dict(x; prefix = "") -> Dict{String, Any}
 
 Flat, TOML-safe dictionary of a result — `KernelResources`, `KernelInstructionMix` /
-`InstructionMix`, `IRMix`, `FP64IssueFloor`, `LaunchTimer`, `GPUTelemetry`, `HWCounters` —
+`InstructionMix`, `IRMix`, `FP64IssueFloor`, `PeakProbe`, `LaunchTimer`, `GPUTelemetry`, `HWCounters` —
 with every key prefixed by `prefix` (the convention used by the first consumer: `kernel_`,
 `kernel_mix_`, `kernel_ir_`, `sampler_`, `hw_`), ready to `merge!` into a run manifest.
 Values are `Int`, `Float64`, `Bool`, `String` or vectors of those; `Symbol`s become strings;
@@ -112,6 +112,14 @@ end
 
 # ---- LaunchTimer: one vector per statistic, in ascending device order (the layout the first
 # consumer's manifests already use).
+function diagnostics_dict(p::PeakProbe; prefix::AbstractString = "")
+    d = _newdict()
+    for k in fieldnames(PeakProbe)
+        _put!(d, prefix, k, getfield(p, k))
+    end
+    return d
+end
+
 function diagnostics_dict(t::LaunchTimer; prefix::AbstractString = "")
     d = _newdict()
     lt = launch_times(t)
@@ -226,6 +234,21 @@ end
 function Base.show(io::IO, ::MIME"text/plain", f::FP64IssueFloor)
     show(io, f)
     print(io, "\n  confidence ", f.confidence, "\n  assumptions: ", f.assumptions)
+    return nothing
+end
+function Base.show(io::IO, p::PeakProbe)
+    print(io, "PeakProbe(", p.eltype, ": ", round(p.flops / 1e12; digits = 3), " TFLOP/s at ", p.chains,
+        " chains × ", p.n_threads, " threads, best of ", p.trials, ", ", length(p.sweep_flops), "-point sweep)")
+end
+function Base.show(io::IO, ::MIME"text/plain", p::PeakProbe)
+    show(io, p)
+    print(io, "\n  workgroup ", p.workgroup, ", ", p.n_iters, " iterations per chain, ",
+        round(p.best_s * 1e3; digits = 1), " ms per launch",
+        p.capacity === missing ? "" : ", resident capacity $(p.capacity) threads")
+    for (c, n, f) in zip(p.sweep_chains, p.sweep_n_threads, p.sweep_flops)
+        print(io, "\n  ", lpad(c, 3), " chains × ", lpad(n, 9), " threads: ", round(f / 1e12; digits = 3), " TFLOP/s",
+            (c == p.chains && n == p.n_threads) ? "  ←" : "")
+    end
     return nothing
 end
 function Base.show(io::IO, t::LaunchTimer)

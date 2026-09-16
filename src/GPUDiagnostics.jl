@@ -24,9 +24,11 @@ fallbacks so the plumbing (and its tests) run without a GPU.
   (means, peaks, busy-window means and medians, the power-capped fraction). In-process sampling
   wedges behind a backed-up kernel stream or is suspended by Julia's GC/timer coupling; a child
   is immune.
-- **Measured peak** — `measure_peak_flops(backend, T)`: a dependent-FMA-chain kernel gives the
+- **Measured peak** — `peak_flops_probe(backend, T)` / `measure_peak_flops`: a dependent-FMA-chain
+  kernel, swept over a small geometry grid (chains per thread × launch size), gives the
   attainable vector FP64 (or FP32) rate of the device at the clocks it actually holds, never
-  routed to matrix/tensor units. Runs on every backend, the CPU included.
+  routed to matrix/tensor units, with the winning geometry recorded. `measure_gemm_flops` is the
+  matrix-unit rate for the same device, an upper reference. Runs on every backend, the CPU included.
 - **Compile-time resource report** — `compiled_kernels` inventories the kernels this process
   compiled (from the vendor's kernel cache, so closures inside driver functions are reachable
   too) and `kernel_resources` reports registers, spill/stack and shared (LDS) memory, and the
@@ -76,7 +78,7 @@ export FEATURES, supports, capabilities, BackendUnsupported,
     LaunchOverhead, measure_launch_overhead, HostSnapshot, host_snapshot, backend_versions,
     gpu_sample, gpu_sampler_sources, sampler_source, SamplerSource, telemetry_child_main,
     with_gpu_sampler, GPUTelemetry, gpu_telemetry_stats, throttle_reasons, THROTTLE_REASON_BITS,
-    measure_peak_flops,
+    measure_peak_flops, peak_flops_probe, PeakProbe, measure_gemm_flops,
     CompiledKernel, KernelResources, KernelOccupancy, compiled_kernels, kernel_resources,
     MIX_CLASSES, SASS_RULES, AMD_RULES, MixLoop, InstructionMix, KernelInstructionMix, FP64IssueFloor,
     instruction_mix, kernel_instruction_mix, fp64_issue_floor,
