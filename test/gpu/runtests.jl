@@ -83,10 +83,16 @@ end
     end
 
     @testset "measured peak" begin
-        p64 = measure_peak_flops(backend; trials = 2, target_seconds = 0.05)
+        pr = peak_flops_probe(backend; trials = 2, target_seconds = 0.05)
+        p64 = pr.flops
         p32 = measure_peak_flops(backend, Float32; trials = 2, target_seconds = 0.05)
         @test 1e9 < p64 < 1e15 && 1e9 < p32 < 1e16
-        @info "measured peaks" fp64_TFLOPs = round(p64 / 1e12; digits = 2) fp32_TFLOPs = round(p32 / 1e12; digits = 2)
+        @test !ismissing(pr.capacity) && pr.n_threads % pr.capacity == 0    # whole resident waves
+        @test length(pr.sweep_flops) == 9 && p64 ≥ maximum(pr.sweep_flops)
+        g64 = measure_gemm_flops(backend; n = 2048, trials = 2)
+        @test 1e9 < g64 < 1e16
+        @info "measured peaks" fp64_TFLOPs = round(p64 / 1e12; digits = 2) fp32_TFLOPs = round(p32 / 1e12; digits = 2) gemm64_TFLOPs = round(g64 / 1e12; digits = 2) chains = pr.chains n_threads = pr.n_threads
+        show(stdout, MIME"text/plain"(), pr); println()
     end
 
     @testset "resource report" begin

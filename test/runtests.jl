@@ -1,5 +1,5 @@
 using GPUDiagnostics
-using GPUDiagnostics: _fma_chain_reference, _fma_chain_kernel!, _PEAK_CHAINS
+using GPUDiagnostics: _fma_chain_reference, _fma_chain_kernel!, _PEAK_CHAINS, _pairsum
 using GPUDiagnostics: _static_workgroup_size, _parse_amdgpu_kernel_info, backend_wrap_kernel, _parse_ptxas_verbose
 using GPUDiagnostics: _classify, _parse_machine_code, _natural_loops, FP64_CLASSES, _ir_counts, IR_FP64_CLASSES
 import KernelAbstractions as KA
@@ -304,22 +304,48 @@ end
     @testset "measured FP64 peak: FMA-chain probe (CPU backend) + host peakflops" begin
         n = 64
         out = zeros(n); seed = Float64.(0:(n - 1))
-        _fma_chain_kernel!(CPU(), 16)(out, seed, Int32(1000); ndrange = n)
-        @test all(i -> isapprox(out[i], _fma_chain_reference(seed[i], 1000); rtol = 1.0e-12), 1:n)
-        @test _PEAK_CHAINS == 8
+        for C in (1, 4, 8, 16)
+            _fma_chain_kernel!(CPU(), 16)(out, seed, Int32(1000), Val(C); ndrange = n)
+            @test all(i -> isapprox(out[i], _fma_chain_reference(seed[i], 1000; chains = C); rtol = 1.0e-12), 1:n)
+        end
+        @test _PEAK_CHAINS == (4, 8, 16)
+        @test _pairsum((1.0, 2.0, 3.0, 4.0, 5.0)) == (1.0 + 2.0) + ((3.0 + 4.0) + 5.0)
         p = measure_peak_flops(CPU(); n_threads = 4096, trials = 2, target_seconds = 0.02)
         p32 = measure_peak_flops(CPU(), Float32; n_threads = 4096, trials = 2, target_seconds = 0.02)
         @test p32 isa Float64 && p32 > 0
         out32 = zeros(Float32, n); seed32 = Float32.(0:(n - 1))
-        _fma_chain_kernel!(CPU(), 16)(out32, seed32, Int32(1000); ndrange = n)
+        _fma_chain_kernel!(CPU(), 16)(out32, seed32, Int32(1000), Val(8); ndrange = n)
         @test all(i -> isapprox(out32[i], _fma_chain_reference(seed32[i], 1000); rtol = 1.0e-5), 1:n)
+        # the full record: geometry sweep, winner, capacity (missing on the CPU backend)
+        pr = peak_flops_probe(CPU(); chains = (4, 8), n_threads = (2048, 4096), trials = 2, target_seconds = 0.02)
+        @test pr isa PeakProbe && Float64(pr) == pr.flops > 0
+        @test pr.eltype == :Float64 && pr.chains in (4, 8) && pr.n_threads in (2048, 4096)
+        @test pr.sweep_chains == [4, 4, 8, 8] && pr.sweep_n_threads == [2048, 4096, 2048, 4096]
+        @test length(pr.sweep_flops) == 4 && pr.flops ≥ maximum(pr.sweep_flops)
+        @test ismissing(pr.capacity) && pr.trials == 2 && pr.workgroup == 256 && pr.best_s > 0
+        # :auto on a backend without device props falls back to the fixed launch size
+        pa = peak_flops_probe(CPU(); chains = 4, trials = 1, target_seconds = 0.01)
+        @test pa.sweep_n_threads == [GPUDiagnostics._PEAK_THREADS_FALLBACK] && pa.chains == 4
+        d = diagnostics_dict(pr; prefix = "peak_probe_")
+        @test d["peak_probe_flops"] == pr.flops && d["peak_probe_chains"] == pr.chains
+        @test d["peak_probe_eltype"] == "Float64" && d["peak_probe_sweep_flops"] == pr.sweep_flops
+        @test !haskey(d, "peak_probe_capacity") && d["gpudiagnostics_schema"] == GPUDIAGNOSTICS_SCHEMA
+        @test occursin("TFLOP/s", sprint(show, pr)) && occursin("←", sprint(show, MIME"text/plain"(), pr))
+        # GEMM reference on the host BLAS
+        g = measure_gemm_flops(CPU(); n = 128, trials = 2)
+        @test g isa Float64 && g > 1.0e7
+        @test_throws ArgumentError measure_gemm_flops(CPU(); n = 0)
         # a backend without :fp64 can still probe Float32
         struct NoFP64Backend <: Backend end
         GPUDiagnostics.supports(::NoFP64Backend, ::Val{:peak_flops}) = true
         e64 = try measure_peak_flops(NoFP64Backend()); catch err; err; end
         @test e64 isa BackendUnsupported && e64.feature == :fp64
+        eg = try measure_gemm_flops(NoFP64Backend()); catch err; err; end
+        @test eg isa BackendUnsupported && eg.feature == :fp64
         @test isfinite(p) && p > 1.0e7
         @test_throws ArgumentError measure_peak_flops(CPU(); trials = 0)
+        @test_throws ArgumentError peak_flops_probe(CPU(); chains = 0)
+        @test_throws ArgumentError peak_flops_probe(CPU(); n_threads = 0)
     end
 
     @testset "compile-time resource report" begin

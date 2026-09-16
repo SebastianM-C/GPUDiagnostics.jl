@@ -73,12 +73,15 @@ a window shorter than that has no samples.
 `measure_launch_overhead`'s `device_s` brackets a one-instruction kernel with two device events,
 whose own cost is a few microseconds — it is an upper bound and may exceed the host round trip.
 
-## The peak probe reads low on some architectures
+## The peak probe is a geometry sweep, and a power-managed card reports a lower peak
 
-The FMA-chain probe reaches ≈ 91 % of the vector FP64 spec on an H100 but ≈ 54 % on an A100 at
-full boost clock; the shortfall is a probe-geometry question (chains per thread, launch size)
-tracked in the repository's issues, not a clock effect. Treat the number as "attainable by scalar
-code at the clocks the device holds", and cross-check with the sampler's clock columns.
+With one fixed geometry (8 chains over 2^20 threads) the FMA-chain probe read ≈ 91 % of the vector
+FP64 spec on an H100 but ≈ 54 % on an A100 at full boost clock. `peak_flops_probe` therefore sweeps
+chains × launch size and records the winner (see [measured peak](peaks_probes.md)); read
+`sweep_flops` when a card still comes out low. Treat the number as "attainable by scalar code at
+the clocks the device holds", and cross-check with the sampler's clock columns: an MI300X under a
+sustained FP64 load drops well below its rated clock, and its measured peak is the power-limited
+one, which is the right denominator for a kernel that runs under the same cap.
 
 ## `test/gpu` needs `Pkg.resolve()` first
 
