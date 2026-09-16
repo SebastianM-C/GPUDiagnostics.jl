@@ -52,6 +52,40 @@ end
         b3 = synth_gpu_metrics(1, 4, 288; throttle_status = 0x5, gfxclk_MHz = fill(2100, 8))
         @test GPUDiagnostics._gpu_metrics_columns(b3).amd_throttle_status == 5
     end
+    @testset "MI300X v1.9 capture (idle, attribute table)" begin
+        f = joinpath(@__DIR__, "fixtures", "amdgpu", "mi300x_gpu_metrics_v1_9_idle.bin")
+        m = amd_gpu_metrics(f)
+        @test m.version == v"1.9" && m.structure_size == 1150 && m.known
+        @test m.hotspot_C == 42 && m.mem_temperature_C == 37 && m.socket_power_W == 194
+        @test m.gfx_activity == 0 && m.umc_activity == 0
+        @test m.gfxclk_MHz == [2098, 2100, 2110, 2105, 2103, 2109, 2105, 2115] && length(m.gfxclk_MHz) == 8
+        @test m.accumulation_counter == 54536484 && m.ppt_residency_acc == 633093
+        @test m.socket_thm_residency_acc == 0 && m.vr_thm_residency_acc == 0 && m.hbm_thm_residency_acc == 0 && m.prochot_residency_acc == 0
+        @test ismissing(m.throttle_status) && ismissing(m.indep_throttle_status)
+        @test length(m.attrs) == 47 && m.attrs[:current_gfxclk] isa Vector{UInt16}
+        @test m.attrs[:gfx_busy_inst] == [1, 0, 0, 0, 0, 0, 0, 0] && length(m.attrs[:gfx_below_host_limit_ppt_acc]) == 8
+        @test m.attrs[:gfx_below_host_limit_ppt_acc] isa Vector{UInt64} && m.attrs[:mem_max_bandwidth] == [5325]
+        @test isequal(amd_gpu_metrics(read(f)), m)
+        cols = GPUDiagnostics._gpu_metrics_columns(f)
+        @test cols.throttle_acc_counter == 54536484 && cols.power_throttle_acc == 633093
+        @test cols.xcd_clock_min_MHz == 2098 && cols.xcd_clock_max_MHz == 2115 && isnan(cols.amd_throttle_status)
+        @test cols.thermal_throttle_acc == 0 && cols.prochot_acc == 0
+        # fixed-layout revisions carry an empty attrs
+        @test isempty(amd_gpu_metrics(joinpath(@__DIR__, "fixtures", "amdgpu", "w7900_gpu_metrics_idle.bin")).attrs)
+        # truncated mid-table: what was parsed before the cut, missing after it, never a throw
+        b = read(f)
+        t = amd_gpu_metrics(b[1:120])   # entries 0–8 fit; the accumulation counter (entry 9) is cut
+        @test t.version == v"1.9" && t.known && t.hotspot_C == 42 && t.socket_power_W == 194
+        @test ismissing(t.accumulation_counter) && isempty(t.gfxclk_MHz) && length(t.attrs) < 47
+        t8 = amd_gpu_metrics(b[1:8])   # header + count only
+        @test t8.known && isempty(t8.attrs) && ismissing(t8.hotspot_C)
+        # an unknown type index ends the walk without an error
+        bad = copy(b); bad[9 + 2] |= 0x80   # type nibble → 8+
+        @test isempty(amd_gpu_metrics(bad).attrs)
+        # an unknown id is kept under a generic name
+        odd = copy(b); odd[9 + 1] = 0xfc; odd[9 + 2] = (odd[9 + 2] & 0xf0) | 0x0f   # id bits 10..19 → 1023
+        @test haskey(amd_gpu_metrics(odd).attrs, :attr_1023)
+    end
     @testset "unknown revisions and bad input" begin
         m = amd_gpu_metrics(UInt8[0x14, 0x00, 0x09, 0x09, zeros(UInt8, 16)...])
         @test m.version == v"9.9" && !m.known && ismissing(m.throttle_status) && isempty(m.gfxclk_MHz)

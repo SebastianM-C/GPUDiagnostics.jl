@@ -38,8 +38,8 @@ revision lacks the field; NVIDIA rows never carry them):
 | column | unit | source | revisions |
 |---|---|---|---|
 | `amd_throttle_status` | bitmask | `indep_throttle_status`, the driver's vendor-independent throttler bits (`amd_throttle_reasons(x)` names them: `:ppt0`…, `:tdc_*`, `:temp_hotspot`, …); the raw SMU mask where a revision has only that | v1.3 (RDNA3 dGPUs), v2.2+ (APUs); raw on v1.0–1.5 |
-| `xcd_clock_min_MHz`, `xcd_clock_max_MHz` | MHz | spread of `current_gfxclk[]` over the dies | v1.4+ (MI300 and later); a single die gives min = max |
-| `throttle_acc_counter`, `power_throttle_acc`, `thermal_throttle_acc`, `hbm_throttle_acc`, `vr_throttle_acc`, `prochot_acc` | counts | the accumulated throttler residencies: PPT (package power), socket thermal, HBM thermal, VR thermal, PROCHOT, with their accumulation counter | v1.6+ (MI300) |
+| `xcd_clock_min_MHz`, `xcd_clock_max_MHz` | MHz | spread of `current_gfxclk[]` over the dies | v1.4+ (MI300 and later, v1.9 included); a single die gives min = max |
+| `throttle_acc_counter`, `power_throttle_acc`, `thermal_throttle_acc`, `hbm_throttle_acc`, `vr_throttle_acc`, `prochot_acc` | counts | the accumulated throttler residencies: PPT (package power), socket thermal, HBM thermal, VR thermal, PROCHOT, with their accumulation counter | v1.6+ (MI300; v1.9 attribute table included) |
 
 The residencies are cumulative, so `gpu_telemetry_stats` differences them over the window:
 `power_violation_fraction` is Δ`power_throttle_acc` / Δ`throttle_acc_counter`, AMD's own PVIOL
@@ -61,6 +61,13 @@ virtual function (a cloud MI300X) exposes `gpu_metrics` at all is up to the host
 are simply absent when the file is. `amd_gpu_metrics(path)` decodes one snapshot offline for
 inspection; the field offsets are data, `assets/gpu_metrics_layouts.toml`, which
 `tools/gen_gpu_metrics_layouts.jl` rewrites from the kernel header when a new revision appears.
+One revision needs no offsets: v1.9, which MI300-class parts report under amdgpu 6.16-era drivers
+(a cloud SR-IOV virtual function included — the file is there, and it describes the whole
+card), is a self-describing attribute table (an `int32` count, then packed entries of a `u64`
+encoding — unit, type, id, instance count — followed by the values). The decoder maps its
+`accumulation_counter`, the residencies and `current_gfxclk[8]` onto the same columns as
+v1.6–1.8 and returns every attribute raw in `attrs` (per-XCD `gfx_busy_acc`,
+`gfx_below_host_limit_ppt_acc`, …) for inspection.
 
 `gpu_sample` is exactly what the sampler child calls per tick. The child is a Julia process
 (`telemetry_child_main`, started with the parent's julia binary and load path) rather than a Julia
