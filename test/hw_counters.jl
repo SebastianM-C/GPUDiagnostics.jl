@@ -263,8 +263,11 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test first(h.dispatches).device["name"] == "NVIDIA test GPU"
         @test first(h.dispatches).device["device__attribute_confidential_computing_mode"] == "No-CC"
         @test all(d -> d.resources["grid_size"] == 4096 && d.resources["grid_blocks"] == 16, h.dispatches)
-        # metadata columns of the raw page are not counters: launch attributes → resources, replay passes → provenance
-        @test Set(h.counters) == Set(["gpu__time_duration.sum"; COUNTER_SETS[:nvidia][:fp64].metrics])
+        # metadata columns of the raw page are not counters: launch attributes → resources, replay passes → provenance.
+        # The fixture predates the pipe-fraction metric in the preset, so it is a subset of the preset.
+        @test Set(h.counters) ⊆ Set(["gpu__time_duration.sum"; COUNTER_SETS[:nvidia][:fp64].metrics])
+        @test "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active" in COUNTER_SETS[:nvidia][:fp64].metrics
+        @test !haskey(hw_counter_derived(h), "nvidia_fp64_pipe_peak_fraction")   # absent from this capture, not zero
         @test all(d -> d.resources["registers"] == 16 && d.resources["launch__registers_per_thread"] == 16 &&
             d.resources["launch__func_cache_config"] == "CachePreferNone" && d.resources["profiler__replayer_passes"] == 3, h.dispatches)
         @test h.provenance["passes"] == 3 && hw_counter_summary(h)["collection_passes"] == 3

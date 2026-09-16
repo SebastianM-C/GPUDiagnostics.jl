@@ -40,7 +40,8 @@ const _NCU_COUNTERS = Dict(
     :occupancy => ["gpu__time_duration.sum", "sm__warps_active.avg.pct_of_peak_sustained_active"],
     :memory => ["gpu__time_duration.sum", "dram__bytes.sum"],
     :fp64 => ["gpu__time_duration.sum", "smsp__sass_thread_inst_executed_op_dfma_pred_on.sum",
-        "smsp__sass_thread_inst_executed_op_dadd_pred_on.sum", "smsp__sass_thread_inst_executed_op_dmul_pred_on.sum"],
+        "smsp__sass_thread_inst_executed_op_dadd_pred_on.sum", "smsp__sass_thread_inst_executed_op_dmul_pred_on.sum",
+        "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active"],
     :l2 => ["gpu__time_duration.sum", "lts__t_sector_hit_rate.pct"],
 )
 
@@ -61,10 +62,10 @@ const _NCU_PRESET_NOTES = Dict{Symbol, String}(
         "There is no L1-pipe busy analogue in this preset — the nearest ncu metrics are the " *
         "l1tex__* family, passed as a custom `metrics` list. One pass on sm_120.",
     :fp64 => "Predicated-on DFMA / DADD / DMUL thread instructions: per-THREAD counts, so / slots " *
-        "directly (no wave factor); fp64_flop_per_slot = 2·FMA + ADD + MUL. Add " *
-        "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active to `metrics` for " *
-        "nvidia_fp64_pipe_peak_fraction, the question 'is the FP64 pipe the wall' (a kernel at 88 % " *
-        "pipe fraction gained only 7–9 % from removing integer work). Three replay passes on sm_120.",
+        "directly (no wave factor); fp64_flop_per_slot = 2·FMA + ADD + MUL. Plus the FP64 pipe's " *
+        "active-cycle fraction of its sustained peak (sm__pipe_fp64_cycles_active…pct_of_peak_sustained_active " *
+        "→ nvidia_fp64_pipe_peak_fraction), the question 'is the FP64 pipe the wall': a kernel at 88 % " *
+        "pipe fraction gained only 7–9 % from removing integer work. Three to four replay passes on sm_120.",
     :l2 => "lts__t_sector_hit_rate.pct: L2 hit rate over 32 B SECTOR lookups (nvidia_l2_sector_hit_rate). " *
         "Sectors are not AMD's TCC requests, so the two hit rates have different denominators and are " *
         "not directly comparable. Three replay passes on sm_120.",
