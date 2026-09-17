@@ -158,7 +158,7 @@ end
         @test nt.power_limit_W == 300 && isnan(nt.throttle_reasons) && nt.power_W == 150
         # a partial extension (7 fields) and too many fields
         @test GPUDiagnostics.sample!(sampler_source("sysfs:4:$d/p:$d/b:-:$d/v:$d/f1:-", :none)).sm_clock_MHz == 1850
-        @test_throws ArgumentError sampler_source("sysfs:4:$d/p:$d/b:-:$d/v:-:-:-:-:-:-", :none)
+        @test_throws ArgumentError sampler_source("sysfs:4:$d/p:$d/b:-:$d/v:-:-:-:-:-:-:-", :none)
         rm(joinpath(d, "b"))
         @test isnan(GPUDiagnostics.sample!(sy).compute_util) && GPUDiagnostics.sample!(sy).power_W == 150   # transient read failure → nan, row survives
 
@@ -937,4 +937,5 @@ end
     end
 
     include("hw_counters.jl")
+    include("gpu_metrics.jl")
 end
