@@ -74,7 +74,24 @@ GPUDIAGNOSTICS_GPU=cuda julia --project=test/gpu -e 'using Pkg; Pkg.resolve(); P
 GPUDIAGNOSTICS_GPU=rocm …
 ```
 
-It has been run on RTX 4080 SUPER, A100, H100 (also both in one process) and Radeon Pro W7900.
+Hardware the package has been exercised on (hand-run suite, or the probe / sampler / counter paths
+through a production campaign), as of v0.4.2:
+
+| card | architecture | what ran |
+|---|---|---|
+| NVIDIA A100 PCIe 40 GB | sm_80 | hardware suite; swept peak probe (99 % of spec); sampler without GPM (Ampere) |
+| NVIDIA H100 PCIe | sm_90 | hardware suite (also with the A100 in one process); probe, sampler, GPM |
+| NVIDIA H100 SXM | sm_90 | probe, sampler, GPM; Nsight Compute counter presets (`fp64`, `issue`, `occupancy`, `memory`, `l2`) |
+| NVIDIA H200 SXM | sm_90 | probe, sampler, GPM |
+| NVIDIA B200 | sm_100 | probe, sampler, GPM |
+| NVIDIA B300 (Blackwell Ultra) | sm_103 | hardware suite; probe (1.20 TFLOP/s FP64, the datasheet figure); all ncu presets (ncu ≥ 2025.3) |
+| NVIDIA RTX 5090 | sm_120 | hardware suite; probe; all ncu presets |
+| NVIDIA RTX 4080 SUPER | sm_89 | hardware suite; probe |
+| AMD Instinct MI300X | gfx942 | rocprofv3 presets (`fp64`, `memory`, `issue`, `occupancy`, `l2`); `gpu_metrics` v1.6 / v1.9 decode and residencies; probe under the power cap |
+| AMD Radeon Pro W7900 | gfx1100 | hardware suite; `issue` and `occupancy` presets (the part has no FP64 / TA / TCP / TCC counters) |
+
+Two caveats that came out of that coverage: NVML GPM's FP64 utilization does not see the FP64 path on
+sm_120 / sm_103 (#42), and a peak probe measured inside a profiled process is not a peak (#43).
 
 ## Porting a backend
 
