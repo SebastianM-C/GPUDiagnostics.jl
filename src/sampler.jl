@@ -361,7 +361,8 @@ Base.show(io::IO, t::GPUTelemetry) = print(io, "GPUTelemetry(", length(t), " row
     t.starved ? ", STARVED" : "", ")")
 
 """
-    with_gpu_sampler(f, backend, dt; devices = 1:1, tracefile = nothing, counters = :auto) -> (f(), telem)
+    with_gpu_sampler(f, backend, dt; devices = 1:1, tracefile = nothing, counters = :auto,
+                     ready_timeout = 10.0) -> (f(), telem)
 
 Run `f()` while a child process samples `devices` (1-based vendor ids) every `dt` seconds:
 power / compute / memory utilization / VRAM / SM and memory clocks / edge and hotspot temperature /
@@ -372,14 +373,17 @@ first so the do-block form works. Without `tracefile`, samples go to a temp file
 after parsing. `telem` is a [`GPUTelemetry`](@ref) column table; reduce it with
 [`gpu_telemetry_stats`](@ref).
 
-If no sampler child can be built for `backend` (no vendor extension, e.g. the CPU backend) or
-the child fails to start, a warning is logged and `f` runs without one — telemetry is never
-allowed to break the caller.
+`f` starts once the child has written its header (its sources are open and primed), waited for
+up to `ready_timeout` seconds, so a workload shorter than the child's startup is still sampled;
+`telem.first_sample_s` reports that startup lag. If no sampler child can be built for `backend`
+(no vendor extension, e.g. the CPU backend) or the child fails to start, a warning is logged and
+`f` runs without one — telemetry is never allowed to break the caller.
 """
 function with_gpu_sampler(f, backend, dt::Real; devices::AbstractVector{<:Integer} = 1:1,
-        tracefile::Union{String, Nothing} = nothing, counters::Symbol = :auto)
+        tracefile::Union{String, Nothing} = nothing, counters::Symbol = :auto, ready_timeout::Real = 10.0)
     _check_counters(counters)
     dt > 0 || throw(ArgumentError("dt must be positive"))
+    ready_timeout >= 0 || throw(ArgumentError("ready_timeout must be non-negative"))
     trace = something(tracefile, tempname() * ".tsv")
     stopfile = trace * ".stop"
     errfile = trace * ".stderr"
@@ -397,6 +401,16 @@ function with_gpu_sampler(f, backend, dt::Real; devices::AbstractVector{<:Intege
         tracefile === nothing && rm(trace; force = true)
         rm(errfile; force = true)
         return f(), _empty_telemetry(dt, counters)
+    end
+    # Wait for the child to be ready before running `f`: its header line lands once every source
+    # is open and primed. A fresh Julia child takes ~0.8 s on a fast host and several seconds on a
+    # two-vCPU CI runner, and a workload shorter than that saw the stopfile before the child's
+    # first tick — zero rows, exit code 0 (PR #35's Julia 1.10 job). Bounded by `ready_timeout`;
+    # a child that never gets ready still lets `f` run, and the starvation watchdog then reports
+    # the empty window. `t0` stays the launch time, so `first_sample_s` keeps measuring startup.
+    ready_deadline = time() + ready_timeout
+    while process_running(child) && !_trace_ready(trace) && time() < ready_deadline
+        sleep(0.02)
     end
 
     local result
@@ -447,6 +461,14 @@ _starved(window, first_sample_s, ticks, dt) = (s = window - first_sample_s; s > 
 # (`*_util`, `sm_occupancy`) in [0, 1], power and power limit below 5 kW, VRAM below 1 TB, clocks
 # below 20 GHz, temperatures within [-50, 200] °C, a non-negative integer throttle bitmask; `nan`
 # (a counter the device does not expose) is kept anywhere but epoch/device.
+# The child's header line marks readiness (written after every source is open and primed).
+function _trace_ready(trace::AbstractString)
+    isfile(trace) || return false
+    return open(trace) do io
+        eof(io) ? false : startswith(readline(io), "# epoch_s")
+    end
+end
+
 function _parse_trace(trace::AbstractString, t0::Real)
     columns = copy(_BASE_COLUMNS)
     rows = Vector{Float64}[]

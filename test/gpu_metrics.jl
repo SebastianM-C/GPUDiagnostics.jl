@@ -182,6 +182,13 @@ end
         s12 = gpu_telemetry_stats(t12)
         @test s12["power_throttled_fraction"] == 1 && s12["thermal_throttled_fraction"] == 1
         @test !haskey(s12, "power_violation_fraction")   # no residency columns on those devices
+        # a workload shorter than the child's startup still yields rows: the parent waits for the
+        # header before running it (zero rows on a slow CI runner otherwise, exit code 0)
+        _, tshort = with_gpu_sampler(GPUDiagnostics.KA.CPU(), 0.1; devices = 1:1) do
+            sleep(0.3); nothing
+        end
+        @test tshort.ticks >= 2 && tshort.first_sample_s > 0 && !tshort.starved
+        @test_throws ArgumentError with_gpu_sampler(() -> nothing, GPUDiagnostics.KA.CPU(), 0.1; ready_timeout = -1)
         Base.delete_method(only(methods(GPUDiagnostics.gpu_sampler_sources, (CPU, AbstractVector{<:Integer}, Symbol))))
     end
 end
