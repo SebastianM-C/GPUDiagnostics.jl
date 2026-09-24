@@ -386,7 +386,12 @@ function _parse_amd_isa(text::AbstractString)
     return blocks
 end
 
-const _SASS_INSTR = r"^\s*/\*[0-9a-f]+\*/\s+(?:(@!?U?P[0-9T])\s+)?([A-Z][A-Z0-9_.]*)\s*(.*?)\s*;?\s*$"
+# `/*0050*/  @P2 BRA `(.L_x_1) ;` → predicate, opcode, operands up to the `;` (trimmed below).
+# Nothing follows the operand group, so the match is linear in the line length: nvdisasm pads
+# its comment annotations with runs of thousands of spaces (`STL.64 [R1+0xc48], R62 ␣…␣
+# (*"SpillRefill"*) ;`), and a lazy operand group before a `\s*;?\s*$` tail backtracks
+# quadratically across them, into PCRE's match limit on a large kernel.
+const _SASS_INSTR = r"^\s*/\*[0-9a-f]+\*/\s+(?:(@!?U?P[0-9T])\s+)?([A-Z][A-Z0-9_.]*)([^;]*)"
 
 function _parse_sass(text::AbstractString)
     blocks = MixBlock[]
@@ -413,7 +418,7 @@ function _parse_sass(text::AbstractString)
         end
         m = match(_SASS_INSTR, line)
         m === nothing && continue
-        pred, op, operands = m[1], m[2], m[3]
+        pred, op, operands = m[1], m[2], strip(m[3])
         push!(opcodes, op)
         base = split(op, '.')[1]
         unconditional = pred === nothing || pred == "@PT" || pred == "@UPT"
