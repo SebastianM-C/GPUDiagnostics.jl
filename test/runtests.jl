@@ -738,6 +738,40 @@ end
         @test_throws BackendUnsupported kernel_instruction_mix(NoVendorBackend(), ck)
     end
 
+    @testset "SASS parser: nvdisasm's padded annotations and long symbol names stay linear" begin
+        # nvdisasm pads the `(*"SpillRefill"*)` comment on spill LDL/STL with runs of thousands of
+        # spaces, and a Julia kernel's `.type`/`.size`/label lines carry mangled names thousands of
+        # characters long; a backtracking operand pattern hit PCRE's match limit on such a dump.
+        pad = " "^4000
+        name = "_Z9gpu_k" * repeat("16CompilerMetadataI11DynamicSize12DynamicCheckv", 100)
+        sass = """
+        \t.section\t.text.$name,"ax",@progbits
+                .type           $name,@function
+                .size           $name,(.L_x_1 - $name)
+        $name:
+        .text.$name:
+                /*0000*/                   IADD3 R1, R1, -0xf58, RZ ;
+                /*0010*/                   STL.64 [R1+0xc48], R62 $pad(*"SpillRefill"*) ;
+        .L_x_0:
+                /*0020*/                   LDL.64 R62, [R1+0xc48] $pad(*"SpillRefill"*) ;
+                /*0030*/                   DFMA R62, R62, R4, R62 ;
+                /*0040*/               @P0 BRA `(.L_x_0) $pad;
+                /*0050*/                   BRA.U !UP0, `(.L_x_0) $pad;
+                /*0060*/                   EXIT ;
+        """
+        @test length(name) > 4000
+        t = @elapsed (sb = _parse_machine_code(sass, :nvidia))
+        @test t < 1.0
+        @test [b.label for b in sb] == [name, ".text." * name, ".L_x_0"]
+        @test sb[2].opcodes == ["IADD3", "STL.64"] && sb[2].fallthrough
+        @test sb[3].opcodes == ["LDL.64", "DFMA", "BRA", "BRA.U", "EXIT"]
+        @test sb[3].targets == [".L_x_0", ".L_x_0"] && !sb[3].fallthrough   # both branches conditional, then EXIT
+        mp = instruction_mix(sass, :nvidia)
+        @test mp.total == 7 && mp.counts.mem_store == 1 && mp.counts.mem_load == 1 && mp.counts.fp64_fma == 1
+        @test mp.opcodes["STL.64"] == 1 && mp.coverage == 1.0
+        @test mp.hot_loop.header == ".L_x_0" && mp.hot_loop.total == 5
+    end
+
     @testset "atomic-expansion fallback blocks (AMD): counted apart, not as memory traffic" begin
         # The shape LLVM emits for `atomicrmw` on a generic pointer: a global path (flat_atomic
         # cmpswap loop), a private path (scratch load/store) and a shared path (ds_*), selected by
