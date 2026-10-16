@@ -1,7 +1,7 @@
 name = "GPUDiagnostics"
 uuid = "5ccc9b3c-1187-41e2-9266-b19f02873332"
-authors = ["Sebastian Micluța-Câmpeanu <sebastian.mc95@proton.me> and contributors"]
 version = "0.4.3"
+authors = ["Sebastian Micluța-Câmpeanu <sebastian.mc95@proton.me> and contributors"]
 
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
@@ -17,9 +17,6 @@ CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 GPUCompiler = "61eb1bfa-7361-4325-ad38-22787b887f55"
 LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
 
-# GPUCompiler and LLVM are always loaded whenever a vendor package is, so listing them as triggers
-# costs nothing at runtime and lets the extensions `using` them explicitly instead of reaching
-# through `AMDGPU.GPUCompiler` / `CUDACore.LLVM` (private bindings).
 [extensions]
 GPUDiagnosticsAMDGPUExt = ["AMDGPU", "GPUCompiler", "LLVM"]
 GPUDiagnosticsCUDAExt = ["CUDA", "GPUCompiler", "LLVM"]
@@ -31,7 +28,7 @@ Aqua = "0.8"
 CUDA = "6"
 GPUCompiler = "2"
 KernelAbstractions = "0.9.41"
-LLVM = "9"
+LLVM = "9, 10"
 LinearAlgebra = "1.10"
 Statistics = "1"
 TOML = "1"
