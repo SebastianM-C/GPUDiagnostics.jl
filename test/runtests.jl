@@ -358,8 +358,10 @@ end
 
         # static workgroup size from a KA kernel signature (what mkcontext + StaticSize produce)
         CI1 = CartesianIndices{1, Tuple{Base.OneTo{Int}}}
-        ctx(W) = KA.CompilerMetadata{KA.NDIteration.DynamicSize, KA.NDIteration.DynamicCheck, Nothing, CI1,
-            KA.NDIteration.NDRange{1, KA.NDIteration.DynamicSize, W, CI1, Nothing}}
+        # KA 0.10 appended type parameters (CompilerMetadata: Launch, Subgroups; NDRange: Mapping); fill them with Nothing
+        concrete(T, ps...) = T{ps..., ntuple(_ -> Nothing, length(Base.unwrap_unionall(T).parameters) - length(ps))...}
+        ctx(W) = concrete(KA.CompilerMetadata, KA.NDIteration.DynamicSize, KA.NDIteration.DynamicCheck, Nothing, CI1,
+            concrete(KA.NDIteration.NDRange, 1, KA.NDIteration.DynamicSize, W, CI1, Nothing))
         @test _static_workgroup_size(Tuple{ctx(KA.NDIteration.StaticSize{(256,)}), Int}) == 256
         @test _static_workgroup_size(Tuple{ctx(KA.NDIteration.StaticSize{(16, 16)}), Int}) == 256
         @test _static_workgroup_size(Tuple{ctx(KA.NDIteration.DynamicSize), Int}) === nothing

@@ -212,7 +212,7 @@ function host_snapshot(backend::Union{Nothing, Backend} = nothing)
     kern = something(_read_or_nothing("/proc/sys/kernel/osrelease"), string(Sys.KERNEL))
     return HostSnapshot(string(VERSION), nt, blas, Sys.CPU_THREADS, quota, Int(Sys.total_memory()), Int(Sys.free_memory()),
         _cgroup_memory_limit(), string(Sys.KERNEL), kern, gethostname(),
-        backend === nothing ? "" : string(nameof(typeof(backend))),
+        backend === nothing ? "" : _backend_name(backend),
         haskey(vv, :driver) ? string(vv.driver) : missing, haskey(vv, :runtime) ? string(vv.runtime) : missing, modver,
         haskey(vv, :package) ? string(vv.package) : missing, pkgs, warnings)
 end

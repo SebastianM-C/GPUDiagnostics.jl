@@ -84,8 +84,13 @@ struct BackendUnsupported <: Exception
     entry::Symbol
 end
 
+# The backend's type name for messages and reports. KA ≥ 0.10 makes `CPU` an alias for
+# `POCLBackend`; keep reporting it as "CPU" so stored manifests stay comparable across versions.
+_backend_name(backend) = string(nameof(typeof(backend)))
+_backend_name(::KA.CPU) = "CPU"
+
 function Base.showerror(io::IO, e::BackendUnsupported)
-    T = string(nameof(typeof(e.backend)))
+    T = _backend_name(e.backend)
     print(io, e.entry, ": ", T, " does not support :", e.feature)
     e.feature in FEATURES || print(io, " (not a GPUDiagnostics feature; see FEATURES)")
     pkg = get(BACKEND_PROVIDERS, T, nothing)
