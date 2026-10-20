@@ -17,9 +17,6 @@ CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 GPUCompiler = "61eb1bfa-7361-4325-ad38-22787b887f55"
 LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
 
-# GPUCompiler and LLVM are always loaded whenever a vendor package is, so listing them as triggers
-# costs nothing at runtime and lets the extensions `using` them explicitly instead of reaching
-# through `AMDGPU.GPUCompiler` / `CUDACore.LLVM` (private bindings).
 [extensions]
 GPUDiagnosticsAMDGPUExt = ["AMDGPU", "GPUCompiler", "LLVM"]
 GPUDiagnosticsCUDAExt = ["CUDA", "GPUCompiler", "LLVM"]
