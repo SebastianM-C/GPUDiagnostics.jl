@@ -23,3 +23,11 @@ Validates the RDNA entries of the SQ layout table: `sq_cycle_unit = 1` keeps res
 0.89 of the dispatch, and `SQ_INSTS_VALU × 32 / slots` is 1.0001 per FMA. `SQ_WAVES` reads
 116097 instead of 8192 on the last dispatch — a counter glitch observed in three of five W7900
 collections, always on one dispatch.
+
+## `mi350x_*` — gfx950 (MI350X, two-socket EPYC host), rocprofv3 1.4.1 / ROCm 10.1.0
+
+`test/gpu/counter_probe.jl` under the rocprofv3 shipped in AMDGPU.jl 2.12's ROCm artifact, with
+`--pmc SQ_WAVES`: three 4096-work-item dispatches of 64 waves. The agent info lists both CPU
+sockets first, so the GPU's `Node_Id` (4) differs from its `Logical_Node_Id` (2), and the
+collection's `Agent_Id` (`Agent 2`) is the logical one. CPU names, PCI location, DRM minor,
+device / GPU / hive ids, capability and firmware fields are zeroed; process ids are replaced.

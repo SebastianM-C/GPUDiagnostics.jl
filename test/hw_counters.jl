@@ -46,6 +46,13 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
     @test hw_counter_derived(varied)["amd_insts_per_slot_vmem_rd"][2] ≈ derived["amd_insts_per_slot_vmem_rd"][2] / 2
     @test !haskey(hw_counter_summary(varied), "slots")
 
+    # rocprofv3 1.4 (ROCm 10.1) on a two-socket MI350X host: `Agent 2` is the GPU's
+    # Logical_Node_Id; its Node_Id is 4 (the CPUs take 0 and 1)
+    m350 = hw_counters(fx; name = "mi350x")
+    d350 = first(m350.dispatches).device
+    @test d350["architecture"] == "gfx950" && d350["wave_size"] == 64 && d350["n_cu"] == 256 && d350["n_xcd"] == 8
+    @test m350["SQ_WAVES"] == [64.0, 64.0, 64.0]
+
     l1 = hw_counters(fx; name = "c2a")
     e = hw_counter_derived(l1)
     @test e["amd_td_busy"] ≈ l1["TD_TD_BUSY_sum"] ./ (l1["GRBM_GUI_ACTIVE"] ./ 8 .* 304)

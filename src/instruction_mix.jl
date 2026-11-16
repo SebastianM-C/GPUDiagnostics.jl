@@ -793,10 +793,9 @@ const IRCounts = NamedTuple{IR_CLASSES, NTuple{length(IR_CLASSES), Int}}
 # Walk an LLVM module (`L` = the LLVM.jl module binding) → per-function IRCounts.
 function _ir_counts(L::Module, mod)
     API = L.API
-    # LLVM.jl names the type structs LLVMDouble/LLVMFloat/LLVMHalf/LLVMBFloat (DoubleType() etc. are constructors)
-    isdouble(t) = t isa L.LLVMDouble || (t isa L.VectorType && eltype(t) isa L.LLVMDouble)
-    isfp(t) = t isa L.LLVMFloat || t isa L.LLVMHalf || t isa L.LLVMBFloat || t isa L.LLVMDouble ||
-        (t isa L.VectorType && isfp(eltype(t)))
+    # LLVM.jl ≥ 10 names the type structs DoubleType/FloatType/HalfType/BFloatType, under FloatingPointType
+    isdouble(t) = t isa L.DoubleType || (t isa L.VectorType && eltype(t) isa L.DoubleType)
+    isfp(t) = t isa L.FloatingPointType || (t isa L.VectorType && isfp(eltype(t)))
     first_operand_type(inst) = L.value_type(first(L.operands(inst)))
     fp_arith = Dict(API.LLVMFAdd => :add, API.LLVMFSub => :add, API.LLVMFMul => :mul, API.LLVMFDiv => :div,
         API.LLVMFRem => :intrinsic, API.LLVMFNeg => :neg)

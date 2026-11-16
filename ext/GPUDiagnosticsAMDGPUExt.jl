@@ -233,7 +233,11 @@ function _mix_job(ck::GD.CompiledKernel{<:RecordedKernel}, target)
     features = (isempty(features) ? "" : features * ",") *
         (wave64 ? "-wavefrontsize32,+wavefrontsize64" : "+wavefrontsize32,-wavefrontsize64")
     tgt = _GPUC.GCNCompilerTarget(; dev_isa, features)
-    params = AMDGPU.Compiler.HIPCompilerParams(wave64, true)
+    # the recorded job's own params (fp-atomics, memory assumptions, waves per EU, … — the set
+    # grows across AMDGPU versions) with only the wavefront size switched to the target's
+    p = job.config.params
+    P = typeof(p)
+    params = P((f === :wavefrontsize64 ? wave64 : getfield(p, f) for f in fieldnames(P))...)
     config = _GPUC.CompilerConfig(tgt, params; kernel = true, always_inline = true)
     return _GPUC.CompilerJob(job.source, config), dev_isa
 end

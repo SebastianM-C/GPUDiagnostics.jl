@@ -18,10 +18,11 @@ module FakeLLVM
         LLVMCanValueUseFastMathFlags(i) = Int(getfield(i, :op) in (LLVMFAdd, LLVMFSub, LLVMFMul, LLVMFDiv))
     end
     abstract type LLVMType end
-    struct LLVMDouble <: LLVMType end
-    struct LLVMFloat <: LLVMType end
-    struct LLVMHalf <: LLVMType end
-    struct LLVMBFloat <: LLVMType end
+    abstract type FloatingPointType <: LLVMType end   # LLVM.jl ≥ 10 type names
+    struct DoubleType <: FloatingPointType end
+    struct FloatType <: FloatingPointType end
+    struct HalfType <: FloatingPointType end
+    struct BFloatType <: FloatingPointType end
     struct IntType <: LLVMType end
     struct VectorType <: LLVMType; el::LLVMType; end
     Base.eltype(t::VectorType) = t.el
@@ -826,7 +827,7 @@ end
         # the extensions); the same duck-typed surface is provided here by a tiny stand-in so the
         # walker's typing logic (double vs float by operand type, intrinsics by name) is CPU-tested.
         Fake = FakeLLVM
-        dbl, flt, i64 = Fake.LLVMDouble(), Fake.LLVMFloat(), Fake.IntType()
+        dbl, flt, i64 = Fake.DoubleType(), Fake.FloatType(), Fake.IntType()
         v2d = Fake.VectorType(dbl)
         fma64 = Fake.Function("llvm.fma.f64", true); sqrt64 = Fake.Function("llvm.sqrt.f64", true)
         fabs64 = Fake.Function("llvm.fabs.f64", true); fma32 = Fake.Function("llvm.fma.f32", true)
@@ -858,10 +859,10 @@ end
         # `contract`-flagged double fmul/fadd (what `muladd` lowers to) are counted separately and
         # not added to the fp64 total
         fc = FakeLLVM.Function("k", false, [FakeLLVM.Block([
-            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.LLVMDouble(), []; contract = true),
-            FakeLLVM.Inst(FakeLLVM.API.LLVMFAdd, FakeLLVM.LLVMDouble(), []; contract = true),
-            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.LLVMDouble(), []),
-            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.LLVMFloat(), []; contract = true)])])
+            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.DoubleType(), []; contract = true),
+            FakeLLVM.Inst(FakeLLVM.API.LLVMFAdd, FakeLLVM.DoubleType(), []; contract = true),
+            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.DoubleType(), []),
+            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.FloatType(), []; contract = true)])])
         cc = _ir_counts(FakeLLVM, FakeLLVM.Module([fc]))["k"]
         @test cc.fp64_mul == 2 && cc.fp64_add == 1 && cc.fp64_contract == 2 && cc.fp32 == 1
         @test :fp64_contract ∉ IR_FP64_CLASSES
