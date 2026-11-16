@@ -108,11 +108,11 @@ function conformance(backend; kernel = nothing, peak_threads = 2^12)
 
         @testset ":kernel_inventory" begin
             if has(:kernel_inventory)
-                ks = compiled_kernels(backend)
-                @test ks isa Vector{<:CompiledKernel}
-                @test compiled_kernels(backend; pattern = r"no such kernel \d{9}") |> isempty
+                ks = compiled_kernels(() -> nothing, backend)
+                @test ks isa Vector{<:CompiledKernel} && isempty(ks)     # nothing ran, nothing recorded
+                @test compiled_kernels(() -> nothing, backend; pattern = r"no such kernel \d{9}") |> isempty
             else
-                @test_throws BackendUnsupported compiled_kernels(backend)
+                @test_throws BackendUnsupported compiled_kernels(() -> nothing, backend)
             end
         end
 

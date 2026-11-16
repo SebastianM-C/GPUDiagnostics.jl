@@ -4,30 +4,33 @@
 # memory — decides how many waves the hardware can keep resident, i.e. the theoretical
 # occupancy, before a single launch runs. Neither KernelAbstractions nor the vendor packages
 # surface this for a kernel that has already been launched, and kernels are often closures
-# inside driver functions that never hand the kernel object out. Both CUDA.jl
-# and AMDGPU.jl, however, keep every compiled kernel instance of the process in a cache
-# (`_kernel_instances`, keyed by the Julia function + argument types), so the report is
-# built from an INVENTORY of what actually went to the GPU: no kernel is modified, wrapped or
-# recompiled, and the launch loop is untouched. The one vendor addition is the AMD ISA dump
-# (`code_native`, ~0.5 s), which carries the SGPR/VGPR/spill/scratch counts the HIP function
-# attributes do not expose.
+# inside driver functions that never hand the kernel object out. The vendor compilers do
+# report every kernel lookup to GPUCompiler's compile hook (the one `@device_code_*` uses),
+# so the report is built from a RECORDING: `compiled_kernels(f, backend)` runs `f` with a hook
+# installed and keeps the compiler jobs it saw, each with the function handle the runtime
+# linked for it. No kernel is modified or wrapped; while the hook is active the runtime skips
+# its fast lookup cache, so launches in `f` cost a cached-results lookup each, not a recompile.
+# (CUDA.jl ≥ 6.5 and AMDGPU.jl ≥ 2.11 keep no process-wide list of kernel objects to read
+# instead.) The one vendor addition is the AMD ISA dump (`code_native`, ~0.5 s), which
+# carries the SGPR/VGPR/spill/scratch counts the HIP function attributes do not expose.
 #
 # Identification: on Julia ≥ 1.12 a closure's type name embeds the enclosing function
 # (`var"#outer##0#outer##1"`), so the signature string of a `foreachindex`/`@kernel` launch
-# names the driver it came from; `compiled_kernels(backend; pattern = r"my_driver!")` picks it
+# names the driver it came from; `compiled_kernels(f, backend; pattern = r"my_driver!")` picks it
 # out. On Julia 1.10/1.11 closures are numbered (`var"#12#13"`) and the caller filters on the
 # kernel `name` or argument types instead.
 
 """
     CompiledKernel
 
-One entry of [`compiled_kernels`](@ref): a kernel this process compiled for the vendor
-runtime. `name` is the Julia function the kernel was generated from (`gpu__forindices_global!`
+One entry of [`compiled_kernels`](@ref): a kernel the recorded block compiled or launched on
+the vendor runtime. `name` is the Julia function the kernel was generated from (`gpu__forindices_global!`
 for an AcceleratedKernels `foreachindex`, `gpu_<kernel>` for a KernelAbstractions `@kernel`),
 `signature` the argument-type tuple as a string (closure types carry the enclosing function's
 name on Julia ≥ 1.12), `workgroup_size` the static KernelAbstractions workgroup size read from
-the signature (`nothing` when dynamic or not a KA kernel), and `kernel` the vendor kernel
-object (CUDA.jl `HostKernel`, AMDGPU.jl `HIPKernel`).
+the signature (`nothing` when dynamic or not a KA kernel), and `kernel` the extension's record
+of it, `RecordedKernel{F, TT}`: the GPUCompiler `job` the runtime compiled and the function
+handle `fun` (`CuFunction` / `HIPFunction`) it linked on the device the kernel ran on.
 """
 struct CompiledKernel{K}
     name::String
@@ -127,32 +130,42 @@ function Base.show(io::IO, ::MIME"text/plain", r::KernelResources)
     return nothing
 end
 
-"""    compiled_kernels(backend; pattern = nothing) -> Vector{CompiledKernel}
+"""
+    compiled_kernels(f, backend; pattern = nothing) -> Vector{CompiledKernel}
 
-Inventory of the kernels THIS PROCESS has compiled for `backend`'s vendor runtime, from the
-vendor package's kernel-instance cache (every `@cuda`/`@roc`/KernelAbstractions launch lands
-there on its first call). `pattern` (a `Regex` or `AbstractString`) keeps only entries whose
+Run `f()` and return the kernels it compiled or launched on `backend`'s vendor runtime, in
+the order they were first seen, one entry per kernel and device. A kernel compiled before the
+call counts as long as `f` launches it again: the record comes from the compiler's lookup, not
+from a fresh compile. `pattern` (a `Regex` or `AbstractString`) keeps only entries whose
 `name` or `signature` matches — the way to pick a production kernel that is a closure inside
-its driver: `compiled_kernels(backend; pattern = r"_my_driver!")`. The CPU backend compiles
-nothing and returns an empty vector. Pass entries to [`kernel_resources`](@ref)."""
-function compiled_kernels(backend::KA.Backend; pattern::Union{Regex, AbstractString, Nothing} = nothing)
+its driver:
+
+    cks = compiled_kernels(backend; pattern = r"_my_driver!") do
+        my_driver!(state)              # one step of the real workload is enough
+    end
+
+Tasks that `f` spawns are recorded too, as long as `f` waits for them. While `f` runs the
+runtime bypasses its fast kernel cache, so time a workload outside the block, not inside it.
+The CPU backend compiles nothing: `f` runs and the result is empty. Pass entries to
+[`kernel_resources`](@ref) or [`kernel_instruction_mix`](@ref)."""
+function compiled_kernels(f, backend::KA.Backend; pattern::Union{Regex, AbstractString, Nothing} = nothing)
     _require(backend, :kernel_inventory, :compiled_kernels)
-    ks = backend_compiled_kernels(backend)
+    ks = backend_record_kernels(f, backend)
     pattern === nothing && return ks
     return filter(k -> occursin(pattern, k.name) || occursin(pattern, k.signature), ks)
 end
 
-"""    backend_compiled_kernels(backend) -> Vector{CompiledKernel}
+"""    backend_record_kernels(f, backend) -> Vector{CompiledKernel}
 
-Backend hook (`:kernel_inventory`): every kernel this process has compiled for `backend`, from
-the vendor's kernel-instance cache, each wrapped with [`backend_wrap_kernel`](@ref).
-[`compiled_kernels`](@ref) filters over it."""
-backend_compiled_kernels(::KA.CPU) = CompiledKernel[]
-backend_compiled_kernels(b::KA.Backend) = throw(BackendUnsupported(b, :kernel_inventory, :compiled_kernels))
+Backend hook (`:kernel_inventory`): run `f()` and return every kernel it compiled or launched
+on `backend`, each wrapped with [`backend_wrap_kernel`](@ref). [`compiled_kernels`](@ref)
+filters over it."""
+backend_record_kernels(f, ::KA.CPU) = (f(); CompiledKernel[])
+backend_record_kernels(f, b::KA.Backend) = throw(BackendUnsupported(b, :kernel_inventory, :compiled_kernels))
 
 """
     kernel_resources(backend, ck::CompiledKernel; block_size = something(ck.workgroup_size, 256))
-    kernel_resources(backend, pattern; kwargs...) -> Vector
+    kernel_resources(f, backend; pattern = nothing, kwargs...) -> Vector
 
 Compile-time resource report of a compiled kernel (see [`compiled_kernels`](@ref)), and the
 theoretical occupancy the vendor runtime computes from it for a launch of `block_size`
@@ -175,7 +188,7 @@ Returns a [`KernelResources`](@ref) (registers, local/spill and shared memory, `
   inline them; compare `CUDABackend(always_inline = true)`). `ptxas_matches_attributes`
   says whether that regenerated compile reproduced the runtime's register count.
 
-The `pattern` form maps [`compiled_kernels`](@ref)`(backend; pattern)` through the report
+The `f` form maps [`compiled_kernels`](@ref)`(f, backend; pattern)` through the report
 (possibly empty). Nothing is launched; the AMD ISA dump and the NVIDIA PTX regeneration re-run
 the compiler for a few seconds.
 """
@@ -200,8 +213,8 @@ function kernel_resources(backend::KA.Backend, ck::CompiledKernel;
     return KernelResources(ck.name, ck.signature, Int(block_size), attrs.registers, attrs.local_mem_bytes,
         attrs.shared_mem_bytes, attrs.const_mem_bytes, attrs.max_threads_per_block, occupancy, isa)
 end
-kernel_resources(backend::KA.Backend, pattern::Union{Regex, AbstractString}; kwargs...) =
-    [kernel_resources(backend, ck; kwargs...) for ck in compiled_kernels(backend; pattern)]
+kernel_resources(f, backend::KA.Backend; pattern::Union{Regex, AbstractString, Nothing} = nothing, kwargs...) =
+    [kernel_resources(backend, ck; kwargs...) for ck in compiled_kernels(f, backend; pattern)]
 
 # The vendor runtimes report "not available" as a negative count (HIP's CONST_SIZE_BYTES is
 # −1); the API boundary says `missing`.
@@ -233,9 +246,9 @@ backend_kernel_isa_info(::KA.Backend, ck::CompiledKernel) = Dict{String, Any}()
 
 """    backend_wrap_kernel(kernel) -> CompiledKernel
 
-Build a [`CompiledKernel`](@ref) from a vendor kernel object of type `K{F, TT}` (both CUDA.jl
-and AMDGPU.jl parametrize their kernel struct by the Julia function type and the argument
-tuple type). A backend whose kernel type is shaped differently adds its own method."""
+Build a [`CompiledKernel`](@ref) from a kernel record of type `K{F, TT}`, parametrized by the
+Julia function type and the argument tuple type (the extensions' `RecordedKernel`, like the
+vendors' own kernel structs). A backend whose kernel type is shaped differently adds its own method."""
 function backend_wrap_kernel(kernel)
     F, TT = typeof(kernel).parameters[1], typeof(kernel).parameters[2]
     return CompiledKernel(string(nameof(F)), string(TT), _static_workgroup_size(TT), kernel)

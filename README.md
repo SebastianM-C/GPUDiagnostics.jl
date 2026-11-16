@@ -47,7 +47,7 @@ end
 
 timer                                           # per-device first / median / max launch seconds
 telem                                           # ticks, window, power / clock / occupancy means and busy medians
-ck = only(compiled_kernels(backend; pattern = r"my_kernel"))
+ck = only(compiled_kernels(() -> my_kernel!(backend)(first(work); ndrange = n), backend; pattern = r"my_kernel!"))
 kernel_resources(backend, ck)                   # registers, spills, LDS, theoretical occupancy
 m = kernel_instruction_mix(backend, ck)         # class × loop table; m.hot_loop is the per-slot floor
 fp64_issue_floor(m; n_slots, peak_fp64_flops = measure_peak_flops(backend), kernel_time_s = median_launch_s)

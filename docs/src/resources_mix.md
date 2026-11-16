@@ -1,7 +1,9 @@
 # Resource report and instruction mix
 
 ```julia
-cks = compiled_kernels(backend; pattern = r"_my_driver!")   # kernels this process compiled
+cks = compiled_kernels(backend; pattern = r"_my_driver!") do   # kernels this block compiled or launched
+    my_driver!(state)
+end
 r = kernel_resources(backend, only(cks))                    # at the kernel's static workgroup size
 r.registers, r.local_mem_bytes, r.shared_mem_bytes           # per-thread regs, spill/stack bytes, LDS/block (missing if unreported)
 r.occupancy.active_blocks_per_sm, r.occupancy.fraction       # the runtime's occupancy calculator (missing without one)
@@ -9,9 +11,11 @@ r.isa                                                        # AMD: sgpr/vgpr/sp
 r                                                            # prints as a small table
 ```
 
-Both vendor packages cache every kernel instance the process compiles, so the inventory reaches
-kernels that are closures inside driver functions (an AcceleratedKernels `foreachindex` body, say)
-without wrapping, recompiling or modifying them; on Julia ≥ 1.12 the closure type carries the
+Both vendor compilers report every kernel lookup to GPUCompiler's compile hook (the one the
+`@device_code_*` macros use), so recording a block reaches kernels that are closures inside driver
+functions (an AcceleratedKernels `foreachindex` body, say) without wrapping, recompiling or modifying
+them. A kernel compiled before the block is recorded as long as the block launches it again. While the
+block runs, the runtime bypasses its fast kernel cache, so time the workload outside it. on Julia ≥ 1.12 the closure type carries the
 enclosing function's name, which is what `pattern` matches. `shared_mem_bytes` is what the kernel
 descriptor *reserves* — LLVM's AMDGPU backend promotes private arrays it cannot keep in registers
 to LDS, sized for the kernel's maximum block size, and that reservation, not the source, is what

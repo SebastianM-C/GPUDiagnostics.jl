@@ -350,11 +350,13 @@ end
 
     @testset "compile-time resource report" begin
         # CPU backend compiles nothing; vendor-less backends error
-        @test compiled_kernels(CPU()) == CompiledKernel[]
-        @test isempty(compiled_kernels(CPU(); pattern = r"anything"))
-        @test kernel_resources(CPU(), r"anything") == []
+        ran = Ref(0)
+        @test compiled_kernels(() -> ran[] += 1, CPU()) == CompiledKernel[] && ran[] == 1   # f runs, nothing recorded
+        @test isempty(compiled_kernels(() -> nothing, CPU(); pattern = r"anything"))
+        @test kernel_resources(() -> nothing, CPU(); pattern = r"anything") == []
         @test_throws BackendUnsupported kernel_resources(CPU(), CompiledKernel("k", "sig", 256, nothing))
-        @test_throws BackendUnsupported compiled_kernels(NoVendorBackend())
+        @test_throws BackendUnsupported compiled_kernels(() -> ran[] += 1, NoVendorBackend())
+        @test ran[] == 1                                # an unsupported backend does not run f
 
         # static workgroup size from a KA kernel signature (what mkcontext + StaticSize produce)
         CI1 = CartesianIndices{1, Tuple{Base.OneTo{Int}}}
@@ -444,15 +446,16 @@ end
         for f in (:kernel_inventory, :resources, :occupancy)
             @eval GPUDiagnostics.supports(::FakeGPU, ::Val{$(QuoteNode(f))}) = true
         end
-        GPUDiagnostics.backend_compiled_kernels(::FakeGPU) = [ck]
+        GPUDiagnostics.backend_record_kernels(f, ::FakeGPU) = (f(); [ck])
         GPUDiagnostics.backend_kernel_attributes(::FakeGPU, k::FakeKernel) =
             (; registers = 123, local_mem_bytes = 584, shared_mem_bytes = 65536, const_mem_bytes = -1, max_threads_per_block = 1024)
         GPUDiagnostics.backend_kernel_occupancy(::FakeGPU, k::FakeKernel, block_size::Int) =
             (; active_blocks_per_sm = min(65536 ÷ 65536, 2048 ÷ block_size), warp_size = 32, max_threads_per_sm = 2048, shared_mem_per_sm = 65536)
         GPUDiagnostics.backend_kernel_isa_info(::FakeGPU, c::CompiledKernel{<:FakeKernel}) = Dict{String, Any}("vgpr_count" => 123)
-        @test length(compiled_kernels(FakeGPU())) == 1
-        @test length(compiled_kernels(FakeGPU(); pattern = "StaticSize")) == 1
-        @test isempty(compiled_kernels(FakeGPU(); pattern = r"no such kernel"))
+        @test length(compiled_kernels(() -> nothing, FakeGPU())) == 1
+        @test length(compiled_kernels(() -> nothing, FakeGPU(); pattern = "StaticSize")) == 1
+        @test isempty(compiled_kernels(() -> nothing, FakeGPU(); pattern = r"no such kernel"))
+        @test only(kernel_resources(() -> nothing, FakeGPU(); pattern = "StaticSize")).registers == 123
         r = kernel_resources(FakeGPU(), ck)
         @test r.block_size == 128                      # defaults to the static workgroup size
         @test r.registers == 123 && r.local_mem_bytes == 584 && r.shared_mem_bytes == 65536
@@ -483,7 +486,7 @@ end
         GPUDiagnostics.backend_kernel_occupancy(::FakeZeroCapGPU, k::FakeKernel, block_size::Int) =
             (; active_blocks_per_sm = 0, warp_size = 32, max_threads_per_sm = 0, shared_mem_per_sm = 0)
         @test ismissing(kernel_resources(FakeZeroCapGPU(), ck).occupancy)
-        @test length(kernel_resources(FakeGPU(), "StaticSize")) == 1
+        @test length(kernel_resources(() -> nothing, FakeGPU(); pattern = "StaticSize")) == 1
     end
 
     @testset "static instruction mix: classifiers, parsers, loop nest, FP64 floor" begin

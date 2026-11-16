@@ -52,11 +52,27 @@ end
     n = 2^16
     x = Adapt.adapt(backend, rand(Float64, n))
     out = Adapt.adapt(backend, zeros(Float64, n))
-    gpudiag_probe_kernel!(backend, 256)(out, x, Int32(100); ndrange = n)
-    KernelAbstractions.synchronize(backend)
-    cks = compiled_kernels(backend; pattern = r"gpudiag_probe_kernel")
+    launch() = (gpudiag_probe_kernel!(backend, 256)(out, x, Int32(100); ndrange = n); KernelAbstractions.synchronize(backend))
+    cks = compiled_kernels(launch, backend; pattern = r"gpudiag_probe_kernel")   # first compile, recorded
     @test length(cks) == 1
     ck = only(cks)
+    @testset "recording" begin
+        again = compiled_kernels(launch, backend)      # already compiled: recorded from the cached lookup
+        @test length(again) == 1 && only(again).name == ck.name && only(again).kernel.fun === ck.kernel.fun
+        @test isempty(compiled_kernels(() -> nothing, backend))
+        @test ck.workgroup_size == 256
+        both = compiled_kernels(backend) do            # two signatures in one block, each once
+            launch(); launch()
+            gpudiag_probe_kernel!(backend, 128)(out, x, Int32(100); ndrange = n)
+            KernelAbstractions.synchronize(backend)
+        end
+        @test length(both) == 2 && sort([k.workgroup_size for k in both]) == [128, 256]
+        @test length(kernel_resources(launch, backend; pattern = r"gpudiag_probe_kernel")) == 1
+        spawned = compiled_kernels(backend) do         # a task spawned (and awaited) inside f is recorded
+            wait(Threads.@spawn launch())
+        end
+        @test length(spawned) == 1
+    end
 
     conformance(backend; kernel = ck)
 

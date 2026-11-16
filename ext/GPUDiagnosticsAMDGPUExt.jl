@@ -117,15 +117,53 @@ function GD.gpu_sampler_sources(::ROCBackend, device_ids::AbstractVector{<:Integ
 end
 
 # ── Compile-time resource report (src/resources.jl hooks) ───────────────────────────────────
-# Inventory = AMDGPU.jl's compiled-kernel cache (one HIPKernel per compiled function × argument
-# types × device). Attributes come from the driver-API `hipFuncGetAttribute` on the module
-# function (the runtime-API `hipFuncGetAttributes` only knows host stubs); NUM_REGS is the VGPR
-# count. Occupancy from `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` (a "multiprocessor"
-# is what HIP calls one — a WGP on RDNA3, a CU on CDNA), capacities from the CURRENT device's
-# properties. The ISA dump (`code_native`, ~0.5 s, no launch) adds the SGPR/VGPR/spill/scratch
+# Recording = GPUCompiler's compile hook around `f`: AMDGPU.jl reports every kernel lookup to it
+# (`compile_or_lookup`), with the active device. Afterwards the compiled results of each job
+# are read back from GPUCompiler's cache, and the `HIPFunction` the runtime linked for that
+# device is taken from them: nothing is compiled or linked here. Attributes come from the
+# driver-API `hipFuncGetAttribute` on the module function (the runtime-API
+# `hipFuncGetAttributes` only knows host stubs); NUM_REGS is the VGPR count. Occupancy from
+# `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` (a "multiprocessor" is what HIP calls
+# one — a WGP on RDNA3, a CU on CDNA), capacities from the CURRENT device's properties. The ISA
+# dump (`code_native` of the recorded job, ~0.5 s, no launch) adds the SGPR/VGPR/spill/scratch
 # figures and the compiler's own occupancy estimate, which the HIP attributes do not expose.
-GD.backend_compiled_kernels(::ROCBackend) = Base.@lock AMDGPU.Compiler.hipfunction_lock begin
-    [GD.backend_wrap_kernel(k) for k in values(AMDGPU.Compiler._kernel_instances) if k isa AMDGPU.Runtime.HIPKernel]
+
+"""
+    RecordedKernel{F, TT}
+
+A kernel recorded by `compiled_kernels(f, ::ROCBackend)`: the `job` AMDGPU.jl compiled for the
+Julia function type `F` and argument types `TT`, and the `HIPFunction` `fun` it linked.
+"""
+struct RecordedKernel{F, TT}
+    job::GPUCompiler.CompilerJob
+    fun::AMDGPU.HIP.HIPFunction
+end
+
+function _job_signature(job)
+    sig = Base.unwrap_unionall(job.source.specTypes)
+    return sig.parameters[1], Tuple{sig.parameters[2:end]...}
+end
+
+function GD.backend_record_kernels(f, ::ROCBackend)
+    seen = Tuple{GPUCompiler.CompilerJob, AMDGPU.HIP.HIPDevice}[]
+    lk = ReentrantLock()
+    hook(job) = job.config.kernel && Base.@lock lk begin
+        key = (job, AMDGPU.device())
+        key in seen || push!(seen, key)
+    end
+    GPUCompiler.with_compile_hook(f, hook)
+    out = GD.CompiledKernel[]
+    Base.@lock AMDGPU.Compiler.hipfunction_lock begin
+        for (job, dev) in seen
+            res = GPUCompiler.cached_results(AMDGPU.Compiler.HIPResults, job)
+            res === nothing && continue
+            i = findfirst(e -> e[1] == dev, res.functions)
+            i === nothing && continue      # looked up but never linked here (reflection only)
+            F, TT = _job_signature(job)
+            push!(out, GD.backend_wrap_kernel(RecordedKernel{F, TT}(job, res.functions[i][2])))
+        end
+    end
+    return out
 end
 
 function _hip_func_attr(fun::AMDGPU.HIP.HIPFunction, attr)
@@ -134,7 +172,7 @@ function _hip_func_attr(fun::AMDGPU.HIP.HIPFunction, attr)
     return Int(v[])
 end
 
-function GD.backend_kernel_attributes(::ROCBackend, k::AMDGPU.Runtime.HIPKernel)
+function GD.backend_kernel_attributes(::ROCBackend, k::RecordedKernel)
     HIP = AMDGPU.HIP
     a(attr) = _hip_func_attr(k.fun, attr)
     return (;
@@ -146,7 +184,7 @@ function GD.backend_kernel_attributes(::ROCBackend, k::AMDGPU.Runtime.HIPKernel)
     )
 end
 
-function GD.backend_kernel_occupancy(::ROCBackend, k::AMDGPU.Runtime.HIPKernel, block_size::Int)
+function GD.backend_kernel_occupancy(::ROCBackend, k::RecordedKernel, block_size::Int)
     nb = Ref{Cint}(0)
     AMDGPU.HIP.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(nb, k.fun, block_size, 0)
     dev = AMDGPU.device()
@@ -159,12 +197,10 @@ function GD.backend_kernel_occupancy(::ROCBackend, k::AMDGPU.Runtime.HIPKernel, 
     )
 end
 
-function GD.backend_kernel_isa_info(::ROCBackend, ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel})
-    k = ck.kernel
-    TT = typeof(k).parameters[2]
+function GD.backend_kernel_isa_info(::ROCBackend, ck::GD.CompiledKernel{<:RecordedKernel})
     try
         io = IOBuffer()
-        AMDGPU.code_native(io, k.f, TT; kernel = true, raw = true)
+        GPUCompiler.code_native(io, ck.kernel.job; raw = true)
         return GD._parse_amdgpu_kernel_info(String(take!(io)))
     catch err
         @warn "kernel_resources: AMD ISA dump failed — reporting HIP attributes only" exception = err
@@ -189,13 +225,9 @@ const _GPUC = GPUCompiler
 _wave64_default(dev_isa::AbstractString) = startswith(dev_isa, "gfx9")   # GCN/CDNA are wave64-only; HIP compiles RDNA wave32
 
 # The CompilerJob of `ck` for `target` (nothing = the current device's own config) and its ISA name.
-function _mix_job(ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel}, target)
-    k = ck.kernel
-    TT = typeof(k).parameters[2]
-    if target === nothing
-        config = AMDGPU.Compiler.compiler_config(AMDGPU.device(); kernel = true)
-        return _GPUC.CompilerJob(_GPUC.methodinstance(typeof(k.f), TT), config), _gfx_name()
-    end
+function _mix_job(ck::GD.CompiledKernel{<:RecordedKernel}, target)
+    job = ck.kernel.job
+    target === nothing && return job, _gfx_name()
     dev_isa, features = AMDGPU.Compiler.parse_llvm_features(String(target))
     wave64 = _wave64_default(dev_isa)
     features = (isempty(features) ? "" : features * ",") *
@@ -203,7 +235,7 @@ function _mix_job(ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel}, target)
     tgt = _GPUC.GCNCompilerTarget(; dev_isa, features)
     params = AMDGPU.Compiler.HIPCompilerParams(wave64, true)
     config = _GPUC.CompilerConfig(tgt, params; kernel = true, always_inline = true)
-    return _GPUC.CompilerJob(_GPUC.methodinstance(typeof(k.f), TT), config), dev_isa
+    return _GPUC.CompilerJob(job.source, config), dev_isa
 end
 
 # Run `f()` with the OCLC ISA-version cache entry evicted (cross-target compiles only).
@@ -221,7 +253,7 @@ function _with_target_libs(f, native::Bool)
     end
 end
 
-function GD.backend_kernel_machine_code(::ROCBackend, ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel}, target)
+function GD.backend_kernel_machine_code(::ROCBackend, ck::GD.CompiledKernel{<:RecordedKernel}, target)
     job, isa = _mix_job(ck, target)
     io = IOBuffer()
     _with_target_libs(target === nothing) do
@@ -237,7 +269,7 @@ function _isa_vgprs(text::AbstractString)
 end
 
 # Typed IR count: the optimized module of the same job, walked with AMDGPU's LLVM.jl.
-function GD.backend_kernel_ir_counts(::ROCBackend, ck::GD.CompiledKernel{<:AMDGPU.Runtime.HIPKernel}, target)
+function GD.backend_kernel_ir_counts(::ROCBackend, ck::GD.CompiledKernel{<:RecordedKernel}, target)
     job, isa = _mix_job(ck, target)
     functions = _with_target_libs(target === nothing) do
         _GPUC.JuliaContext() do ctx
