@@ -201,60 +201,116 @@ function _gpm_metrics!(buf::Vector{UInt8}, older::NVML.nvmlGpmSample_t, newer::N
 end
 
 # ── Compile-time resource report (src/resources.jl hooks) ───────────────────────────────────
-# Inventory = the compiled-kernel cache of CUDA.jl's compiler (CUDACore from CUDA 6.3; the
-# same names live in CUDA itself before the split). Attributes via the public `registers` /
-# `memory` / `maxthreads` accessors (cuFuncGetAttribute underneath), occupancy via the driver's
-# `cuOccupancyMaxActiveBlocksPerMultiprocessor`, capacities from the CURRENT device.
-const _CC = isdefined(CUDA, :CUDACore) ? CUDA.CUDACore : CUDA
+# Recording = GPUCompiler's compile hook around `f`: CUDACore reports every kernel lookup to it
+# (`compile_or_lookup`, under `cufunction_lock`), with the active context. Afterwards the
+# compiled results of each job are read back from GPUCompiler's cache, and the `CuFunction` the
+# runtime linked for that context is taken from them: nothing is compiled or linked here.
+# Attributes come from `cuFuncGetAttribute` on that function, occupancy from the driver's
+# `cuOccupancyMaxActiveBlocksPerMultiprocessor`, capacities from the device of the context the
+# kernel was linked in; every query runs with that context active.
+const _CC = CUDA.CUDACore
 
-GD.backend_compiled_kernels(::CUDABackend) = Base.@lock _CC.cufunction_lock begin
-    [GD.backend_wrap_kernel(k) for k in values(_CC._kernel_instances) if k isa CUDA.HostKernel]
+"""
+    RecordedKernel{F, TT}
+
+A kernel recorded by `compiled_kernels(f, ::CUDABackend)`: the `job` CUDA.jl compiled for the
+Julia function type `F` and argument types `TT`, the `CuFunction` `fun` it linked, and the
+context `ctx` it was linked in (one entry per kernel and context; `CUDA.device(ctx)` tells the
+entries of a multi-GPU recording apart).
+"""
+struct RecordedKernel{F, TT}
+    job::GPUCompiler.CompilerJob
+    fun::CUDA.CuFunction
+    ctx::CUDA.CuContext
 end
 
-function GD.backend_kernel_attributes(::CUDABackend, k::CUDA.HostKernel)
-    mem = CUDA.memory(k)   # (local, shared, constant) bytes; `local` is a keyword → positional
+function _job_signature(job)
+    sig = Base.unwrap_unionall(job.source.specTypes)
+    return sig.parameters[1], Tuple{sig.parameters[2:end]...}
+end
+
+function GD.backend_record_kernels(f, ::CUDABackend)
+    seen = Tuple{GPUCompiler.CompilerJob, CUDA.CuContext}[]
+    lk = ReentrantLock()
+    # Only CUDA kernel jobs: the hook also sees CUDACore's deferred (non-kernel) jobs and, with
+    # several GPU packages loaded, other back-ends' jobs.
+    function hook(job)
+        job isa GPUCompiler.CompilerJob && job.config.target isa GPUCompiler.PTXCompilerTarget &&
+            job.config.kernel || return
+        Base.@lock lk begin
+            key = (job, CUDA.context())
+            key in seen || push!(seen, key)
+        end
+        return
+    end
+    GPUCompiler.with_compile_hook(f, hook)
+    recorded = Base.@lock lk copy(seen)   # a task `f` did not wait for may still report
+    out = GD.CompiledKernel[]
+    Base.@lock _CC.cufunction_lock begin
+        for (job, ctx) in recorded
+            res = GPUCompiler.cached_results(_CC.CUDACompilerResults, job)
+            res === nothing && continue
+            i = findfirst(e -> e[1] === ctx, res.kernels)
+            i === nothing && continue      # never linked in this context (reflection only)
+            fun = res.kernels[i][2]
+            # the job key includes the world age, so the same kernel looked up in two worlds
+            # (an eval or package load inside `f`) resolves to the same function twice
+            any(o -> o.kernel.fun === fun, out) && continue
+            F, TT = _job_signature(job)
+            push!(out, GD.backend_wrap_kernel(RecordedKernel{F, TT}(job, fun, ctx)))
+        end
+    end
+    return out
+end
+
+_fattr(k::RecordedKernel, a) = CUDA.context!(() -> Int(CUDA.attributes(k.fun)[a]), k.ctx)
+
+function GD.backend_kernel_attributes(::CUDABackend, k::RecordedKernel)
     return (;
-        registers = Int(CUDA.registers(k)),
-        local_mem_bytes = Int(mem[1]),
-        shared_mem_bytes = Int(mem.shared),
-        const_mem_bytes = Int(mem.constant),
-        max_threads_per_block = Int(CUDA.maxthreads(k)),
+        registers = _fattr(k, CUDA.FUNC_ATTRIBUTE_NUM_REGS),
+        local_mem_bytes = _fattr(k, CUDA.FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+        shared_mem_bytes = _fattr(k, CUDA.FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
+        const_mem_bytes = _fattr(k, CUDA.FUNC_ATTRIBUTE_CONST_SIZE_BYTES),
+        max_threads_per_block = _fattr(k, CUDA.FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK),
     )
 end
 
-function GD.backend_kernel_occupancy(::CUDABackend, k::CUDA.HostKernel, block_size::Int)
-    dev = CUDA.device()
-    return (;
-        active_blocks_per_sm = Int(CUDA.active_blocks(k.fun, block_size)),
-        warp_size = Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_WARP_SIZE)),
-        max_threads_per_sm = Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)),
-        shared_mem_per_sm = Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)),
-    )
+function GD.backend_kernel_occupancy(::CUDABackend, k::RecordedKernel, block_size::Int)
+    return CUDA.context!(k.ctx) do
+        dev = CUDA.device(k.ctx)
+        (;
+            active_blocks_per_sm = Int(CUDA.active_blocks(k.fun, block_size)),
+            warp_size = Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_WARP_SIZE)),
+            max_threads_per_sm = Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)),
+            shared_mem_per_sm = Int(CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)),
+        )
+    end
 end
 
 # PTX / SASS binary versions the kernel was built for, plus the `ptxas --verbose` report of a
 # regenerated compile. The driver attribute `local_mem_bytes` lumps the call-ABI stack frame
 # (arguments/returns of device functions Julia did not inline, private arrays) together with
 # true register spills; only ptxas separates them, and it also names every function it
-# assembled out of line. CUDA.jl ships ptxas (CUDA_Compiler_jll) and compiles through it, so
-# the same binary is run here on the module PTX generated with the kernel's own options
-# (`always_inline` from the backend, `maxthreads` = the static KA workgroup size); the register
+# assembled out of line. CUDA.jl compiles through the ptxas of `CUDACore.CUDA_Compiler` (the
+# bundled CUDA_Compiler_jll, or the local toolkit under the `local` preference), so that same
+# binary is run here on the module PTX of the recorded job (the options the runtime
+# compiled with: `always_inline`, `maxthreads` = the static KA workgroup size); the register
 # count is checked against the runtime attribute so a mismatched regeneration is flagged, not
 # trusted. Costs a few seconds of compiler time; nothing is launched.
-function GD.backend_kernel_isa_info(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel})
+function GD.backend_kernel_isa_info(::CUDABackend, ck::GD.CompiledKernel{<:RecordedKernel})
     k = ck.kernel
     info = Dict{String, Any}()
+    vnum(x) = VersionNumber(divrem(x, 10)...)
     try
-        v = _CC.version(k)
-        info["ptx_version"] = string(v.ptx)
-        info["binary_version"] = string(v.binary)
+        info["ptx_version"] = string(vnum(_fattr(k, CUDA.FUNC_ATTRIBUTE_PTX_VERSION)))
+        info["binary_version"] = string(vnum(_fattr(k, CUDA.FUNC_ATTRIBUTE_BINARY_VERSION)))
     catch err
-        @warn "kernel_resources: PTX/binary version query failed" exception = err
+        @warn "kernel_resources: PTX/binary version attributes unavailable" exception = err
     end
     try
-        merge!(info, _ptxas_report(backend, k, ck.workgroup_size))
+        merge!(info, _ptxas_report(k.job))
         if haskey(info, "ptxas_registers")
-            info["ptxas_matches_attributes"] = info["ptxas_registers"] == Int(CUDA.registers(k))
+            info["ptxas_matches_attributes"] = info["ptxas_registers"] == _fattr(k, CUDA.FUNC_ATTRIBUTE_NUM_REGS)
         end
     catch err
         @warn "kernel_resources: ptxas report unavailable — reporting driver attributes only" exception = err
@@ -262,15 +318,11 @@ function GD.backend_kernel_isa_info(backend::CUDABackend, ck::GD.CompiledKernel{
     return info
 end
 
-_ptxas_cmd() = isdefined(_CC, :CUDA_Compiler_jll) ? _CC.CUDA_Compiler_jll.ptxas() :
-    isdefined(CUDA, :CUDA_Compiler_jll) ? CUDA.CUDA_Compiler_jll.ptxas() :
-    error("CUDA_Compiler_jll (ptxas) not reachable from CUDA.jl")
+_ptxas_cmd() = _CC.CUDA_Compiler.ptxas()
 
-function _ptxas_report(backend::CUDABackend, k::CUDA.HostKernel{F, TT}, workgroup_size) where {F, TT}
+function _ptxas_report(job)
     io = IOBuffer()
-    kw = workgroup_size === nothing ? (;) : (; maxthreads = Int(workgroup_size))
-    CUDA.code_ptx(io, k.f, TT; kernel = true, raw = true, dump_module = true,
-        always_inline = backend.always_inline, kw...)
+    GPUCompiler.code_native(io, job; raw = true, dump_module = true)   # the module PTX of the recorded job
     ptx = String(take!(io))
     m = match(r"\.target\s+(sm_\w+)", ptx)
     m === nothing && error("no .target line in the generated PTX")
@@ -292,25 +344,33 @@ end
 # CUDA.jl's `code_sass` disassembles the cubin from a CUPTI module-load callback, i.e. it
 # LOADS the module on the current device — impossible for a cubin of another architecture.
 # So the job is compiled here directly (`CUDACore.compile`: LLVM → PTX → the bundled ptxas →
-# cubin, no device involved) and the bundled `nvdisasm` reads the cubin. The compiler config
-# is the kernel's own (`always_inline` from the backend, `maxthreads` = the static workgroup
-# size, the runtime's default `sm_NNa` for the current device) or, for `target = "sm_90"`,
-# the same with `arch` overridden; ptxas's `.sectioninfo @"SHI_REGISTERS=N"` gives the
+# cubin, no device involved) and the bundled `nvdisasm` reads the cubin. The job is the
+# recorded one (the runtime's own config, `sm_NNa` for the device it ran on) or, for
+# `target = "sm_90"`, the same options with the architecture (and the PTX ISA, feature set and
+# system-atomics flag CUDACore derives from it) overridden; ptxas's `.sectioninfo @"SHI_REGISTERS=N"` gives the
 # register count to check against the runtime attribute.
 const _GPUC = GPUCompiler
 
-# The CompilerJob of `ck` (the kernel's own options; `arch` overridden for a target) and its ISA name.
-function _mix_job(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel}, target)
-    k = ck.kernel
-    TT = typeof(k).parameters[2]
-    kw = ck.workgroup_size === nothing ? (;) : (; maxthreads = Int(ck.workgroup_size))
-    arch_kw = target === nothing ? (;) : (; arch = String(target))
-    config = _CC.compiler_config(CUDA.device(); kernel = true, always_inline = backend.always_inline, kw..., arch_kw...)
-    return _GPUC.CompilerJob(_GPUC.methodinstance(typeof(k.f), TT), config), _CC.cpu_name(config.params.sm)
+# Target fields that are the kernel's own options, not properties of the architecture.
+const _KERNEL_TARGET_FIELDS = (:minthreads, :maxthreads, :blocks_per_sm, :maxregs, :fastmath)
+
+# The CompilerJob of `ck` (the recorded one; for a target, its options with the architecture
+# overridden) and its ISA name.
+function _mix_job(ck::GD.CompiledKernel{<:RecordedKernel}, target)
+    job = ck.kernel.job
+    if target !== nothing
+        rec = job.config.target
+        base = _CC.compiler_config(CUDA.device(ck.kernel.ctx); kernel = true, arch = String(target))
+        T = typeof(rec)
+        tgt = T((f in _KERNEL_TARGET_FIELDS ? getfield(rec, f) : getfield(base.target, f) for f in fieldnames(T))...)
+        # everything else (name, always_inline, debug level, …) stays the recorded config's
+        job = _GPUC.CompilerJob(job.source, _GPUC.CompilerConfig(job.config; target = tgt, params = base.params))
+    end
+    return job, _CC.cpu_name(job.config.params.sm)
 end
 
-function GD.backend_kernel_machine_code(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel}, target)
-    job, isa = _mix_job(backend, ck, target)
+function GD.backend_kernel_machine_code(::CUDABackend, ck::GD.CompiledKernel{<:RecordedKernel}, target)
+    job, isa = _mix_job(ck, target)
     compiled = _CC.compile(job)
     cubin = tempname(; cleanup = false) * ".cubin"
     write(cubin, compiled.image)
@@ -324,8 +384,8 @@ function GD.backend_kernel_machine_code(backend::CUDABackend, ck::GD.CompiledKer
 end
 
 # Typed IR count: the optimized module of the same job, walked with CUDACore's LLVM.jl.
-function GD.backend_kernel_ir_counts(backend::CUDABackend, ck::GD.CompiledKernel{<:CUDA.HostKernel}, target)
-    job, isa = _mix_job(backend, ck, target)
+function GD.backend_kernel_ir_counts(::CUDABackend, ck::GD.CompiledKernel{<:RecordedKernel}, target)
+    job, isa = _mix_job(ck, target)
     functions = _GPUC.JuliaContext() do ctx
         ir, _ = _GPUC.compile(:llvm, job)
         GD._ir_counts(LLVM, ir)

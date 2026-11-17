@@ -7,8 +7,8 @@ CurrentModule = GPUDiagnostics
 An extension declares its features with `GPUDiagnostics.supports(::MyBackend, ::Val{:feature}) = true`
 and implements the hooks behind them. `:devices` / `:device_props` / `:telemetry` are the `gpu_*`
 generics of the device API plus `gpu_sampler_sources` (and a `sampler_source(::Val{kind}, …)` for a new
-source kind); `:events` is `gpu_event` / `gpu_elapsed`; `:kernel_inventory` is `backend_compiled_kernels`
-(with `backend_wrap_kernel` if the kernel type is shaped differently); `:resources` / `:occupancy` are
+source kind); `:events` is `gpu_event` / `gpu_elapsed`; `:kernel_inventory` is `backend_record_kernels`
+(with `backend_wrap_kernel` if the kernel record is shaped differently); `:resources` / `:occupancy` are
 `backend_kernel_attributes` / `backend_kernel_occupancy` (+ optional `backend_kernel_isa_info`);
 `:native_mix` is `backend_kernel_machine_code`; `:ir_mix` is `backend_kernel_ir_counts`, the one hook
 every GPU backend should have (a GPUCompiler job over LLVM IR). The `backend_*` names are public API,
@@ -17,7 +17,7 @@ documented in their docstrings, not exported.
 ## The hooks
 
 ```@docs
-backend_compiled_kernels
+backend_record_kernels
 backend_wrap_kernel
 backend_kernel_attributes
 backend_kernel_occupancy

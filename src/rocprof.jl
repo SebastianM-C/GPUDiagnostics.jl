@@ -46,15 +46,25 @@
 # are trimmed real MI300X collections.
 
 """
-    RocprofV3()
+    RocprofV3(executable = nothing)
 
 rocprofv3 collector for an external AMD workload. The AMDGPU extension selects this
 automatically for `ROCBackend()`. Use it explicitly with [`hw_counter_command`](@ref)
 or [`hw_counter_status`](@ref) when no AMDGPU runtime is loaded.
+
+`executable` is the default tool path; `nothing` looks `rocprofv3` up on `PATH`. For
+`ROCBackend()` the extension passes the `rocprofv3` of the ROCm install whose HIP library
+AMDGPU loaded, when that install has one: AMDGPU 2.12 can load a ROCm artifact, and a
+system rocprofv3 from another ROCm release may fail to load that HIP library. An
+`executable` keyword on the calls still overrides it.
 """
-struct RocprofV3 <: HWCounterCollector end
+struct RocprofV3 <: HWCounterCollector
+    executable::Union{Nothing, String}
+end
+RocprofV3() = RocprofV3(nothing)
 _counter_vendor(::RocprofV3) = :amd
 _counter_tool(::RocprofV3) = :rocprofv3
+_default_executable(c::RocprofV3) = something(c.executable, "rocprofv3")
 _collector_keywords(::RocprofV3) = (:kernel_trace,)
 
 function _counter_command_args(::RocprofV3, exe, metrics; dir, name, kernel, kernel_trace::Bool = true)
@@ -125,7 +135,10 @@ function _rocprof_devices(path)
     header, rows = _read_csv(path)
     for row in rows
         isequal(_csv_get(header, row, "Agent_Type"), "GPU") || continue
-        id = _counter_int(_csv_get(header, row, "Node_Id"))
+        # the collection's `Agent_Id` ("Agent N") is the LOGICAL node id; it equals `Node_Id` on a
+        # single-socket host but not on a two-socket one (MI350X: Node_Id 4, logical 2)
+        id = _counter_int(_csv_get(header, row, "Logical_Node_Id"))
+        ismissing(id) && (id = _counter_int(_csv_get(header, row, "Node_Id")))
         ismissing(id) && continue
         d = Dict{String, Any}("architecture" => _csv_get(header, row, "Name"),
             "name" => _csv_get(header, row, "Product_Name"))

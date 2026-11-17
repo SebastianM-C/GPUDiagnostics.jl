@@ -52,11 +52,29 @@ end
     n = 2^16
     x = Adapt.adapt(backend, rand(Float64, n))
     out = Adapt.adapt(backend, zeros(Float64, n))
-    gpudiag_probe_kernel!(backend, 256)(out, x, Int32(100); ndrange = n)
-    KernelAbstractions.synchronize(backend)
-    cks = compiled_kernels(backend; pattern = r"gpudiag_probe_kernel")
+    launch() = (gpudiag_probe_kernel!(backend, 256)(out, x, Int32(100); ndrange = n); KernelAbstractions.synchronize(backend))
+    cks = compiled_kernels(launch, backend; pattern = r"gpudiag_probe_kernel")   # first compile, recorded
     @test length(cks) == 1
     ck = only(cks)
+    @testset "recording" begin
+        again = compiled_kernels(launch, backend)      # already compiled: recorded from the cached lookup
+        @test length(again) == 1 && only(again).name == ck.name && only(again).kernel.fun === ck.kernel.fun
+        @test isempty(compiled_kernels(() -> nothing, backend))
+        @test ck.workgroup_size == 256
+        both = compiled_kernels(backend) do            # two signatures in one block, each once
+            launch(); launch()
+            gpudiag_probe_kernel!(backend, 128)(out, x, Int32(100); ndrange = n)
+            KernelAbstractions.synchronize(backend)
+        end
+        @test length(both) == 2 && sort([k.workgroup_size for k in both]) == [128, 256]
+        @test length(kernel_resources(launch, backend; pattern = r"gpudiag_probe_kernel")) == 1
+        spawned = compiled_kernels(backend) do         # a task spawned (and awaited) inside f is recorded
+            wait(Threads.@spawn launch())
+        end
+        @test length(spawned) == 1
+        # one entry per kernel and device: the record carries the context / device it was linked for
+        VENDOR == "cuda" ? (@test ck.kernel.ctx === CUDA.context()) : (@test ck.kernel.dev == AMDGPU.device())
+    end
 
     conformance(backend; kernel = ck)
 
@@ -124,6 +142,19 @@ end
         ct = m.target == cross_target ? alt_cross_target : cross_target   # a real cross-compile, not the device itself
         mx = kernel_instruction_mix(backend, ck; target = ct, ir = false)
         @test !mx.native && mx.target == ct && mx.total > 0 && mx.coverage ≥ 0.98
+        # the cross-compile keeps the recorded kernel's own options, only the architecture changes
+        ext = Base.get_extension(GPUDiagnostics, VENDOR == "cuda" ? :GPUDiagnosticsCUDAExt : :GPUDiagnosticsAMDGPUExt)
+        cj, _ = ext._mix_job(ck, ct)
+        rj = ck.kernel.job
+        @test rj.config.target.maxthreads == 256 && cj.config.target.maxthreads == 256   # KA's static workgroup
+        @test cj.config.target.minthreads == rj.config.target.minthreads
+        @test cj.config.name == rj.config.name && cj.config.always_inline == rj.config.always_inline
+        if VENDOR == "cuda"
+            @test cj.config.target.fastmath == rj.config.target.fastmath && cj.config.target.maxregs == rj.config.target.maxregs
+            @test cj.config.params.sm != rj.config.params.sm
+        else
+            @test cj.config.target.dev_isa == ct
+        end
         @info "instruction mix" native_total = m.total hot_loop = m.hot_loop.total confidence = m.hot_loop_confidence cross_total = mx.total unclassified = m.unclassified_opcodes
     end
 
@@ -173,6 +204,16 @@ end
             lt = launch_times(timer)
             @test sort!(collect(keys(lt))) == [1, 2] && all(v -> length(v) == 2 && all(>(0), v), values(lt))
             @test collect(keys(diagnostics_dict(timer)["devices"])) == [1, 2] || diagnostics_dict(timer)["devices"] == [1, 2]
+            # the same kernel launched on two devices: one recorded entry per device, each queried there
+            per_dev = compiled_kernels(backend; pattern = r"gpudiag_probe_kernel") do
+                for d in 1:2
+                    gpu_device!(backend, d)
+                    gpudiag_probe_kernel!(backend, 256)(outs[d], outs[d], Int32(1); ndrange = n)
+                    KernelAbstractions.synchronize(backend)
+                end
+            end
+            @test length(per_dev) == 2 && per_dev[1].kernel.fun !== per_dev[2].kernel.fun
+            @test all(k -> kernel_resources(backend, k).occupancy isa KernelOccupancy, per_dev)
             gpu_device!(backend, d0)
             _, telem2 = with_gpu_sampler(backend, 0.2; devices = 1:2, counters = :none) do
                 t_end = time() + 6
@@ -228,7 +269,14 @@ end
         @test supports(backend, :hw_counters)
         collector = GPUDiagnostics.backend_counter_collector(backend)
         @test collector isa (VENDOR == "cuda" ? NsightCompute : RocprofV3)
-        # The collector is a system tool, not a dependency: PATH or GPUDIAGNOSTICS_COUNTER_TOOL.
+        if VENDOR == "rocm"   # the rocprofv3 next to the HIP library AMDGPU loaded, else PATH
+            ext = Base.get_extension(GPUDiagnostics, :GPUDiagnosticsAMDGPUExt)
+            libhip = ext._loaded_libhip()
+            @info "rocprofv3 default" executable = collector.executable libhip
+            collector.executable === nothing || @test isfile(collector.executable) &&
+                dirname(dirname(collector.executable)) == dirname(dirname(realpath(libhip)))
+        end
+        # The collector is a system tool, not a dependency: the default above, PATH, or GPUDIAGNOSTICS_COUNTER_TOOL.
         # Discovery says nothing about permission; that is only known once a collection ran.
         exe = get(ENV, "GPUDIAGNOSTICS_COUNTER_TOOL", nothing)
         st = hw_counter_status(backend; executable = exe)

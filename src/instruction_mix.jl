@@ -678,7 +678,8 @@ metadata, to cross-check the runtime's attribute; `missing` for SASS, where `nvd
 none — `kernel_resources` has the ptxas figure).
 
 `target = "gfx942"` / `"sm_90"` **cross-compiles** the same kernel — same function, argument
-types, `always_inline` and static workgroup size — for another architecture through
+types and compile options (`always_inline`, launch bounds such as the static workgroup size,
+NVIDIA's `fastmath` and register cap) — for another architecture through
 GPUCompiler and counts THAT code, without the hardware: what the MI300X / H100 stream looks
 like, whether CDNA3 packed FP64 appears, how many waits the scheduler inserted. AMD targets
 take the `gfx` name optionally with HIP feature suffixes (`"gfx942:sramecc+:xnack-"`); GCN/CDNA
@@ -712,8 +713,8 @@ end
 
 """    backend_kernel_machine_code(backend, ck::CompiledKernel, target) -> NamedTuple
 
-Backend hook (`:native_mix`): the disassembly of `ck` for `target` (`nothing` = the current
-device), as `(; text, vendor::Symbol, isa::String, native::Bool, registers::Union{Int, Missing})`.
+Backend hook (`:native_mix`): the disassembly of `ck` for `target` (`nothing` = the recorded
+compile, for the device it was linked on), as `(; text, vendor::Symbol, isa::String, native::Bool, registers::Union{Int, Missing})`.
 `vendor` selects the classifier rules (`:amd`, `:nvidia`)."""
 backend_kernel_machine_code(b::KA.Backend, ck::CompiledKernel, target) =
     throw(BackendUnsupported(b, :native_mix, :kernel_instruction_mix))
@@ -793,10 +794,9 @@ const IRCounts = NamedTuple{IR_CLASSES, NTuple{length(IR_CLASSES), Int}}
 # Walk an LLVM module (`L` = the LLVM.jl module binding) → per-function IRCounts.
 function _ir_counts(L::Module, mod)
     API = L.API
-    # LLVM.jl names the type structs LLVMDouble/LLVMFloat/LLVMHalf/LLVMBFloat (DoubleType() etc. are constructors)
-    isdouble(t) = t isa L.LLVMDouble || (t isa L.VectorType && eltype(t) isa L.LLVMDouble)
-    isfp(t) = t isa L.LLVMFloat || t isa L.LLVMHalf || t isa L.LLVMBFloat || t isa L.LLVMDouble ||
-        (t isa L.VectorType && isfp(eltype(t)))
+    # LLVM.jl ≥ 10 names the type structs DoubleType/FloatType/HalfType/BFloatType, under FloatingPointType
+    isdouble(t) = t isa L.DoubleType || (t isa L.VectorType && eltype(t) isa L.DoubleType)
+    isfp(t) = t isa L.FloatingPointType || (t isa L.VectorType && isfp(eltype(t)))
     first_operand_type(inst) = L.value_type(first(L.operands(inst)))
     fp_arith = Dict(API.LLVMFAdd => :add, API.LLVMFSub => :add, API.LLVMFMul => :mul, API.LLVMFDiv => :div,
         API.LLVMFRem => :intrinsic, API.LLVMFNeg => :neg)

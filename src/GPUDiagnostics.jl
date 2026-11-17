@@ -29,9 +29,9 @@ fallbacks so the plumbing (and its tests) run without a GPU.
   attainable vector FP64 (or FP32) rate of the device at the clocks it actually holds, never
   routed to matrix/tensor units, with the winning geometry recorded. `measure_gemm_flops` is the
   matrix-unit rate for the same device, an upper reference. Runs on every backend, the CPU included.
-- **Compile-time resource report** — `compiled_kernels` inventories the kernels this process
-  compiled (from the vendor's kernel cache, so closures inside driver functions are reachable
-  too) and `kernel_resources` reports registers, spill/stack and shared (LDS) memory, and the
+- **Compile-time resource report** — `compiled_kernels(f, backend)` records the kernels a block
+  of code compiles or launches (through the compiler's lookup hook, so closures inside driver
+  functions are reachable too) and `kernel_resources` reports registers, spill/stack and shared (LDS) memory, and the
   runtime's theoretical occupancy for the block size actually launched — plus the SGPR/VGPR/
   spill counts from the AMD ISA dump.
 - **Static instruction mix** — `kernel_instruction_mix` counts the compiled instruction stream

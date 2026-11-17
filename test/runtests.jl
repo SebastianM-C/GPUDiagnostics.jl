@@ -18,10 +18,11 @@ module FakeLLVM
         LLVMCanValueUseFastMathFlags(i) = Int(getfield(i, :op) in (LLVMFAdd, LLVMFSub, LLVMFMul, LLVMFDiv))
     end
     abstract type LLVMType end
-    struct LLVMDouble <: LLVMType end
-    struct LLVMFloat <: LLVMType end
-    struct LLVMHalf <: LLVMType end
-    struct LLVMBFloat <: LLVMType end
+    abstract type FloatingPointType <: LLVMType end   # LLVM.jl ≥ 10 type names
+    struct DoubleType <: FloatingPointType end
+    struct FloatType <: FloatingPointType end
+    struct HalfType <: FloatingPointType end
+    struct BFloatType <: FloatingPointType end
     struct IntType <: LLVMType end
     struct VectorType <: LLVMType; el::LLVMType; end
     Base.eltype(t::VectorType) = t.el
@@ -350,11 +351,13 @@ end
 
     @testset "compile-time resource report" begin
         # CPU backend compiles nothing; vendor-less backends error
-        @test compiled_kernels(CPU()) == CompiledKernel[]
-        @test isempty(compiled_kernels(CPU(); pattern = r"anything"))
-        @test kernel_resources(CPU(), r"anything") == []
+        ran = Ref(0)
+        @test compiled_kernels(() -> ran[] += 1, CPU()) == CompiledKernel[] && ran[] == 1   # f runs, nothing recorded
+        @test isempty(compiled_kernels(() -> nothing, CPU(); pattern = r"anything"))
+        @test kernel_resources(() -> nothing, CPU(); pattern = r"anything") == []
         @test_throws BackendUnsupported kernel_resources(CPU(), CompiledKernel("k", "sig", 256, nothing))
-        @test_throws BackendUnsupported compiled_kernels(NoVendorBackend())
+        @test_throws BackendUnsupported compiled_kernels(() -> ran[] += 1, NoVendorBackend())
+        @test ran[] == 1                                # an unsupported backend does not run f
 
         # static workgroup size from a KA kernel signature (what mkcontext + StaticSize produce)
         CI1 = CartesianIndices{1, Tuple{Base.OneTo{Int}}}
@@ -444,15 +447,16 @@ end
         for f in (:kernel_inventory, :resources, :occupancy)
             @eval GPUDiagnostics.supports(::FakeGPU, ::Val{$(QuoteNode(f))}) = true
         end
-        GPUDiagnostics.backend_compiled_kernels(::FakeGPU) = [ck]
+        GPUDiagnostics.backend_record_kernels(f, ::FakeGPU) = (f(); [ck])
         GPUDiagnostics.backend_kernel_attributes(::FakeGPU, k::FakeKernel) =
             (; registers = 123, local_mem_bytes = 584, shared_mem_bytes = 65536, const_mem_bytes = -1, max_threads_per_block = 1024)
         GPUDiagnostics.backend_kernel_occupancy(::FakeGPU, k::FakeKernel, block_size::Int) =
             (; active_blocks_per_sm = min(65536 ÷ 65536, 2048 ÷ block_size), warp_size = 32, max_threads_per_sm = 2048, shared_mem_per_sm = 65536)
         GPUDiagnostics.backend_kernel_isa_info(::FakeGPU, c::CompiledKernel{<:FakeKernel}) = Dict{String, Any}("vgpr_count" => 123)
-        @test length(compiled_kernels(FakeGPU())) == 1
-        @test length(compiled_kernels(FakeGPU(); pattern = "StaticSize")) == 1
-        @test isempty(compiled_kernels(FakeGPU(); pattern = r"no such kernel"))
+        @test length(compiled_kernels(() -> nothing, FakeGPU())) == 1
+        @test length(compiled_kernels(() -> nothing, FakeGPU(); pattern = "StaticSize")) == 1
+        @test isempty(compiled_kernels(() -> nothing, FakeGPU(); pattern = r"no such kernel"))
+        @test only(kernel_resources(() -> nothing, FakeGPU(); pattern = "StaticSize")).registers == 123
         r = kernel_resources(FakeGPU(), ck)
         @test r.block_size == 128                      # defaults to the static workgroup size
         @test r.registers == 123 && r.local_mem_bytes == 584 && r.shared_mem_bytes == 65536
@@ -483,7 +487,7 @@ end
         GPUDiagnostics.backend_kernel_occupancy(::FakeZeroCapGPU, k::FakeKernel, block_size::Int) =
             (; active_blocks_per_sm = 0, warp_size = 32, max_threads_per_sm = 0, shared_mem_per_sm = 0)
         @test ismissing(kernel_resources(FakeZeroCapGPU(), ck).occupancy)
-        @test length(kernel_resources(FakeGPU(), "StaticSize")) == 1
+        @test length(kernel_resources(() -> nothing, FakeGPU(); pattern = "StaticSize")) == 1
     end
 
     @testset "static instruction mix: classifiers, parsers, loop nest, FP64 floor" begin
@@ -823,7 +827,7 @@ end
         # the extensions); the same duck-typed surface is provided here by a tiny stand-in so the
         # walker's typing logic (double vs float by operand type, intrinsics by name) is CPU-tested.
         Fake = FakeLLVM
-        dbl, flt, i64 = Fake.LLVMDouble(), Fake.LLVMFloat(), Fake.IntType()
+        dbl, flt, i64 = Fake.DoubleType(), Fake.FloatType(), Fake.IntType()
         v2d = Fake.VectorType(dbl)
         fma64 = Fake.Function("llvm.fma.f64", true); sqrt64 = Fake.Function("llvm.sqrt.f64", true)
         fabs64 = Fake.Function("llvm.fabs.f64", true); fma32 = Fake.Function("llvm.fma.f32", true)
@@ -855,10 +859,10 @@ end
         # `contract`-flagged double fmul/fadd (what `muladd` lowers to) are counted separately and
         # not added to the fp64 total
         fc = FakeLLVM.Function("k", false, [FakeLLVM.Block([
-            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.LLVMDouble(), []; contract = true),
-            FakeLLVM.Inst(FakeLLVM.API.LLVMFAdd, FakeLLVM.LLVMDouble(), []; contract = true),
-            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.LLVMDouble(), []),
-            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.LLVMFloat(), []; contract = true)])])
+            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.DoubleType(), []; contract = true),
+            FakeLLVM.Inst(FakeLLVM.API.LLVMFAdd, FakeLLVM.DoubleType(), []; contract = true),
+            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.DoubleType(), []),
+            FakeLLVM.Inst(FakeLLVM.API.LLVMFMul, FakeLLVM.FloatType(), []; contract = true)])])
         cc = _ir_counts(FakeLLVM, FakeLLVM.Module([fc]))["k"]
         @test cc.fp64_mul == 2 && cc.fp64_add == 1 && cc.fp64_contract == 2 && cc.fp32 == 1
         @test :fp64_contract ∉ IR_FP64_CLASSES

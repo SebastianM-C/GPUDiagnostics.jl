@@ -100,12 +100,17 @@ returns `RocprofV3()`. CSV parsing does not use this hook or load an extension.
 """
 backend_counter_collector(b::Backend) = throw(BackendUnsupported(b, :hw_counters, :hw_counter_command))
 
+# The executable a collector runs when the caller passes none: a name looked up on PATH, or a
+# path the collector carries.
+_default_executable(c::HWCounterCollector) = String(_counter_tool(c))
+
 """    hw_counter_status(backend; executable = nothing) -> HWCounterAvailability
     hw_counter_status(collector::HWCounterCollector; executable = nothing)
 
 Discover the profiler executable without initializing a GPU or asserting profiling
 permissions. An unsupported backend reports unavailable. A supplied path can locate a
-tool outside PATH. This does not run the tool.
+tool outside PATH; for `ROCBackend()` the default is the rocprofv3 of the ROCm install
+AMDGPU loaded, when it has one (see [`RocprofV3`](@ref)). This does not run the tool.
 """
 function hw_counter_status(b::Backend; kwargs...)
     supports(b, :hw_counters) || return HWCounterAvailability(:none, missing, false, missing)
@@ -113,7 +118,7 @@ function hw_counter_status(b::Backend; kwargs...)
 end
 function hw_counter_status(collector::HWCounterCollector; executable = nothing)
     tool = _counter_tool(collector)
-    path = Sys.which(executable === nothing ? String(tool) : String(executable))
+    path = Sys.which(executable === nothing ? _default_executable(collector) : String(executable))
     return HWCounterAvailability(tool, something(path, missing), path !== nothing, missing)
 end
 
@@ -169,7 +174,7 @@ function hw_counter_command(collector::HWCounterCollector, cmd::Cmd; set::Symbol
     metrics isa AbstractVector || throw(ArgumentError("metrics must be a vector of native names"))
     pmc = String.(metrics)
     isempty(pmc) || any(isempty, pmc) ? throw(ArgumentError("metrics must not be empty")) : nothing
-    exe = executable === nothing ? String(_counter_tool(collector)) : String(executable)
+    exe = executable === nothing ? _default_executable(collector) : String(executable)
     filter = kernel === nothing ? nothing : kernel isa Regex ? kernel.pattern : String(kernel)
     # Collector-specific keywords are checked here, so a keyword of the other vendor's collector is
     # an ArgumentError naming the collector, not a MethodError from the private builder.

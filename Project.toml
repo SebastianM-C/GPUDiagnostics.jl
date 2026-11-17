@@ -1,6 +1,6 @@
 name = "GPUDiagnostics"
 uuid = "5ccc9b3c-1187-41e2-9266-b19f02873332"
-version = "0.4.3"
+version = "0.5.0"
 authors = ["Sebastian Micluța-Câmpeanu <sebastian.mc95@proton.me> and contributors"]
 
 [deps]
@@ -22,13 +22,13 @@ GPUDiagnosticsAMDGPUExt = ["AMDGPU", "GPUCompiler", "LLVM"]
 GPUDiagnosticsCUDAExt = ["CUDA", "GPUCompiler", "LLVM"]
 
 [compat]
-AMDGPU = "2"
+AMDGPU = "2.11"
 Adapt = "4"
 Aqua = "0.8"
-CUDA = "6"
-GPUCompiler = "2"
-KernelAbstractions = "0.9.41, 0.10"
-LLVM = "9, 10"
+CUDA = "6.5.1"
+GPUCompiler = "2.22"
+KernelAbstractions = "0.10"
+LLVM = "10"
 LinearAlgebra = "1.10"
 Statistics = "1"
 TOML = "1"
