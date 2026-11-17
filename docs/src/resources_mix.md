@@ -14,15 +14,18 @@ r                                                            # prints as a small
 Both vendor compilers report every kernel lookup to GPUCompiler's compile hook (the one the
 `@device_code_*` macros use), so recording a block reaches kernels that are closures inside driver
 functions (an AcceleratedKernels `foreachindex` body, say) without wrapping, recompiling or modifying
-them. A kernel compiled before the block is recorded as long as the block launches it again. While the
-block runs, the runtime bypasses its fast kernel cache, so time the workload outside it. on Julia ≥ 1.12 the closure type carries the
+them. A kernel compiled before the block is recorded as long as the block launches it again through a
+lookup (`@cuda`, `@roc`, a KernelAbstractions launch); a kernel object built before the block with
+`launch = false` and only called inside it is not. While the block runs, the runtime bypasses its fast
+kernel cache, so time the workload outside it. Recordings do not nest: an inner `compiled_kernels` or
+`@device_code_*` replaces the outer hook while it runs. On Julia ≥ 1.12 the closure type carries the
 enclosing function's name, which is what `pattern` matches. `shared_mem_bytes` is what the kernel
 descriptor *reserves* — LLVM's AMDGPU backend promotes private arrays it cannot keep in registers
 to LDS, sized for the kernel's maximum block size, and that reservation, not the source, is what
 caps the resident blocks per CU. On NVIDIA the report also re-runs CUDA.jl's bundled `ptxas --verbose` on the
 regenerated module PTX, which separates the call-ABI stack frame from true register spills and lists the device
-functions assembled out of line (what `CUDABackend(always_inline = true)` removes). Nothing is launched; the ISA
-dumps cost a few seconds of compiler time.
+functions assembled out of line (what `CUDABackend(always_inline = true)` removes). The report launches nothing
+beyond what the recorded block does; the ISA dumps cost a few seconds of compiler time.
 
 ## Static instruction mix (native or cross-compiled)
 

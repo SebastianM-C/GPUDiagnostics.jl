@@ -133,10 +133,14 @@ end
 """
     compiled_kernels(f, backend; pattern = nothing) -> Vector{CompiledKernel}
 
-Run `f()` and return the kernels it compiled or launched on `backend`'s vendor runtime, in
-the order they were first seen, one entry per kernel and device. A kernel compiled before the
-call counts as long as `f` launches it again: the record comes from the compiler's lookup, not
-from a fresh compile. `pattern` (a `Regex` or `AbstractString`) keeps only entries whose
+Run `f()` and return the kernels the vendor runtime looked up while it ran, in the order they
+were first seen, one entry per kernel and device (the extension's `ck.kernel` carries the CUDA
+context or AMD device). Every compile and every launch through `@cuda`/`@roc`, a
+KernelAbstractions kernel or `cufunction`/`hipfunction` is a lookup, so a kernel compiled before
+the call counts as long as `f` launches it again that way. A kernel object built before `f`
+(`k = @cuda launch=false …`) and only called inside it does no lookup and is not recorded.
+Reflection inside `f` (`@device_code_*`, `kernel_instruction_mix`) of a kernel already linked
+on that device is recorded too. `pattern` (a `Regex` or `AbstractString`) keeps only entries whose
 `name` or `signature` matches — the way to pick a production kernel that is a closure inside
 its driver:
 
@@ -144,8 +148,11 @@ its driver:
         my_driver!(state)              # one step of the real workload is enough
     end
 
-Tasks that `f` spawns are recorded too, as long as `f` waits for them. While `f` runs the
-runtime bypasses its fast kernel cache, so time a workload outside the block, not inside it.
+Tasks that `f` spawns are recorded too, as long as `f` waits for them; they keep the hook for
+their whole lifetime. While the hook is active the runtime bypasses its fast kernel cache, so
+time a workload outside the block, not inside it. Recordings do not nest: a `compiled_kernels`
+or `@device_code_*` inside `f` replaces the outer hook for its own extent, and the outer
+recording misses the kernels looked up there.
 The CPU backend compiles nothing: `f` runs and the result is empty. Pass entries to
 [`kernel_resources`](@ref) or [`kernel_instruction_mix`](@ref)."""
 function compiled_kernels(f, backend::KA.Backend; pattern::Union{Regex, AbstractString, Nothing} = nothing)
@@ -189,8 +196,8 @@ Returns a [`KernelResources`](@ref) (registers, local/spill and shared memory, `
   says whether that regenerated compile reproduced the runtime's register count.
 
 The `f` form maps [`compiled_kernels`](@ref)`(f, backend; pattern)` through the report
-(possibly empty). Nothing is launched; the AMD ISA dump and the NVIDIA PTX regeneration re-run
-the compiler for a few seconds.
+(possibly empty); running `f` launches whatever `f` launches. The report itself launches
+nothing; the AMD ISA dump and the NVIDIA PTX regeneration re-run the compiler for a few seconds.
 """
 function kernel_resources(backend::KA.Backend, ck::CompiledKernel;
         block_size::Integer = something(ck.workgroup_size, 256))

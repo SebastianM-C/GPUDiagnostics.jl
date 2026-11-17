@@ -192,7 +192,10 @@ and falls back to `PATH` when that install has none. This matters with AMDGPU 2.
 can load its own ROCm artifact: on a ROCm 10.1 artifact under a ROCm 7.2.4 system install,
 the system rocprofv3 failed to load the artifact's HIP library, while the artifact's
 rocprofv3 1.4.1 worked. `hw_counter_status(ROCBackend()).executable` shows the choice;
-the `executable` keyword overrides it. `RocprofV3()` without AMDGPU uses `PATH`.
+the `executable` keyword overrides it. `RocprofV3()` without AMDGPU uses `PATH`. The default
+is a path on the machine that builds the command: pass `executable` (or use `RocprofV3()`)
+when the command runs elsewhere (a container, another node), or when the workload is not
+Julia and links against a different ROCm install than the one AMDGPU loaded.
 
 With rocprofv3 1.0.0, an unsupported GPU present alongside the target GPU can cause an
 `unordered_map::at` exception during counter configuration. Device-qualified metric

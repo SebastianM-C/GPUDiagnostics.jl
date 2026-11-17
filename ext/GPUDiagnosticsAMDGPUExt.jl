@@ -138,7 +138,8 @@ end
 # driver-API `hipFuncGetAttribute` on the module function (the runtime-API
 # `hipFuncGetAttributes` only knows host stubs); NUM_REGS is the VGPR count. Occupancy from
 # `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` (a "multiprocessor" is what HIP calls
-# one — a WGP on RDNA3, a CU on CDNA), capacities from the CURRENT device's properties. The ISA
+# one — a WGP on RDNA3, a CU on CDNA), capacities from the properties of the device the kernel
+# was linked for; every query runs with that device active. The ISA
 # dump (`code_native` of the recorded job, ~0.5 s, no launch) adds the SGPR/VGPR/spill/scratch
 # figures and the compiler's own occupancy estimate, which the HIP attributes do not expose.
 
@@ -146,11 +147,13 @@ end
     RecordedKernel{F, TT}
 
 A kernel recorded by `compiled_kernels(f, ::ROCBackend)`: the `job` AMDGPU.jl compiled for the
-Julia function type `F` and argument types `TT`, and the `HIPFunction` `fun` it linked.
+Julia function type `F` and argument types `TT`, the `HIPFunction` `fun` it linked, and the
+device `dev` it was linked for (one entry per kernel and device).
 """
 struct RecordedKernel{F, TT}
     job::GPUCompiler.CompilerJob
     fun::AMDGPU.HIP.HIPFunction
+    dev::AMDGPU.HIP.HIPDevice
 end
 
 function _job_signature(job)
@@ -161,20 +164,31 @@ end
 function GD.backend_record_kernels(f, ::ROCBackend)
     seen = Tuple{GPUCompiler.CompilerJob, AMDGPU.HIP.HIPDevice}[]
     lk = ReentrantLock()
-    hook(job) = job.config.kernel && Base.@lock lk begin
-        key = (job, AMDGPU.device())
-        key in seen || push!(seen, key)
+    # Only AMDGPU kernel jobs: with several GPU packages loaded the hook sees other back-ends' jobs.
+    function hook(job)
+        job isa GPUCompiler.CompilerJob && job.config.target isa GPUCompiler.GCNCompilerTarget &&
+            job.config.kernel || return
+        Base.@lock lk begin
+            key = (job, AMDGPU.device())
+            key in seen || push!(seen, key)
+        end
+        return
     end
     GPUCompiler.with_compile_hook(f, hook)
+    recorded = Base.@lock lk copy(seen)   # a task `f` did not wait for may still report
     out = GD.CompiledKernel[]
     Base.@lock AMDGPU.Compiler.hipfunction_lock begin
-        for (job, dev) in seen
+        for (job, dev) in recorded
             res = GPUCompiler.cached_results(AMDGPU.Compiler.HIPResults, job)
             res === nothing && continue
             i = findfirst(e -> e[1] == dev, res.functions)
-            i === nothing && continue      # looked up but never linked here (reflection only)
+            i === nothing && continue      # never linked for this device (reflection only)
+            fun = res.functions[i][2]
+            # the job key includes the world age, so the same kernel looked up in two worlds
+            # (an eval or package load inside `f`) resolves to the same function twice
+            any(o -> o.kernel.fun === fun, out) && continue
             F, TT = _job_signature(job)
-            push!(out, GD.backend_wrap_kernel(RecordedKernel{F, TT}(job, res.functions[i][2])))
+            push!(out, GD.backend_wrap_kernel(RecordedKernel{F, TT}(job, fun, dev)))
         end
     end
     return out
@@ -189,19 +203,23 @@ end
 function GD.backend_kernel_attributes(::ROCBackend, k::RecordedKernel)
     HIP = AMDGPU.HIP
     a(attr) = _hip_func_attr(k.fun, attr)
-    return (;
+    return AMDGPU.device!(k.dev) do
+        (;
         registers = a(HIP.HIP_FUNC_ATTRIBUTE_NUM_REGS),
         local_mem_bytes = a(HIP.HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
         shared_mem_bytes = a(HIP.HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
         const_mem_bytes = a(HIP.HIP_FUNC_ATTRIBUTE_CONST_SIZE_BYTES),
         max_threads_per_block = a(HIP.HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK),
-    )
+        )
+    end
 end
 
 function GD.backend_kernel_occupancy(::ROCBackend, k::RecordedKernel, block_size::Int)
     nb = Ref{Cint}(0)
-    AMDGPU.HIP.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(nb, k.fun, block_size, 0)
-    dev = AMDGPU.device()
+    AMDGPU.device!(k.dev) do
+        AMDGPU.HIP.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(nb, k.fun, block_size, 0)
+    end
+    dev = k.dev
     p = AMDGPU.HIP.properties(dev)
     return (;
         active_blocks_per_sm = Int(nb[]),
@@ -238,21 +256,24 @@ const _GPUC = GPUCompiler
 
 _wave64_default(dev_isa::AbstractString) = startswith(dev_isa, "gfx9")   # GCN/CDNA are wave64-only; HIP compiles RDNA wave32
 
-# The CompilerJob of `ck` for `target` (nothing = the current device's own config) and its ISA name.
+# The CompilerJob of `ck` for `target` (nothing = the recorded job, for the device it was
+# linked for) and its ISA name.
 function _mix_job(ck::GD.CompiledKernel{<:RecordedKernel}, target)
     job = ck.kernel.job
-    target === nothing && return job, _gfx_name()
+    target === nothing && return job, _gfx_name(ck.kernel.dev)
     dev_isa, features = AMDGPU.Compiler.parse_llvm_features(String(target))
     wave64 = _wave64_default(dev_isa)
     features = (isempty(features) ? "" : features * ",") *
         (wave64 ? "-wavefrontsize32,+wavefrontsize64" : "+wavefrontsize32,-wavefrontsize64")
-    tgt = _GPUC.GCNCompilerTarget(; dev_isa, features)
+    rec = job.config.target   # keep the kernel's launch bounds (KA's static workgroup size)
+    tgt = _GPUC.GCNCompilerTarget(; dev_isa, features, rec.backend, rec.minthreads, rec.maxthreads)
     # the recorded job's own params (fp-atomics, memory assumptions, waves per EU, … — the set
     # grows across AMDGPU versions) with only the wavefront size switched to the target's
     p = job.config.params
     P = typeof(p)
     params = P((f === :wavefrontsize64 ? wave64 : getfield(p, f) for f in fieldnames(P))...)
-    config = _GPUC.CompilerConfig(tgt, params; kernel = true, always_inline = true)
+    # everything else (name, always_inline, debug level, …) stays the recorded config's
+    config = _GPUC.CompilerConfig(job.config; target = tgt, params)
     return _GPUC.CompilerJob(job.source, config), dev_isa
 end
 
@@ -278,7 +299,7 @@ function GD.backend_kernel_machine_code(::ROCBackend, ck::GD.CompiledKernel{<:Re
         _GPUC.code_native(io, job; raw = true, dump_module = true)
     end
     text = String(take!(io))
-    return (; text, vendor = :amd, isa, native = isa == _gfx_name(), registers = _isa_vgprs(text))
+    return (; text, vendor = :amd, isa, native = isa == _gfx_name(ck.kernel.dev), registers = _isa_vgprs(text))
 end
 
 function _isa_vgprs(text::AbstractString)

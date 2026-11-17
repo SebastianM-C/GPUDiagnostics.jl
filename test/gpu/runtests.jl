@@ -72,6 +72,8 @@ end
             wait(Threads.@spawn launch())
         end
         @test length(spawned) == 1
+        # one entry per kernel and device: the record carries the context / device it was linked for
+        VENDOR == "cuda" ? (@test ck.kernel.ctx === CUDA.context()) : (@test ck.kernel.dev == AMDGPU.device())
     end
 
     conformance(backend; kernel = ck)
@@ -140,6 +142,19 @@ end
         ct = m.target == cross_target ? alt_cross_target : cross_target   # a real cross-compile, not the device itself
         mx = kernel_instruction_mix(backend, ck; target = ct, ir = false)
         @test !mx.native && mx.target == ct && mx.total > 0 && mx.coverage ≥ 0.98
+        # the cross-compile keeps the recorded kernel's own options, only the architecture changes
+        ext = Base.get_extension(GPUDiagnostics, VENDOR == "cuda" ? :GPUDiagnosticsCUDAExt : :GPUDiagnosticsAMDGPUExt)
+        cj, _ = ext._mix_job(ck, ct)
+        rj = ck.kernel.job
+        @test rj.config.target.maxthreads == 256 && cj.config.target.maxthreads == 256   # KA's static workgroup
+        @test cj.config.target.minthreads == rj.config.target.minthreads
+        @test cj.config.name == rj.config.name && cj.config.always_inline == rj.config.always_inline
+        if VENDOR == "cuda"
+            @test cj.config.target.fastmath == rj.config.target.fastmath && cj.config.target.maxregs == rj.config.target.maxregs
+            @test cj.config.params.sm != rj.config.params.sm
+        else
+            @test cj.config.target.dev_isa == ct
+        end
         @info "instruction mix" native_total = m.total hot_loop = m.hot_loop.total confidence = m.hot_loop_confidence cross_total = mx.total unclassified = m.unclassified_opcodes
     end
 
@@ -189,6 +204,16 @@ end
             lt = launch_times(timer)
             @test sort!(collect(keys(lt))) == [1, 2] && all(v -> length(v) == 2 && all(>(0), v), values(lt))
             @test collect(keys(diagnostics_dict(timer)["devices"])) == [1, 2] || diagnostics_dict(timer)["devices"] == [1, 2]
+            # the same kernel launched on two devices: one recorded entry per device, each queried there
+            per_dev = compiled_kernels(backend; pattern = r"gpudiag_probe_kernel") do
+                for d in 1:2
+                    gpu_device!(backend, d)
+                    gpudiag_probe_kernel!(backend, 256)(outs[d], outs[d], Int32(1); ndrange = n)
+                    KernelAbstractions.synchronize(backend)
+                end
+            end
+            @test length(per_dev) == 2 && per_dev[1].kernel.fun !== per_dev[2].kernel.fun
+            @test all(k -> kernel_resources(backend, k).occupancy isa KernelOccupancy, per_dev)
             gpu_device!(backend, d0)
             _, telem2 = with_gpu_sampler(backend, 0.2; devices = 1:2, counters = :none) do
                 t_end = time() + 6
