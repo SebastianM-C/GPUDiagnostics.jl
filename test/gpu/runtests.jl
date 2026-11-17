@@ -244,7 +244,14 @@ end
         @test supports(backend, :hw_counters)
         collector = GPUDiagnostics.backend_counter_collector(backend)
         @test collector isa (VENDOR == "cuda" ? NsightCompute : RocprofV3)
-        # The collector is a system tool, not a dependency: PATH or GPUDIAGNOSTICS_COUNTER_TOOL.
+        if VENDOR == "rocm"   # the rocprofv3 next to the HIP library AMDGPU loaded, else PATH
+            ext = Base.get_extension(GPUDiagnostics, :GPUDiagnosticsAMDGPUExt)
+            libhip = ext._loaded_libhip()
+            @info "rocprofv3 default" executable = collector.executable libhip
+            collector.executable === nothing || @test isfile(collector.executable) &&
+                dirname(dirname(collector.executable)) == dirname(dirname(realpath(libhip)))
+        end
+        # The collector is a system tool, not a dependency: the default above, PATH, or GPUDIAGNOSTICS_COUNTER_TOOL.
         # Discovery says nothing about permission; that is only known once a collection ran.
         exe = get(ENV, "GPUDIAGNOSTICS_COUNTER_TOOL", nothing)
         st = hw_counter_status(backend; executable = exe)

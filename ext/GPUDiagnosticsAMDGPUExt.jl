@@ -12,7 +12,21 @@ import GPUCompiler
 import LLVM
 
 const GD = GPUDiagnostics
-GD.backend_counter_collector(::ROCBackend) = RocprofV3()
+GD.backend_counter_collector(::ROCBackend) = RocprofV3(_loaded_rocprofv3())
+
+# The rocprofv3 shipped with the HIP runtime AMDGPU loaded (`<rocm>/lib/libamdhip64.so` →
+# `<rocm>/bin/rocprofv3`), or `nothing` to fall back to PATH. AMDGPU 2.12 can load its own ROCm
+# artifact, which a system rocprofv3 of another release fails to load (an undefined HSA symbol).
+# The path is `AMDGPU.libamdhip64` from 2.12 (ROCm_Runtime or ROCm_Runtime_Discovery) and
+# `AMDGPU.libhip` in 2.11; both are empty until a HIP runtime was found.
+_loaded_libhip() =
+    isdefined(AMDGPU, :libamdhip64) ? AMDGPU.libamdhip64 : isdefined(AMDGPU, :libhip) ? AMDGPU.libhip : ""
+function _loaded_rocprofv3()
+    lib = _loaded_libhip()
+    lib isa AbstractString && !isempty(lib) && isfile(lib) || return nothing
+    exe = joinpath(dirname(dirname(realpath(lib))), "bin", "rocprofv3")
+    return isfile(exe) ? exe : nothing
+end
 
 # AMDGPU device ids are already 1-based (HIPDevice(id=1, …)), matching the common API — no offset.
 # Everything but GPM-style in-sample counters (no in-process counter API on AMD; the

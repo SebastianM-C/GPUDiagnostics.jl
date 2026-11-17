@@ -1,7 +1,7 @@
 using Test, GPUDiagnostics
 import Statistics
 
-struct CounterTestBackend{C <: HWCounterCollector} <: GPUDiagnostics.KA.GPU end
+struct CounterTestBackend{C <: HWCounterCollector} <: GPUDiagnostics.KA.Backend end
 GPUDiagnostics.supports(::CounterTestBackend, ::Val{:hw_counters}) = true
 GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C()
 
@@ -235,6 +235,19 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         st = hw_counter_status(NsightCompute(); executable = "gpudiag_no_such_profiler")
         @test !st.available && ismissing(st.permitted) && ismissing(st.executable)
         @test hw_counters_available(RocprofV3()) == (Sys.which("rocprofv3") !== nothing)
+        # A collector carrying a path (what the AMDGPU extension builds) uses it by default;
+        # the executable keyword still wins.
+        mktempdir() do d
+            exe = joinpath(d, "rocprofv3")
+            write(exe, "#!/bin/sh\n"); chmod(exe, 0o755)
+            st = hw_counter_status(RocprofV3(exe))
+            @test st.available && st.executable == exe
+            @test first(hw_counter_command(RocprofV3(exe), `true`; dir = "o", name = "p", timeout_s = nothing).exec) == exe
+            @test first(hw_counter_command(RocprofV3(exe), `true`; dir = "o", name = "p", timeout_s = nothing,
+                executable = "/custom/profiler").exec) == "/custom/profiler"
+            @test !hw_counter_status(RocprofV3(exe); executable = "gpudiag_no_such_profiler").available
+        end
+        @test RocprofV3() == RocprofV3(nothing)
         @test_throws BackendUnsupported hw_counter_command(GPUDiagnostics.KA.CPU(), `true`; dir = "o", name = "p")
         for opts in ((; set = :absent), (; metrics = String[]), (; timeout_s = 0),
                 (; launch_skip = -1), (; launch_count = 0), (; clock_control = :invalid), (; kill_after_s = -1),
