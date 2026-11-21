@@ -238,7 +238,8 @@ function Base.show(io::IO, ::MIME"text/plain", f::FP64IssueFloor)
 end
 function Base.show(io::IO, p::PeakProbe)
     print(io, "PeakProbe(", p.eltype, ": ", round(p.flops / 1e12; digits = 3), " TFLOP/s at ", p.chains,
-        " chains × ", p.n_threads, " threads, best of ", p.trials, ", ", length(p.sweep_flops), "-point sweep)")
+        " chains × ", p.n_threads, " threads, best of ", p.trials, ", ", length(p.sweep_flops), "-point sweep",
+        p.under_profiler === nothing ? "" : ", UNDER $(p.under_profiler): not a peak", ")")
 end
 function Base.show(io::IO, ::MIME"text/plain", p::PeakProbe)
     show(io, p)

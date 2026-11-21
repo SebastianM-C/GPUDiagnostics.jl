@@ -26,12 +26,16 @@ backend_kernel_machine_code
 backend_kernel_ir_counts
 backend_versions
 backend_counter_collector
+backend_counter_window_start
+backend_counter_window_stop
 ```
 
 `:hw_counters` implements `backend_counter_collector` and returns the external collector:
 `NsightCompute()` for CUDA or `RocprofV3()` for AMDGPU. Command construction and discovery
 dispatch on that collector; the extension does not need to duplicate profiler options.
 Tool discovery is separate from the backend capability and from profiling permission.
+`:counter_window` implements `backend_counter_window_start` / `backend_counter_window_stop`,
+the collector's profiling range (`cuProfilerStart` / `cuProfilerStop` on CUDA).
 
 The telemetry hooks `gpu_sampler_sources` and `sampler_source` are documented in the [API reference](api.md).
 

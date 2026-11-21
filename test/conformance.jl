@@ -145,6 +145,15 @@ function conformance(backend; kernel = nothing, peak_threads = 2^12)
             end
         end
 
+        @testset ":counter_window" begin
+            if has(:counter_window)
+                @test has(:hw_counters)
+                @test hw_counter_window(() -> 42, backend) == 42   # no profiler attached: a no-op range
+            else
+                @test_throws BackendUnsupported hw_counter_window(() -> 42, backend)
+            end
+        end
+
         @testset ":native_mix" begin
             if has(:native_mix)
                 if kernel !== nothing

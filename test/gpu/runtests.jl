@@ -339,6 +339,78 @@ end
             @test dd["gpudiagnostics_schema"] == GPUDIAGNOSTICS_SCHEMA && dd["hw_dispatches"] == length(hc)
             @test all(k -> k == "gpudiagnostics_schema" || startswith(k, "hw_"), keys(dd))
             @test occursin("dispatches", sprint(show, hc))
+
+            if VENDOR == "cuda"
+                @testset "profiling window, stall / limiter presets, section set" begin
+                    # window_probe.jl: 5 warm-up steps, then 2 fma + 1 copy launch inside hw_counter_window, 1 step after.
+                    wl = addenv(`$(Base.julia_cmd()) --startup-file=no --project=$(dirname(Base.active_project())) $(joinpath(@__DIR__, "window_probe.jl"))`,
+                        "GPUDIAGNOSTICS_GPU" => VENDOR)
+                    function collect_window(wname; kw...)
+                        c = hw_counter_command(backend, wl; dir, name = wname, executable = exe, profile_from_start = false, kw...)
+                        out = joinpath(dir, wname * ".log")
+                        okw = success(pipeline(ignorestatus(c); stdout = out, stderr = out))
+                        okw || foreach(l -> println(stderr, "  | ", l), readlines(out)[max(1, end - 15):end])
+                        return okw, read(out, String)
+                    end
+                    okw, logw = collect_window("window_limiter"; set = :limiter)
+                    @test okw
+                    @test occursin("profiler_attached=ncu", logw)
+                    @test occursin("profiler_attached_without_marker=nsight", logw)
+                    hs = hw_counter_kernels(dir; name = "window_limiter")
+                    @test sort([kernel_name_stem(h.kernel) for h in hs]) == ["window_copy", "window_fma"]
+                    @test sort([length(h) for h in hs]) == [1, 2]   # the window only: no warm-up, nothing after
+                    t = hw_counter_by_kernel(dir; name = "window_limiter")
+                    @test sum(r.share for r in t) ≈ 1
+                    @test all(r -> !ismissing(r.nvidia_sm_throughput) && !ismissing(r.limiter), t)
+                    stalls = [k for k in keys(t[1]) if startswith(String(k), "nvidia_stall_")]
+                    @info "limiter preset" passes = get(first(hs).provenance, "passes", missing) stall_reasons = length(stalls) rows = [(r.group, r.share, r.limiter, r.limiter_reason) for r in t]
+                    @test length(stalls) == length(NVIDIA_STALL_REASONS)
+                    copyrow = t[findfirst(r -> r.group == "window_copy", t)]
+                    @test copyrow.limiter in (:memory_bound, :mixed)   # a 4 MiB copy is DRAM traffic and little else
+                    okw, _ = collect_window("window_stalls"; set = :stalls)
+                    @test okw
+                    @info "stalls preset" passes = get(first(hw_counter_kernels(dir; name = "window_stalls")).provenance, "passes", missing)
+                    okw, _ = collect_window("window_sections"; section_set = :detailed, sections = ["WarpStateStats", "SchedulerStats"])
+                    @test okw
+                    hd = hw_counter_kernels(dir; name = "window_sections")
+                    @test sum(length, hd) == 3
+                    td = hw_counter_by_kernel(dir; name = "window_sections")
+                    @test all(r -> !ismissing(r.limiter), td)
+                    @info "section set" passes = get(first(hd).provenance, "passes", missing) counters = length(first(hd).counters)
+                end
+            end
+        end
+    end
+
+    if VENDOR == "cuda"
+        @testset "register cap: the ISA report describes the capped binary" begin
+            # A plain CUDA.jl kernel launched with maxregs: the recorded job carries the cap, so the
+            # ptxas report must agree with the driver's attributes (issue #41).
+            function capped_kernel(out, x, niter)
+                i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+                @inbounds if i <= length(out)
+                    a = x[i]; b = 0.5 * a; c = 0.25 * a; d = 0.125 * a
+                    for _ in 1:niter
+                        a = fma(a, b, c); b = fma(b, c, d); c = fma(c, d, a); d = fma(d, a, b)
+                    end
+                    out[i] = a + b + c + d
+                end
+                return
+            end
+            xs = CUDA.rand(Float64, 4096); outs = similar(xs)
+            # `.maxnreg` reaches the PTX either way; ptxas may keep a floor above a small cap (18 at
+            # maxregs = 16 on sm_120), so the test is agreement, not the cap itself.
+            for cap in (32, 16)
+                cks = compiled_kernels(backend; pattern = r"capped_kernel") do
+                    @cuda threads = 256 blocks = 16 maxregs = cap capped_kernel(outs, xs, Int32(10))
+                    CUDA.synchronize()
+                end
+                @test length(cks) == 1
+                r = kernel_resources(backend, only(cks))
+                @info "register cap" cap registers = r.registers ptxas = get(r.isa, "ptxas_registers", missing) matches = get(r.isa, "ptxas_matches_attributes", missing)
+                @test get(r.isa, "ptxas_registers", missing) == r.registers
+                @test get(r.isa, "ptxas_matches_attributes", missing) === true
+            end
         end
     end
 end

@@ -136,12 +136,16 @@ hw_counters_available(v::Union{Backend, HWCounterCollector}; kwargs...) = hw_cou
     hw_counter_command(collector::HWCounterCollector, cmd; kwargs...)
 
 Build a `Cmd` wrapping a workload in rocprofv3 or Nsight Compute. Nothing is run or written
-by this function. The caller creates `dir` and runs the command. Environment and working
-directory are preserved. `metrics` overrides the named preset. `executable` overrides the
-tool location. A finite timeout uses the external `timeout` utility; `nothing` disables it.
-The backend extension selects the collector. For an external workload, explicitly pass
-`RocprofV3()` or `NsightCompute()` without loading AMDGPU or CUDA. Vendor symbols are
-used only for offline parsing and preset lookup, not collector selection.
+by this function. The caller creates `dir` and runs the command. The working directory and
+environment are preserved, and [`PROFILER_ENV`](@ref) is added to the environment (a `cmd`
+without its own environment gets a copy of the current one; child processes inherit the
+marker whether or not ncu injects them). `set` names a preset of
+[`COUNTER_SETS`](@ref) (`:issue` when neither `set`, `metrics` nor ncu sections are given);
+`metrics` overrides the preset. `executable` overrides the tool location. A finite timeout
+uses the external `timeout` utility; `nothing` disables it. The backend extension selects
+the collector. For an external workload, explicitly pass `RocprofV3()` or `NsightCompute()`
+without loading AMDGPU or CUDA. Vendor symbols are used only for offline parsing and preset
+lookup, not collector selection.
 
 AMD: `kernel_trace=true` (the dispatch trace rocprofv3 writes next to the counters; the parser
 does not read it, but when no counter CSV appears it shows how far the workload got), optional
@@ -149,6 +153,18 @@ does not read it, but when no counter CSV appears it shows how far the workload 
 `launch_skip=0`, `launch_count=nothing`, `clock_control=:none`, `cache_control=:all`,
 `replay_mode=:kernel`, `target_processes=:application` (`:all` when the GPU work runs in a
 subprocess of the launched command; it also injects precompile workers and the sampler child).
+
+NVIDIA section sets: `section_set` (ncu `--set`, e.g. `:detailed` or `:full`) and `sections`
+(ncu `--section` identifiers, e.g. `["WarpStateStats", "SchedulerStats"]`) collect ncu's own
+sections; without `set` or `metrics` they replace the default preset, with one they are
+collected together. `ncu --list-sets` / `--list-sections` name what the installed version has.
+A section set costs many replay passes per launch (25 to 27 for `:detailed` plus the two
+sections above on sm_120, depending on the ncu version), so select launches with `kernel`, a
+window or `launch_count`.
+`profile_from_start=false` starts ncu with profiling off: only launches inside
+[`hw_counter_window`](@ref) (or the workload's own `cuProfilerStart` / `cuProfilerStop`)
+are profiled, which selects a steady-state window without counting launches.
+
 NVIDIA writes `<name>_ncu.csv` and `<name>.ncu-rep`; AMD writes `<name>_counter_collection.csv`
 and its companion files. Preset metric availability and pass counts depend on architecture.
 Profiling can replay/serialize work and change cache state; profiled times are not ordinary
@@ -158,8 +174,8 @@ function hw_counter_command(b::Backend, cmd::Cmd; kwargs...)
     _require(b, :hw_counters, :hw_counter_command)
     return hw_counter_command(backend_counter_collector(b), cmd; kwargs...)
 end
-function hw_counter_command(collector::HWCounterCollector, cmd::Cmd; set::Symbol = :issue, dir::AbstractString,
-        name::AbstractString, metrics = nothing, executable = nothing,
+function hw_counter_command(collector::HWCounterCollector, cmd::Cmd; set::Union{Nothing, Symbol} = nothing,
+        dir::AbstractString, name::AbstractString, metrics = nothing, executable = nothing,
         timeout_s::Union{Nothing, Real} = 600, kill_after_s::Real = 20,
         kernel = nothing, kwargs...)
     vendor = _counter_vendor(collector)
@@ -167,23 +183,99 @@ function hw_counter_command(collector::HWCounterCollector, cmd::Cmd; set::Symbol
     basename(name) == name && name ∉ (".", "..") || throw(ArgumentError("name must be a file prefix, not a path"))
     timeout_s === nothing || (isfinite(timeout_s) && timeout_s > 0) || throw(ArgumentError("timeout_s must be positive and finite"))
     isfinite(kill_after_s) && kill_after_s > 0 || throw(ArgumentError("kill_after_s must be positive and finite"))
-    if metrics === nothing
-        haskey(COUNTER_SETS[vendor], set) || throw(ArgumentError("unknown $vendor counter set :$set"))
-        metrics = COUNTER_SETS[vendor][set].metrics
-    end
-    metrics isa AbstractVector || throw(ArgumentError("metrics must be a vector of native names"))
-    pmc = String.(metrics)
-    isempty(pmc) || any(isempty, pmc) ? throw(ArgumentError("metrics must not be empty")) : nothing
-    exe = executable === nothing ? _default_executable(collector) : String(executable)
-    filter = kernel === nothing ? nothing : kernel isa Regex ? kernel.pattern : String(kernel)
     # Collector-specific keywords are checked here, so a keyword of the other vendor's collector is
     # an ArgumentError naming the collector, not a MethodError from the private builder.
     bad = [k for k in keys(kwargs) if !(k in _collector_keywords(collector))]
     isempty(bad) || throw(ArgumentError("$(nameof(typeof(collector))) does not accept the keyword(s) $(join(bad, ", ")); it accepts $(join(_collector_keywords(collector), ", "))"))
+    # ncu sections replace the default preset; an explicit `set` or `metrics` is collected next to them.
+    sections = _collects_sections(collector, kwargs)
+    if metrics === nothing
+        if set === nothing && sections
+            metrics = String[]
+        else
+            set = something(set, :issue)
+            haskey(COUNTER_SETS[vendor], set) || throw(ArgumentError("unknown $vendor counter set :$set (available: $(join(sort!(collect(keys(COUNTER_SETS[vendor]))), ", ")))"))
+            metrics = COUNTER_SETS[vendor][set].metrics
+        end
+    end
+    metrics isa AbstractVector || throw(ArgumentError("metrics must be a vector of native names"))
+    pmc = String.(metrics)
+    (isempty(pmc) && !sections) || any(isempty, pmc) ? throw(ArgumentError("metrics must not be empty")) : nothing
+    exe = executable === nothing ? _default_executable(collector) : String(executable)
+    filter = kernel === nothing ? nothing : kernel isa Regex ? kernel.pattern : String(kernel)
     args = _counter_command_args(collector, exe, pmc; dir, name, kernel = filter, kwargs...)
     append!(args, cmd.exec)
     timeout_s === nothing || (args = ["timeout", "-k", string(kill_after_s), string(timeout_s), args...])
-    return Cmd(Cmd(args); env = cmd.env, dir = cmd.dir)
+    # The marker lets the workload (and `peak_flops_probe`) know it runs under a counter collector.
+    return addenv(Cmd(Cmd(args); env = cmd.env, dir = cmd.dir), PROFILER_ENV => String(_counter_tool(collector)))
+end
+
+"""
+    PROFILER_ENV
+
+The environment variable [`hw_counter_command`](@ref) sets in the profiled workload, to the
+collector's tool name (`"ncu"` or `"rocprofv3"`). [`profiler_attached`](@ref) reads it.
+"""
+const PROFILER_ENV = "GPUDIAGNOSTICS_PROFILER"
+
+"""    profiler_attached() -> Union{Nothing, String}
+
+The counter collector this process runs under, or `nothing`. Checks the marker
+[`hw_counter_command`](@ref) sets ([`PROFILER_ENV`](@ref)), then what a collector started by
+hand leaves in the environment: the Nsight injection variables (`NV_TPS_LAUNCH_TOKEN`,
+`NV_NSIGHT_INJECTION_TRANSPORT_TYPE`; seen under ncu 2026.3, reported as `"nsight"`),
+`CUDA_INJECTION64_PATH` (a CUPTI injection, `"cuda-injection"`) and a rocprofiler library in
+`LD_PRELOAD` (`"rocprofv3"`). Under a profiler, kernels are replayed or serialized and clocks may be
+locked, so a rate measured in the process (a peak probe, a timing) is not a peak or a timing.
+"""
+function profiler_attached()
+    v = get(ENV, PROFILER_ENV, "")
+    isempty(v) || return v
+    any(k -> !isempty(get(ENV, k, "")), ("NV_TPS_LAUNCH_TOKEN", "NV_NSIGHT_INJECTION_TRANSPORT_TYPE")) && return "nsight"
+    isempty(get(ENV, "CUDA_INJECTION64_PATH", "")) || return "cuda-injection"
+    occursin("rocprofiler", get(ENV, "LD_PRELOAD", "")) && return "rocprofv3"
+    return nothing
+end
+
+"""    backend_counter_window_start(backend)
+
+Backend hook (`:counter_window`): open the profiling range of an attached counter collector,
+the call [`hw_counter_window`](@ref) makes before the workload; [`backend_counter_window_stop`](@ref)
+closes it. The CUDA extension calls `cuProfilerStart`, a no-op without a profiler.
+"""
+backend_counter_window_start(b::Backend) = throw(BackendUnsupported(b, :counter_window, :hw_counter_window))
+
+"""    backend_counter_window_stop(backend)
+
+Backend hook (`:counter_window`): close the range [`backend_counter_window_start`](@ref)
+opened. The CUDA extension calls `cuProfilerStop`.
+"""
+backend_counter_window_stop(b::Backend) = throw(BackendUnsupported(b, :counter_window, :hw_counter_window))
+
+"""
+    hw_counter_window(f, backend)
+
+Run `f()` inside the counter collector's profiling range and return its result: with
+`hw_counter_command(...; profile_from_start = false)`, only the launches of `f` are profiled.
+The device is synchronized before the range opens and before it closes, so the range holds
+exactly the work `f` launches. Without an attached profiler the range costs two driver calls.
+Mark a steady-state window (after warm-up steps whose count depends on the run) instead of
+counting launches with `launch_skip`; ranges may repeat, and every one is profiled.
+
+NVIDIA only (`:counter_window`) for now: no AMD equivalent is wired up, so on AMD select
+launches with the `kernel` filter.
+"""
+function hw_counter_window(f, b::Backend)
+    _require(b, :counter_window, :hw_counter_window)
+    KA.synchronize(b)
+    backend_counter_window_start(b)
+    try
+        r = f()
+        KA.synchronize(b)
+        return r
+    finally
+        backend_counter_window_stop(b)
+    end
 end
 
 """    hw_counter_export_command(report; output, executable = "ncu") -> Cmd
@@ -213,7 +305,37 @@ selected dispatch; use the preset's `.metrics` to detect silently omitted tool m
 `provenance` can record `tool_version`, `clock_control`, `cache_control`, `replay_mode`,
 and `counter_set`; only allowlisted measurement fields are retained, never commands or paths.
 """
-function hw_counters(path::AbstractString; vendor = nothing, name = nothing, kwargs...)
+function hw_counters(path::AbstractString; vendor = nothing, name = nothing, kernel = nothing, slots = nothing,
+        device_overrides = Dict(), provenance = Dict(), required_metrics = nothing)
+    file, collector, dispatches, rows, units = _counter_collection(path; vendor, name, device_overrides)
+    ids, kname = _select_dispatches(dispatches, kernel)
+    return _build_counters(collector, file, dispatches, rows, units, ids, kname; slots, provenance, required_metrics)
+end
+hw_counters(v::Symbol, path::AbstractString; kwargs...) = hw_counters(path; vendor = v, kwargs...)
+
+"""
+    hw_counter_kernels(path; vendor = nothing, name = nothing, kernel = nothing,
+                       device_overrides = Dict(), provenance = Dict()) -> Vector{HWCounters}
+
+Parse a collection that profiled several kernels (a window of a whole step, a section-set
+run) into one [`HWCounters`](@ref) per full kernel name, in the order the kernels first
+appear. `kernel` (substring or regex) keeps only the matching names; without it every kernel
+but AMD's runtime blit kernels is kept. The other keywords are those of
+[`hw_counters`](@ref); `slots` is not accepted, since it differs per kernel. Group and rank
+the result with [`hw_counter_by_kernel`](@ref).
+"""
+function hw_counter_kernels(path::AbstractString; vendor = nothing, name = nothing, kernel = nothing,
+        device_overrides = Dict(), provenance = Dict())
+    file, collector, dispatches, rows, units = _counter_collection(path; vendor, name, device_overrides)
+    ids = findall(d -> _kernel_matches(kernel, d.kernel), dispatches)
+    isempty(ids) && throw(ArgumentError("kernel selection matched no dispatch (available: $(join(unique(d.kernel for d in dispatches), ", ")))"))
+    return [_build_counters(collector, file, dispatches, rows, units, filter(i -> dispatches[i].kernel == k, ids), k;
+                slots = nothing, provenance, required_metrics = nothing)
+            for k in unique(dispatches[i].kernel for i in ids)]
+end
+
+# Find the one collection under `path` and parse it: (file, collector, dispatches, rows, units).
+function _counter_collection(path::AbstractString; vendor = nothing, name = nothing, device_overrides = Dict())
     vendor === nothing || _counter_vendor(vendor)
     candidates = Tuple{Symbol, String}[]
     files = isdir(path) ? readdir(path; join = true) : isfile(path) ? [String(path)] :
@@ -229,9 +351,8 @@ function hw_counters(path::AbstractString; vendor = nothing, name = nothing, kwa
     end
     length(candidates) == 1 || throw(ArgumentError("expected one counter collection, found $(length(candidates)); select vendor/name or pass a CSV file"))
     v, file = only(candidates)
-    return v === :amd ? _parse_rocprof(file; kwargs...) : _parse_ncu(file; kwargs...)
+    return (file, (v === :amd ? _parse_rocprof(file; device_overrides) : _parse_ncu(file; device_overrides))...)
 end
-hw_counters(v::Symbol, path::AbstractString; kwargs...) = hw_counters(path; vendor = v, kwargs...)
 
 _collection_name(file, v) = chopsuffix(chopsuffix(basename(file), v === :amd ? "_counter_collection.csv" : "_ncu.csv"), ".csv")
 # The header is the first line that is not an ncu `==PROF==` log line; anything else in the
@@ -279,9 +400,8 @@ function _with_slots(d::HWDispatch, slots)
     return HWDispatch(d.id, d.process_id, d.device_id, d.context_id, d.queue_id, d.kernel,
         d.start_s, d.duration_s, d.resources, d.device, slots)
 end
-function _build_counters(collector::HWCounterCollector, file, dispatches, rows, units; kernel, slots, provenance, required_metrics)
+function _build_counters(collector::HWCounterCollector, file, dispatches, rows, units, ids, name; slots, provenance, required_metrics)
     vendor = _counter_vendor(collector)
-    ids, name = _select_dispatches(dispatches, kernel)
     ds = [_with_slots(d, s) for (d, s) in zip(dispatches[ids], _counter_slots(slots, length(ids)))]
     counters = sort!(unique(String[k for i in ids for k in keys(rows[i])]))
     values = Matrix{Union{Missing, Float64}}(missing, length(ids), length(counters))

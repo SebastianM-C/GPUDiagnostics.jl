@@ -1,6 +1,6 @@
 name = "GPUDiagnostics"
 uuid = "5ccc9b3c-1187-41e2-9266-b19f02873332"
-version = "0.5.0"
+version = "0.6.0"
 authors = ["Sebastian Micluța-Câmpeanu <sebastian.mc95@proton.me> and contributors"]
 
 [deps]

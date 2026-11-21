@@ -29,6 +29,7 @@ KernelAbstractions `Backend`; load CUDA.jl or AMDGPU.jl for the vendor methods.
 | "Will it fit / how will it run on the MI300X / H100 I have not rented" | `kernel_instruction_mix(backend, ck; target = "gfx942")` / `"sm_90"` cross-compiles the same kernel from any device of the vendor | `resources_mix.md` |
 | Run was slow on a rented box, GPU numbers look fine | `host_snapshot(backend)`: Julia threads vs the cgroup CPU quota, BLAS threads, driver / runtime versions; `warnings` is data | `peaks_probes.md` |
 | Need per-dispatch hardware counters on AMD or NVIDIA | `hw_counter_command` wraps the process, `hw_counters` parses, `hw_counter_derived` returns per-dispatch columns; `hw_counter_summary` reduces them. Check architecture and measurement denominators. | `hw_counters.md` |
+| "Which kernels of the step hold the time and what limits each" (NVIDIA) | `hw_counter_command(...; section_set = :detailed, profile_from_start = false)` (or `set = :limiter`) with `hw_counter_window(backend) do … end` around steady-state steps; `hw_counter_by_kernel(csv)` → share, throughputs, top stalls, `limiter` per kernel | `hw_counters.md` |
 | Need the results in a manifest / table | `diagnostics_dict(x; prefix)` per result; `GPUTelemetry` is a Tables.jl table | `report.md` |
 
 ## Rules an agent gets wrong without being told
@@ -56,11 +57,16 @@ KernelAbstractions `Backend`; load CUDA.jl or AMDGPU.jl for the vendor methods.
   counters are event counts (never × wave); SQ wave-cycle counters are quad-cycles on CDNA, plain cycles on RDNA; the dispatch's cycles are
   `GRBM_GUI_ACTIVE / n_xcd` (14 GHz means the die sum was not divided). NVIDIA `smsp__*thread*` metrics are
   per-thread. Read `COUNTER_SETS[vendor][set].notes` before interpreting. On a power-capped part compare
-  runs of the same work in cycles, not seconds; ncu durations are replays, not timings.
+  runs of the same work in cycles, not seconds; ncu durations are replays, not timings (with
+  `clock_control = :base`, base-clock replays: compare shares, not seconds). NVIDIA stall reasons
+  are cycles per issued instruction; `selected` / `not_selected` are not stalls. The `limiter`
+  label is a rule of thumb whose `reason` quotes its inputs.
 - **Peak probe.** `peak_flops_probe(backend, T)` sweeps chains × launch size and returns a `PeakProbe`
   (rate + winning geometry + sweep; `measure_peak_flops` is the rate alone), the FMA-chain rate at the
   clocks the device holds, never a matrix-unit peak (`measure_gemm_flops` is that, an upper reference);
   `Float64` requires the `:fp64` capability. Record the sampler's clock next to it on power-managed parts.
+  A probe run under a counter collector carries `under_profiler` (`peak_probe_under_profiler` in the
+  dict): it is not a peak; drop it.
 
 ## Storing results (manifest convention)
 

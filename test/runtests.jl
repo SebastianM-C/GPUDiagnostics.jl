@@ -438,6 +438,9 @@ end
         @test pi["ptxas_functions"] == ["gpu_report_exception", "julia_GPUCubicSpline_15704", "julia__140_15713"]
         @test !haskey(pi, "ptxas_entry")
         @test isempty(_parse_ptxas_verbose("ptxas fatal   : Unresolved extern function\n"))
+        # CUDA 13 ptxas omits a zero cumulative stack from the register line
+        p0 = _parse_ptxas_verbose("ptxas info    : Compiling entry function '_Z1k' for 'sm_120a'\nptxas info    : Function properties for _Z1k\n    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads\nptxas info    : Used 10 registers, used 0 barriers\n")
+        @test p0["ptxas_registers"] == 10 && p0["cumulative_stack_bytes"] == 0
         # comment-only dumps (no metadata) still yield the figures; CDNA's AGPR line is picked up
         info2 = _parse_amdgpu_kernel_info("; NumSgprs: 40\n; NumVgprs: 64\n; NumAgprs: 8\n; TotalNumVgprs: 72\n; ScratchSize: 0\n; Occupancy: 8\n")
         @test info2["sgpr_count"] == 40 && info2["agpr_count"] == 8 && info2["total_vgpr_count"] == 72 && info2["scratch_bytes"] == 0

@@ -29,9 +29,10 @@ subsystem of the package:
 | `:native_mix` | `kernel_instruction_mix` (a disassembly of the device code exists) |
 | `:ir_mix` | `kernel_ir_mix` |
 | `:hw_counters` | `hw_counter_command`, `hw_counter_status` (rocprofv3 on AMD, ncu on NVIDIA) |
+| `:counter_window` | `hw_counter_window` (the workload marks the launches the collector profiles) |
 """
 const FEATURES = (:devices, :device_props, :events, :telemetry, :telemetry_counters, :peak_flops, :fp64,
-    :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix, :hw_counters)
+    :kernel_inventory, :resources, :occupancy, :native_mix, :ir_mix, :hw_counters, :counter_window)
 
 """
     supports(backend, feature::Symbol) -> Bool
