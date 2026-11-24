@@ -13,7 +13,7 @@ _collector_keywords(::NsightCompute) = (:launch_skip, :launch_count, :clock_cont
 # Whether the call collects ncu sections, which can stand in for a metric list.
 _collects_sections(::HWCounterCollector, kwargs) = false
 _collects_sections(::NsightCompute, kwargs) =
-    get(kwargs, :section_set, nothing) !== nothing || !isempty(get(kwargs, :sections, ()))
+    get(kwargs, :section_set, nothing) !== nothing || !isempty(something(get(kwargs, :sections, nothing), ()))
 
 _section_name(s::Union{Symbol, AbstractString}, what) =
     (t = String(s); isempty(t) || occursin(r"[\s,]", t) ? throw(ArgumentError("invalid ncu $what $(repr(s))")) : t)
@@ -29,6 +29,7 @@ function _counter_command_args(::NsightCompute, exe, metrics; dir, name, kernel,
     cache_control in (:none, :all) || throw(ArgumentError("invalid cache_control"))
     replay_mode in (:kernel, :application) || throw(ArgumentError("replay_mode must be :kernel or :application"))
     target_processes in (:application, :all) || throw(ArgumentError("target_processes must be :application or :all"))
+    sections = something(sections, String[])
     sections isa Union{AbstractVector, Tuple} || throw(ArgumentError("sections must be a vector of ncu section identifiers"))
     # ncu's own default is `all`. `:application` injects only the launched process (`env`/`bash -c` exec into it, so those
     # wrappers are fine); `:all` follows every child — needed when the GPU work runs in a

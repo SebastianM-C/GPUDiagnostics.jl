@@ -343,9 +343,9 @@ end
             if VENDOR == "cuda"
                 @testset "profiling window, stall / limiter presets, section set" begin
                     # window_probe.jl: 5 warm-up steps, then 2 fma + 1 copy launch inside hw_counter_window, 1 step after.
-                    wl = addenv(`$(Base.julia_cmd()) --startup-file=no --project=$(dirname(Base.active_project())) $(joinpath(@__DIR__, "window_probe.jl"))`,
-                        "GPUDIAGNOSTICS_GPU" => VENDOR)
-                    function collect_window(wname; kw...)
+                    function collect_window(wname; script = "window_probe.jl", kw...)
+                        wl = addenv(`$(Base.julia_cmd()) --startup-file=no --project=$(dirname(Base.active_project())) $(joinpath(@__DIR__, script))`,
+                            "GPUDIAGNOSTICS_GPU" => VENDOR)
                         c = hw_counter_command(backend, wl; dir, name = wname, executable = exe, profile_from_start = false, kw...)
                         out = joinpath(dir, wname * ".log")
                         okw = success(pipeline(ignorestatus(c); stdout = out, stderr = out))
@@ -364,9 +364,20 @@ end
                     @test all(r -> !ismissing(r.nvidia_sm_throughput) && !ismissing(r.limiter), t)
                     stalls = [k for k in keys(t[1]) if startswith(String(k), "nvidia_stall_")]
                     @info "limiter preset" passes = get(first(hs).provenance, "passes", missing) stall_reasons = length(stalls) rows = [(r.group, r.share, r.limiter, r.limiter_reason) for r in t]
-                    @test length(stalls) == length(NVIDIA_STALL_REASONS)
+                    @test gpu_arch(backend) == "12.0" ? length(stalls) == length(NVIDIA_STALL_REASONS) : !isempty(stalls)
+                    @test occursin("probe_under_profiler=ncu", logw)
                     copyrow = t[findfirst(r -> r.group == "window_copy", t)]
-                    @test copyrow.limiter in (:memory_bound, :mixed)   # a 4 MiB copy is DRAM traffic and little else
+                    @test copyrow.dominant === :memory   # the labels are checked on limiter_probe.jl's known-answer kernels
+                    okw, _ = collect_window("window_known"; set = :limiter, script = "limiter_probe.jl")
+                    @test okw
+                    known = Dict(r.group => r for r in hw_counter_by_kernel(dir; name = "window_known"))
+                    for (k, r) in known
+                        @info "known-answer kernel" kernel = k limiter = r.limiter dominant = r.dominant fraction = r.fraction sm = r.nvidia_sm_throughput memory = r.nvidia_memory_throughput dram = r.nvidia_dram_throughput occupancy = r.nvidia_active_occupancy theoretical = r.nvidia_theoretical_occupancy top = r.top_stalls
+                    end
+                    @test known["cal_compute"].limiter === :compute_bound
+                    @test known["cal_memory"].limiter === :memory_bound
+                    @test known["cal_latency"].limiter === :latency_bound
+                    @test known["cal_occupancy"].limiter === :occupancy_limited
                     okw, _ = collect_window("window_stalls"; set = :stalls)
                     @test okw
                     @info "stalls preset" passes = get(first(hw_counter_kernels(dir; name = "window_stalls")).provenance, "passes", missing)

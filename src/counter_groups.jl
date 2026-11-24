@@ -7,13 +7,14 @@
 """    kernel_name_stem(name) -> String
 
 The kernel's name without its parameter list, the `gpu_` prefix KernelAbstractions adds, and
-trailing underscores (a Julia `!` becomes `_`): `"gpu_resort_rank_kernel_(CompilerMetadata<…>, …)"`
+one trailing underscore (a Julia `!` becomes `_`): `"gpu_resort_rank_kernel_(CompilerMetadata<…>, …)"`
 → `"resort_rank_kernel"`. The default grouping of [`hw_counter_by_kernel`](@ref), which merges
-the launches of one Julia kernel compiled for different argument types."""
+the launches of one Julia kernel compiled for different argument types. Kernels that are told
+apart by their argument types alone (a `foreachindex` loop, a broadcast) therefore share one
+group: pass `group = identity` (or your own function) to keep them separate."""
 function kernel_name_stem(name::AbstractString)
-    s = strip(first(split(name, '('; limit = 2)))
-    startswith(s, "gpu_") && (s = s[(nextind(s, 0, 5)):end])
-    s = rstrip(s, '_')
+    m = match(r"^((?:[^(]|\(anonymous namespace\))*)", name)
+    s = chopsuffix(chopprefix(strip(m[1]), "gpu_"), "_")
     return isempty(s) ? String(name) : String(s)
 end
 
@@ -44,7 +45,7 @@ function _top_stalls(means::AbstractDict, n::Integer)
     for (r, _) in NVIDIA_STALL_REASONS
         r in _NOT_STALLS && continue
         v = get(means, "nvidia_stall_" * r, missing)
-        ismissing(v) || push!(stalls, r => v)
+        ismissing(v) || v <= 0 || push!(stalls, r => v)
     end
     sort!(stalls; by = last, rev = true)
     return stalls[1:min(n, length(stalls))]
@@ -59,21 +60,23 @@ function _limiter(means::AbstractDict; bound::Real = 0.6, low::Real = 0.4, occup
     stalls = _top_stalls(means, 1)
     top = isempty(stalls) ? missing : first(first(stalls))
     stall_text = ismissing(top) ? "" : string(", top stall ", top, " ", round(last(first(stalls)); digits = 1), " cycles/issue")
-    (ismissing(sm) || ismissing(mem)) && return (limiter = missing, top_stall = top,
+    (ismissing(sm) || ismissing(mem)) && return (limiter = missing, dominant = missing, fraction = missing, top_stall = top,
         reason = "no speed-of-light counters: collect the :limiter preset or an ncu section set (NVIDIA only)")
     sol = string("SM ", _pct(sm), ", memory ", _pct(mem), " of peak")
-    if max(sm, mem) >= bound
-        return (limiter = sm >= mem ? :compute_bound : :memory_bound, top_stall = top, reason = sol * stall_text)
-    elseif sm < low && mem < low
+    dominant, fraction = sm >= mem ? (:compute, sm) : (:memory, mem)
+    result(limiter, text) = (; limiter, dominant, fraction, top_stall = top, reason = sol * text * stall_text)
+    if fraction >= bound
+        return result(dominant === :compute ? :compute_bound : :memory_bound, "")
+    elseif fraction < low
         occ = get(means, "nvidia_active_occupancy", missing)
         theo = get(means, "nvidia_theoretical_occupancy", missing)
         if !ismissing(occ) && occ < occupancy_low
-            occ_text = string(", achieved occupancy ", _pct(occ), ismissing(theo) ? "" : string(" of a theoretical ", _pct(theo)))
-            return (limiter = :occupancy_limited, top_stall = top, reason = sol * occ_text * stall_text)
+            return result(:occupancy_limited, string(", achieved occupancy ", _pct(occ),
+                ismissing(theo) ? "" : string(" of a theoretical ", _pct(theo))))
         end
-        return (limiter = :latency_bound, top_stall = top, reason = sol * stall_text)
+        return result(:latency_bound, "")
     end
-    return (limiter = :mixed, top_stall = top, reason = sol * " (between the thresholds)" * stall_text)
+    return result(:mixed, " (between the thresholds)")
 end
 
 """
@@ -81,7 +84,7 @@ end
     hw_counter_limiter(row; kwargs...)    # a row of hw_counter_by_kernel
 
 A rule-of-thumb label for what limits a kernel, from NVIDIA speed-of-light counters (the
-`:limiter` preset or an ncu section set), as `(limiter, top_stall, reason)`. With `sm` and
+`:limiter` preset or an ncu section set), as `(limiter, dominant, fraction, top_stall, reason)`. With `sm` and
 `mem` the SM and memory throughputs as fractions of their peak (time-weighted over the
 dispatches), `limiter` is
 
@@ -94,8 +97,15 @@ dispatches), `limiter` is
 - `:mixed` in between, and `missing` when the throughputs were not collected (AMD has no rules
   yet).
 
-`reason` quotes the numbers the label came from. It is a starting point, not a diagnosis:
-read the stall reasons and the throughputs before acting on it. Throughputs are ratios to the
+`dominant` (`:compute` or `:memory`) is the larger of the two throughputs and `fraction` its
+value: the label has hard edges, so a kernel at 59 % and one at 62 % differ in `limiter` and
+not in `dominant` / `fraction`; compare those. On an A100 (sm_80) the labels agreed with
+unprofiled timings on a triad swept from memory-bound to compute-bound and on a pointer chase
+up to 3/4 occupancy (1.20× its unloaded time per hop); the chase at full occupancy (1.28×) sits
+in between at 41 % memory throughput and is `:mixed`. The 60 % cutoff was not probed closely:
+the triad's throughputs jump past it. Expect edge cases. `reason` quotes the numbers the label came
+from. It is a starting point, not a diagnosis: the default thresholds are choices (40 % and
+60 % of peak), not measurements; read the stall reasons and the throughputs before acting on it. Throughputs are ratios to the
 peak at the clock the kernel ran at, so the label survives `clock_control = :base`.
 """
 hw_counter_limiter(h::HWCounters; kwargs...) = _limiter(first(_group_means([h])); kwargs...)
@@ -120,8 +130,8 @@ table). `group` maps a full kernel name to its group; the default
   mean over the group's dispatches weighted by their durations (`missing` where the group
   lacks it);
 - `top_stalls`, the `top_stalls` largest NVIDIA stall reasons as `reason => cycles per issued
-  instruction` (`selected` and `not_selected` excluded), and `limiter` / `limiter_reason` from
-  [`hw_counter_limiter`](@ref) with the `limiter` keywords.
+  instruction` (`selected` and `not_selected` excluded), and `limiter`, `dominant`, `fraction`
+  and `limiter_reason` from [`hw_counter_limiter`](@ref) with the `limiter` keywords.
 
 Durations under replay (ncu) or with `clock_control = :base` are not the run's timings: the
 shares are comparable within the collection, the seconds are not comparable with a timed
@@ -146,16 +156,16 @@ function hw_counter_by_kernel(hcs::AbstractVector{HWCounters}; group = kernel_na
     reduced = [(g, _group_means(groups[g])...) for g in order]
     columns = sort!(unique(k for (_, means, _) in reduced for k in keys(means)))
     total = any(r -> ismissing(r[3]), reduced) ? missing : sum(Float64, (r[3] for r in reduced); init = 0.0)
-    names = (:group, :kernels, :dispatches, :time_s, :share, Symbol.(columns)..., :top_stalls, :limiter, :limiter_reason)
+    names = (:group, :kernels, :dispatches, :time_s, :share, Symbol.(columns)..., :top_stalls, :limiter, :dominant, :fraction, :limiter_reason)
     M = Union{Missing, Float64}
     NT = NamedTuple{names, Tuple{String, Vector{String}, Int, M, M, ntuple(_ -> M, length(columns))...,
-        Vector{Pair{String, Float64}}, Union{Missing, Symbol}, String}}
+        Vector{Pair{String, Float64}}, Union{Missing, Symbol}, Union{Missing, Symbol}, M, String}}
     rows = NT[]
     for (g, means, t) in reduced
         lim = _limiter(means; limiter...)
         share = ismissing(t) || ismissing(total) || total <= 0 ? missing : t / total
         push!(rows, NT((g, [h.kernel for h in groups[g]], sum(length, groups[g]), t, share,
-            (get(means, c, missing) for c in columns)..., _top_stalls(means, top_stalls), lim.limiter, lim.reason)))
+            (get(means, c, missing) for c in columns)..., _top_stalls(means, top_stalls), lim.limiter, lim.dominant, lim.fraction, lim.reason)))
     end
     sort!(rows; by = r -> coalesce(r.time_s, -Inf), rev = true)
     return rows

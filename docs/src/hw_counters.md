@@ -317,7 +317,8 @@ t = hw_counter_by_kernel("prof/step_ncu.csv")   # one row per kernel, largest sh
 - [`hw_counter_limiter`](@ref) is a rule of thumb with its thresholds as keywords: either
   throughput at or above 60 % of peak is compute- or memory-bound; both below 40 % is
   latency-bound, or occupancy-limited when achieved occupancy is below 25 %; anything between is
-  `:mixed`. Its `reason` quotes the numbers. Read it as where to look first.
+  `:mixed`. Its `reason` quotes the numbers, and `dominant` / `fraction` (the larger throughput and
+  its value) say how far from an edge a kernel is. Read it as where to look first.
 
 Reading the stall reasons (`NVIDIA_STALL_REASONS` has all of them): each is cycles per issued
 instruction, so `long_scoreboard` at 65 means a warp waits ~65 cycles on memory per

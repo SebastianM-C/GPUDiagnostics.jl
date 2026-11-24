@@ -137,9 +137,8 @@ hw_counters_available(v::Union{Backend, HWCounterCollector}; kwargs...) = hw_cou
 
 Build a `Cmd` wrapping a workload in rocprofv3 or Nsight Compute. Nothing is run or written
 by this function. The caller creates `dir` and runs the command. The working directory and
-environment are preserved, and [`PROFILER_ENV`](@ref) is added to the environment (a `cmd`
-without its own environment gets a copy of the current one; child processes inherit the
-marker whether or not ncu injects them). `set` names a preset of
+environment are preserved; an `env` prefix sets [`PROFILER_ENV`](@ref) for the collector and the
+workload (child processes inherit the marker whether or not ncu injects them). `set` names a preset of
 [`COUNTER_SETS`](@ref) (`:issue` when neither `set`, `metrics` nor ncu sections are given);
 `metrics` overrides the preset. `executable` overrides the tool location. A finite timeout
 uses the external `timeout` utility; `nothing` disables it. The backend extension selects
@@ -206,8 +205,10 @@ function hw_counter_command(collector::HWCounterCollector, cmd::Cmd; set::Union{
     args = _counter_command_args(collector, exe, pmc; dir, name, kernel = filter, kwargs...)
     append!(args, cmd.exec)
     timeout_s === nothing || (args = ["timeout", "-k", string(kill_after_s), string(timeout_s), args...])
-    # The marker lets the workload (and `peak_flops_probe`) know it runs under a counter collector.
-    return addenv(Cmd(Cmd(args); env = cmd.env, dir = cmd.dir), PROFILER_ENV => String(_counter_tool(collector)))
+    # The marker lets the workload (and `peak_flops_probe`) know it runs under a counter collector. Set through
+    # `env`, not `addenv`: that would copy all of ENV into the Cmd, which prints it (secrets included) on failure.
+    args = ["/usr/bin/env", PROFILER_ENV * "=" * String(_counter_tool(collector)), args...]
+    return Cmd(Cmd(args); env = cmd.env, dir = cmd.dir)
 end
 
 """
@@ -252,6 +253,8 @@ opened. The CUDA extension calls `cuProfilerStop`.
 """
 backend_counter_window_stop(b::Backend) = throw(BackendUnsupported(b, :counter_window, :hw_counter_window))
 
+const _WINDOW_DEPTH = Threads.Atomic{Int}(0)
+
 """
     hw_counter_window(f, backend)
 
@@ -260,21 +263,35 @@ Run `f()` inside the counter collector's profiling range and return its result: 
 The device is synchronized before the range opens and before it closes, so the range holds
 exactly the work `f` launches. Without an attached profiler the range costs two driver calls.
 Mark a steady-state window (after warm-up steps whose count depends on the run) instead of
-counting launches with `launch_skip`; ranges may repeat, and every one is profiled.
+counting launches with `launch_skip`; ranges may repeat, and every one is profiled. Nested
+windows act as the outermost one.
+
+Use it with `profile_from_start = false` only: in a collection that profiles from the start, the
+end of the window also ends profiling for the rest of the run. The range covers the current
+context, so launches that other tasks make meanwhile are profiled too.
 
 NVIDIA only (`:counter_window`) for now: no AMD equivalent is wired up, so on AMD select
 launches with the `kernel` filter.
 """
 function hw_counter_window(f, b::Backend)
     _require(b, :counter_window, :hw_counter_window)
-    KA.synchronize(b)
-    backend_counter_window_start(b)
-    try
-        r = f()
-        KA.synchronize(b)
-        return r
+    Threads.atomic_add!(_WINDOW_DEPTH, 1) == 0 || return try   # nested: the outermost call owns the range
+        f()
     finally
-        backend_counter_window_stop(b)
+        Threads.atomic_sub!(_WINDOW_DEPTH, 1)
+    end
+    try
+        KA.synchronize(b)
+        backend_counter_window_start(b)
+        try
+            r = f()
+            KA.synchronize(b)
+            return r
+        finally
+            backend_counter_window_stop(b)
+        end
+    finally
+        Threads.atomic_sub!(_WINDOW_DEPTH, 1)
     end
 end
 

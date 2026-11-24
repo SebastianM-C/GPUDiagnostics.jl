@@ -32,6 +32,7 @@ hw_counter_window(backend) do
 end
 step!()        # after the window: not profiled either
 KernelAbstractions.synchronize(backend)
+println("probe_under_profiler=", peak_flops_probe(backend, Float32).under_profiler)
 println("profiler_attached=", something(profiler_attached(), "nothing"))
 withenv(GPUDiagnostics.PROFILER_ENV => nothing) do   # what a hand-started ncu leaves: the Nsight variables
     println("profiler_attached_without_marker=", something(profiler_attached(), "nothing"))

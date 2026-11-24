@@ -205,23 +205,24 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
             backend = CounterTestBackend{typeof(collector)}()
             cmd = setenv(`julia run.jl`, ["TEST_KEY=2"]; dir = "/tmp")
             c = hw_counter_command(backend, cmd; dir = "out", name = "probe", timeout_s = nothing)
-            @test first(c.exec) == tool
+            @test c.exec[1:3] == ["/usr/bin/env", "$PROFILER_ENV=$tool", tool]
+            @test hw_counter_command(collector, `true`; dir = "out", name = "probe").env === nothing   # ENV is not copied into the Cmd
             @test c.exec == hw_counter_command(collector, cmd; dir = "out", name = "probe", timeout_s = nothing).exec
-            @test c.env == [cmd.env; "$PROFILER_ENV=$tool"] && c.dir == cmd.dir
+            @test c.env == cmd.env && c.dir == cmd.dir
             st = hw_counter_status(backend; executable = "gpudiag_no_such_profiler")
             @test st.tool == Symbol(tool) && !st.available && ismissing(st.permitted)
             @test !hw_counters_available(backend; executable = "gpudiag_no_such_profiler")
-            @test first(hw_counter_command(backend, cmd; dir = "out", name = "probe",
-                executable = "/custom/profiler", timeout_s = nothing).exec) == "/custom/profiler"
+            @test hw_counter_command(backend, cmd; dir = "out", name = "probe",
+                executable = "/custom/profiler", timeout_s = nothing).exec[3] == "/custom/profiler"
         end
         c = hw_counter_command(RocprofV3(), `julia run.jl`; set = :occupancy, dir = "out", name = "probe")
-        @test c.exec[1:6] == ["timeout", "-k", "20", "600", "rocprofv3", "--kernel-trace"]
-        @test c.exec[8:15] == COUNTER_SETS[:amd][:occupancy].metrics
+        @test c.exec[3:8] == ["timeout", "-k", "20", "600", "rocprofv3", "--kernel-trace"]
+        @test c.exec[10:17] == COUNTER_SETS[:amd][:occupancy].metrics
         @test c.exec[end-2:end] == ["--", "julia", "run.jl"]
         cmd = setenv(`julia run.jl`, ["TEST_KEY=1"]; dir = "/tmp")
         c = hw_counter_command(NsightCompute(), cmd; set = :fp64, dir = "out space", name = "probe",
             kernel = r"probe.*", launch_skip = 1, launch_count = 2, timeout_s = nothing)
-        @test c.env == ["TEST_KEY=1", "$PROFILER_ENV=ncu"] && c.dir == "/tmp"
+        @test c.env == ["TEST_KEY=1"] && c.dir == "/tmp"
         @test "out space/probe_ncu.csv" in c.exec && "regex:probe.*" in c.exec
         @test c.exec[findfirst(==("--clock-control"), c.exec) + 1] == "none"
         @test c.exec[findfirst(==("--launch-count"), c.exec) + 1] == "2"
@@ -242,9 +243,9 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
             write(exe, "#!/bin/sh\n"); chmod(exe, 0o755)
             st = hw_counter_status(RocprofV3(exe))
             @test st.available && st.executable == exe
-            @test first(hw_counter_command(RocprofV3(exe), `true`; dir = "o", name = "p", timeout_s = nothing).exec) == exe
-            @test first(hw_counter_command(RocprofV3(exe), `true`; dir = "o", name = "p", timeout_s = nothing,
-                executable = "/custom/profiler").exec) == "/custom/profiler"
+            @test hw_counter_command(RocprofV3(exe), `true`; dir = "o", name = "p", timeout_s = nothing).exec[3] == exe
+            @test hw_counter_command(RocprofV3(exe), `true`; dir = "o", name = "p", timeout_s = nothing,
+                executable = "/custom/profiler").exec[3] == "/custom/profiler"
             @test !hw_counter_status(RocprofV3(exe); executable = "gpudiag_no_such_profiler").available
         end
         @test RocprofV3() == RocprofV3(nothing)
@@ -263,7 +264,7 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test_throws MethodError hw_counter_status(:amd)
         amd = hw_counter_command(RocprofV3(), `true`; dir = "o", name = "p",
             kernel = r"probe.*", kernel_trace = false, metrics = ["SQ_WAVES:device=0"], timeout_s = nothing)
-        @test amd.exec == ["rocprofv3", "--kernel-include-regex", "probe.*", "--pmc",
+        @test amd.exec[3:end] == ["rocprofv3", "--kernel-include-regex", "probe.*", "--pmc",
             "SQ_WAVES:device=0", "--output-format", "csv", "-d", "o", "-o", "p", "--", "true"]
         @test all(p -> p.passes == 1, values(COUNTER_SETS[:amd]))
         for v in (:amd, :nvidia)   # the notes are the per-preset reading guide, not boilerplate
@@ -294,7 +295,8 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         err = try hw_counter_command(RocprofV3(), `true`; dir = "o", name = "p", sections = ["X"]); nothing catch e; e end
         @test err isa ArgumentError && occursin("RocprofV3 does not accept", err.msg)
         @test_throws ArgumentError hw_counter_command(RocprofV3(), `true`; dir = "o", name = "p", set = :stalls)
-        # presets: every stall reason, the limiter inputs, no pass count until one is measured
+        @test "--set" ∉ exec(; section_set = nothing, sections = nothing)   # "not given": the default preset
+        # presets: every stall reason, the limiter inputs, the measured pass counts
         @test length(NVIDIA_STALL_REASONS) == 17 && allunique(first.(NVIDIA_STALL_REASONS))
         st = COUNTER_SETS[:nvidia][:stalls]
         @test length(st.metrics) == 18 && all(m -> m == "gpu__time_duration.sum" || startswith(m, "smsp__average_warps_issue_stalled_"), st.metrics)
@@ -323,6 +325,9 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test kernel_name_stem("gpu_resort_rank_kernel_(CompilerMetadata<A, B>, Int32)") == "resort_rank_kernel"
         @test kernel_name_stem("gpu__fma_chain_kernel_(x)") == "_fma_chain_kernel"
         @test kernel_name_stem("plain") == "plain" && kernel_name_stem("gpu_") == "gpu_"
+        @test kernel_name_stem("gpu_foo_(x)") == "foo" && kernel_name_stem("gpu_foo__(x)") == "foo_"
+        @test kernel_name_stem("ns::(anonymous namespace)::foo(int)") == "ns::(anonymous namespace)::foo"
+        @test isempty(GPUDiagnostics._top_stalls(Dict("nvidia_stall_long_scoreboard" => 0.0), 3))
         @test_throws ArgumentError hw_counters(f)   # several kernels: hw_counters still wants one
         hs = hw_counter_kernels(f)
         @test length(hs) == 8 && sum(length, hs) == 21 && allunique(h.kernel for h in hs)
@@ -350,7 +355,16 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test first(t[2].top_stalls) == ("lg_throttle" => t[2].nvidia_stall_lg_throttle)
         @test length(t[1].top_stalls) == 3 && all(p -> first(p) ∉ ("selected", "not_selected"), t[1].top_stalls)
         @test all(r -> keys(r) == keys(t[1]), t)
-        @test hw_counter_limiter(t[2]) == (limiter = :memory_bound, top_stall = "lg_throttle", reason = t[2].limiter_reason)
+        @test hw_counter_limiter(t[2]) == (limiter = :memory_bound, dominant = :memory, fraction = t[2].fraction,
+            top_stall = "lg_throttle", reason = t[2].limiter_reason)
+        @test t[2].fraction == t[2].nvidia_memory_throughput && all(r -> r.dominant === :memory, t)
+        # every label, from synthetic inputs (the fixture has no compute-bound or occupancy-limited kernel)
+        lim(sm, mem, occ) = hw_counter_limiter((nvidia_sm_throughput = sm, nvidia_memory_throughput = mem, nvidia_active_occupancy = occ))
+        @test lim(0.9, 0.2, 0.8).limiter === :compute_bound && lim(0.9, 0.2, 0.8).dominant === :compute
+        @test lim(0.1, 0.9, 0.8).limiter === :memory_bound
+        @test lim(0.1, 0.2, 0.1).limiter === :occupancy_limited && lim(0.1, 0.2, 0.8).limiter === :latency_bound
+        @test lim(0.1, 0.59, 0.8).limiter === :mixed && lim(0.1, 0.59, 0.8).dominant === :memory && lim(0.1, 0.59, 0.8).fraction == 0.59
+        @test ismissing(hw_counter_limiter((nvidia_sm_throughput = 0.5,)).dominant)
         # time weighting: the group mean lies between its kernels' values, weighted by duration
         scan = hw_counter_kernels(f; kernel = r"^gpu_scan_tile")
         v = [x for h in scan for x in hw_counter_derived(h)["nvidia_sm_throughput"]]

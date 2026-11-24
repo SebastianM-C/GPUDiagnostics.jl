@@ -344,12 +344,12 @@ function _parse_ptxas_verbose(log::AbstractString)
             info["spill_load_bytes"] = parse(Int, m[3])
             continue
         end
-        # ptxas leaves the cumulative stack out when it is zero: "Used 10 registers, used 0 barriers".
+        # ptxas may leave the cumulative stack out ("Used 10 registers, used 0 barriers"); the key is then absent.
         m = match(r"Used (\d+) registers", line)
         if m !== nothing
             info["ptxas_registers"] = parse(Int, m[1])
             ms = match(r"(\d+) bytes cumulative stack size", line)
-            info["cumulative_stack_bytes"] = ms === nothing ? 0 : parse(Int, ms[1])
+            ms === nothing || (info["cumulative_stack_bytes"] = parse(Int, ms[1]))
         end
     end
     isempty(others) || (info["ptxas_functions"] = others)   # the entry name itself is mangled noise
