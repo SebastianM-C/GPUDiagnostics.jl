@@ -382,35 +382,6 @@ end
         end
     end
 
-    if VENDOR == "cuda"
-        @testset "register cap: the ISA report describes the capped binary" begin
-            # A plain CUDA.jl kernel launched with maxregs: the recorded job carries the cap, so the
-            # ptxas report must agree with the driver's attributes (issue #41).
-            function capped_kernel(out, x, niter)
-                i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-                @inbounds if i <= length(out)
-                    a = x[i]; b = 0.5 * a; c = 0.25 * a; d = 0.125 * a
-                    for _ in 1:niter
-                        a = fma(a, b, c); b = fma(b, c, d); c = fma(c, d, a); d = fma(d, a, b)
-                    end
-                    out[i] = a + b + c + d
-                end
-                return
-            end
-            xs = CUDA.rand(Float64, 4096); outs = similar(xs)
-            # `.maxnreg` reaches the PTX either way; ptxas may keep a floor above a small cap (18 at
-            # maxregs = 16 on sm_120), so the test is agreement, not the cap itself.
-            for cap in (32, 16)
-                cks = compiled_kernels(backend; pattern = r"capped_kernel") do
-                    @cuda threads = 256 blocks = 16 maxregs = cap capped_kernel(outs, xs, Int32(10))
-                    CUDA.synchronize()
-                end
-                @test length(cks) == 1
-                r = kernel_resources(backend, only(cks))
-                @info "register cap" cap registers = r.registers ptxas = get(r.isa, "ptxas_registers", missing) matches = get(r.isa, "ptxas_matches_attributes", missing)
-                @test get(r.isa, "ptxas_registers", missing) == r.registers
-                @test get(r.isa, "ptxas_matches_attributes", missing) === true
-            end
-        end
-    end
+    # A separate file: `@cuda` must not be expanded on the ROCm side.
+    VENDOR == "cuda" && include(joinpath(@__DIR__, "cuda_register_cap.jl"))
 end

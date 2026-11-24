@@ -14,9 +14,10 @@ The marketing name was replaced by a generic label. Numeric counters, units,
 durations, and kernel name are unchanged.
 
 `multikernel_ncu.csv` is a trimmed raw-page export of an Nsight Compute 2025.4.1
-collection on a GPU with compute capability 12.0: `--set detailed --section WarpStateStats
---section SchedulerStats`, `--profile-from-start off` around one 3D particle resort of
-the public ParticleMesh.jl project (96³ cells, Float32). It keeps the 21 launches of four
+collection on a GPU with compute capability 12.0 (the `--set detailed --section
+WarpStateStats --section SchedulerStats` collection of issue #53), `--profile-from-start
+off` around one 3D particle resort and one full sort of the public ParticleMesh.jl project
+(96³ cells, Float32). It keeps the 21 launches of four
 kernels (`resort_rank_kernel`, `gather_all_kernel`, five specializations of
 `scan_tile_kernel`, `tail_key_kernel`) and only the identity and geometry columns, the
 duration, the launch attributes and replay pass count (25), the speed-of-light and

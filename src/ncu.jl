@@ -165,7 +165,7 @@ before interpreting a collection. AMD sets are validated on gfx942 with rocprofv
 ROCm 7.2.4, and each fits one pass there; the L2 set is at the TCC block's four-counter
 capacity, and exceeding a block's capacity aborts rocprofv3 and hangs the workload (hence
 `timeout -k` in [`hw_counter_command`](@ref)). NVIDIA presets were collected on sm_120 with ncu
-2025.4.1; their recorded pass counts apply to a bounded FMA probe only, not to arbitrary
+2025.4.1 (`:stalls` and `:limiter` with 2026.3.1); their recorded pass counts apply to small probes only, not to arbitrary
 workloads or other GPUs. Raw custom `metrics` remain available. Unsupported metrics are
 errors from the collector, never silently replaced with different measurements.
 """

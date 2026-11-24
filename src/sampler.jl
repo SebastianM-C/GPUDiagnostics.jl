@@ -197,9 +197,8 @@ a counter) and, on NVIDIA GPUs with GPM (Hopper and newer) when `counters = :aut
 `sm_util`, `sm_occupancy` (ACHIEVED), `fp64_util`, `dram_bw_util`, `fp32_util`, `fp16_util`,
 `tensor_util`, `int_util`, `pcie_tx_MiBps`, `pcie_rx_MiBps`, `nvlink_rx_MiBps`, `nvlink_tx_MiBps`.
 `fp64_util` is a fraction of full-rate FP64 issue slots, not of the device's FP64 peak: on a
-part with a reduced FP64 path (1/64 on the RTX 50 / RTX PRO 6000 Blackwell parts, the B300)
-a saturated FP64 kernel reads about the rate ratio (0.012 at 84 % of the measured FP64 peak
-on an RTX PRO 6000). Attribute FP64 there with the peak-probe fraction or the ncu `:fp64`
+part with a reduced FP64 path a saturated FP64 kernel reads about the FP64 rate ratio (0.012
+at 84 % of the measured FP64 peak on a 1/64-rate RTX PRO 6000 Blackwell). Attribute FP64 there with the peak-probe fraction or the ncu `:fp64`
 preset's `nvidia_fp64_pipe_peak_fraction`.
 Interval metrics (GPM) cover the time since the previous `gpu_sample` of that device (the first
 call takes a 100 ms interval). This is exactly what the sampler child calls per tick; for a time
