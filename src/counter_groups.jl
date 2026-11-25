@@ -11,11 +11,32 @@ one trailing underscore (a Julia `!` becomes `_`): `"gpu_resort_rank_kernel_(Com
 → `"resort_rank_kernel"`. The default grouping of [`hw_counter_by_kernel`](@ref), which merges
 the launches of one Julia kernel compiled for different argument types. Kernels that are told
 apart by their argument types alone (a `foreachindex` loop, a broadcast) therefore share one
-group: pass `group = identity` (or your own function) to keep them separate."""
+group, and so do `foo` and `foo!`: pass `group = identity` (or your own function) to keep them
+separate. C++ template arguments stay in the name."""
 function kernel_name_stem(name::AbstractString)
-    m = match(r"^((?:[^(]|\(anonymous namespace\))*)", name)
-    s = chopsuffix(chopprefix(strip(m[1]), "gpu_"), "_")
+    s = chopsuffix(chopprefix(strip(_without_parameters(name)), "gpu_"), "_")
     return isempty(s) ? String(name) : String(s)
+end
+
+# The name up to its parameter list: the first `(` outside template arguments that is not part of
+# the name itself (an anonymous namespace, a C++ operator).
+const _NAME_TOKENS = ("(anonymous namespace)", "operator()", "operator<<", "operator<", "operator->", "operator>>", "operator>")
+function _without_parameters(name::AbstractString)
+    depth = 0
+    i = firstindex(name)
+    while i <= lastindex(name)
+        c = name[i]
+        if c == '(' || c == 'o'
+            rest = SubString(name, i)
+            k = findfirst(t -> startswith(rest, t), _NAME_TOKENS)
+            k === nothing || (i += ncodeunits(_NAME_TOKENS[k]); continue)
+        end
+        c == '(' && depth == 0 && return SubString(name, firstindex(name), prevind(name, i))
+        c == '<' && (depth += 1)
+        c == '>' && (depth = max(0, depth - 1))
+        i = nextind(name, i)
+    end
+    return SubString(name)
 end
 
 # Stall reasons that are not stalls: the issuing cycle and a ready warp that lost the pick.
@@ -62,7 +83,10 @@ function _limiter(means::AbstractDict; bound::Real = 0.6, low::Real = 0.4, occup
     stall_text = ismissing(top) ? "" : string(", top stall ", top, " ", round(last(first(stalls)); digits = 1), " cycles/issue")
     (ismissing(sm) || ismissing(mem)) && return (limiter = missing, dominant = missing, fraction = missing, top_stall = top,
         reason = "no speed-of-light counters: collect the :limiter preset or an ncu section set (NVIDIA only)")
-    sol = string("SM ", _pct(sm), ", memory ", _pct(mem), " of peak")
+    clock = get(means, "nvidia_elapsed_clock_GHz", missing)
+    max_clock = get(means, "nvidia_max_clock_GHz", missing)
+    sol = string("SM ", _pct(sm), ", memory ", _pct(mem), " of peak", ismissing(clock) ? "" :
+        string(" at ", round(clock; digits = 2), ismissing(max_clock) ? "" : string(" of ", round(max_clock; digits = 2)), " GHz"))
     dominant, fraction = sm >= mem ? (:compute, sm) : (:memory, mem)
     result(limiter, text) = (; limiter, dominant, fraction, top_stall = top, reason = sol * text * stall_text)
     if fraction >= bound
@@ -103,19 +127,29 @@ although their `fraction`s are close; compare those. `:mixed` only says that the
 between `low` and `bound`. The kernel may be balanced (compute 54 %, memory 59 %) or lean on one
 side without reaching its peak (compute 13 %, memory 50 %); compare the two throughputs to tell.
 
-The default thresholds are conventions, not measurements. On an A100 (sm_80) the labels agreed
-with unprofiled timings on a triad swept from memory-bound to compute-bound and on a pointer chase
-up to 3/4 occupancy (1.20× its unloaded time per hop); the chase at full occupancy (1.28×) sits
-in between at 41 % memory throughput and is `:mixed`. The larger throughput was never between 41 %
-and 85 % there, so any `bound` from 42 % to 84 % gives those same labels: the sweep supports the
-labels at the extremes and says nothing about the 60 % default. `reason` quotes the numbers the
-label came from. It is a starting point, not a diagnosis: read the stall reasons and the
-throughputs before acting on it. Throughputs are ratios to the
-peak at the clock the kernel ran at, so the label survives `clock_control = :base`.
+The default thresholds are conventions, not measurements. Held against unprofiled timings on an
+A100 (sm_80, SM clock locked to its 1410 MHz maximum), they agree at the extremes:
+
+- a copy with 0 to 512 FMAs per element is `:memory_bound` up to 32 (1.02× the time without FMAs)
+  and `:compute_bound` from 64 (1.24×). The larger throughput was never between 42 % and 84 %, so
+  any `bound` in that range gives the same labels: 60 % itself is untested;
+- a pointer chase is `:occupancy_limited` up to 1/4 of the GPU's resident blocks,
+  `:latency_bound` at 1/2 and 3/4 (1.15× and 1.26× the 1/16 time) and `:mixed` at full occupancy (1.37×, 41 %
+  memory throughput). The time rises smoothly, with no step at `occupancy_low` or `low`, and the
+  1/4 and full-occupancy launches sit on those cutoffs (25 % occupancy, 41 % throughput);
+- a 4 MiB copy is `:latency_bound` at 37 %, against `:mixed` on an RTX PRO 6000 (52 %).
+
+The label depends on the SM clock: SM throughput is relative to the SM clock and DRAM throughput
+to the memory clock. At 1095 MHz (the base clock, with `clock_control = :base` or locked) the copy with 32 FMAs
+became `:compute_bound` and the full-occupancy chase `:latency_bound`. Compare labels collected at the
+same clock, the one the run holds; `reason` quotes it when it was collected.
+
+`reason` quotes the numbers the label came from. It is a starting point, not a diagnosis: read the
+stall reasons and the throughputs before acting on it.
 """
 hw_counter_limiter(h::HWCounters; kwargs...) = _limiter(first(_group_means([h])); kwargs...)
 function hw_counter_limiter(row::NamedTuple; kwargs...)
-    means = Dict{String, Float64}(String(k) => v for (k, v) in pairs(row) if v isa Real && !(v isa Bool))
+    means = Dict{String, Float64}(String(k) => v for (k, v) in pairs(row) if v isa Real && !(v isa Bool) && isfinite(v))
     return _limiter(means; kwargs...)
 end
 

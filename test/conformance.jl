@@ -149,9 +149,11 @@ function conformance(backend; kernel = nothing, peak_threads = 2^12)
             if has(:counter_window)
                 @test has(:hw_counters)
                 @test hw_counter_window(() -> 42, backend) == 42   # no profiler attached: a no-op range
+                # Here only that nesting and failure return cleanly: test/hw_counters.jl checks the range itself on a
+                # fake backend, and test/gpu/window_probe.jl a nested window under the collector.
                 @test hw_counter_window(() -> hw_counter_window(() -> 7, backend), backend) == 7
                 @test_throws ErrorException hw_counter_window(() -> error("x"), backend)
-                @test GPUDiagnostics._WINDOW_DEPTH[] == 0
+                @test isempty(GPUDiagnostics._WINDOWS)
             else
                 @test_throws BackendUnsupported hw_counter_window(() -> 42, backend)
             end

@@ -5,6 +5,20 @@ struct CounterTestBackend{C <: HWCounterCollector} <: GPUDiagnostics.KA.Backend 
 GPUDiagnostics.supports(::CounterTestBackend, ::Val{:hw_counters}) = true
 GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C()
 
+# Records what `hw_counter_window` does to the profiling range; the device is task-local, as in CUDA.jl.
+struct WindowBackend <: GPUDiagnostics.KA.Backend
+    log::Vector{Any}
+    fail::Base.RefValue{Bool}
+end
+WindowBackend() = WindowBackend([], Ref(false))
+GPUDiagnostics.supports(::WindowBackend, ::Union{Val{:counter_window}, Val{:devices}}) = true
+GPUDiagnostics.gpu_device(::WindowBackend) = get(task_local_storage(), :window_device, 1)
+GPUDiagnostics.gpu_device!(b::WindowBackend, i::Integer) = (p = gpu_device(b); task_local_storage(:window_device, Int(i)); p)
+GPUDiagnostics.KA.synchronize(b::WindowBackend) = (push!(b.log, :sync); nothing)
+GPUDiagnostics.backend_counter_window_start(b::WindowBackend) =
+    b.fail[] ? error("no range") : (push!(b.log, (:start, gpu_device(b))); nothing)
+GPUDiagnostics.backend_counter_window_stop(b::WindowBackend) = (push!(b.log, (:stop, gpu_device(b))); nothing)
+
 @testset "hardware counters" begin
     fx = joinpath(@__DIR__, "fixtures", "rocprof")
     slots = 401 * 401 * 1666
@@ -215,6 +229,10 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
             @test hw_counter_command(backend, cmd; dir = "out", name = "probe",
                 executable = "/custom/profiler", timeout_s = nothing).exec[3] == "/custom/profiler"
         end
+        # `env` would read such a path as an assignment; behind `timeout` it is an ordinary argument
+        @test_throws ArgumentError hw_counter_command(NsightCompute(), `true`; dir = "out", name = "probe", executable = "/a=b/ncu", timeout_s = nothing)
+        @test hw_counter_command(NsightCompute(), `true`; dir = "out", name = "probe", executable = "/a=b/ncu").exec[7] == "/a=b/ncu"
+        @test GPUDiagnostics._marked(["ncu", "x"], NsightCompute(); windows = true) == ["ncu", "x"]
         c = hw_counter_command(RocprofV3(), `julia run.jl`; set = :occupancy, dir = "out", name = "probe")
         @test c.exec[3:8] == ["timeout", "-k", "20", "600", "rocprofv3", "--kernel-trace"]
         @test c.exec[10:17] == COUNTER_SETS[:amd][:occupancy].metrics
@@ -320,6 +338,54 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         end
     end
 
+    @testset "profiling window: one range per device" begin
+        b = WindowBackend()
+        mark(x) = push!(b.log, x)
+        W = GPUDiagnostics._WINDOWS
+        # nested: the inner window leaves the range open
+        @test hw_counter_window(b) do
+            hw_counter_window(() -> mark(:inner), b)
+            mark(:outer)
+            :r
+        end === :r
+        @test b.log == [:sync, (:start, 1), :inner, :sync, :outer, :sync, (:stop, 1)] && isempty(W)
+        # an inner failure that the outer catches leaves it open; an outer failure closes it
+        empty!(b.log)
+        @test_throws ErrorException hw_counter_window(b) do
+            try
+                hw_counter_window(() -> error("inner"), b)
+            catch
+            end
+            mark(:after)
+            error("outer")
+        end
+        @test b.log == [:sync, (:start, 1), :after, (:stop, 1)] && isempty(W)
+        # concurrent on one device: open until the last one ends
+        empty!(b.log)
+        first_in, second_in, first_out = Base.Event(), Base.Event(), Base.Event()
+        t1 = @async (hw_counter_window(() -> (notify(first_in); wait(second_in)), b); mark(:first_out); notify(first_out))
+        t2 = @async (wait(first_in); hw_counter_window(() -> (notify(second_in); wait(first_out); mark(:late)), b))
+        wait(t1); wait(t2)
+        @test filter(!=(:sync), b.log) == [(:start, 1), :first_out, :late, (:stop, 1)] && isempty(W)
+        # concurrent on two devices: a range each
+        empty!(b.log)
+        ev = [Base.Event(), Base.Event()]
+        ts = map(1:2) do i
+            @async (gpu_device!(b, i); hw_counter_window(() -> (notify(ev[i]); wait(ev[3 - i])), b))
+        end
+        foreach(wait, ts)
+        @test sort(filter(x -> x isa Tuple, b.log)) == [(:start, 1), (:start, 2), (:stop, 1), (:stop, 2)] && isempty(W)
+        # `f` selects another device: the range closes on the one it opened on, and the selection stays
+        empty!(b.log)
+        task = @async (hw_counter_window(() -> gpu_device!(b, 2), b); gpu_device(b))
+        @test fetch(task) == 2 && filter(x -> x isa Tuple, b.log) == [(:start, 1), (:stop, 1)] && isempty(W)
+        # a range that does not open leaves no window behind
+        empty!(b.log)
+        b.fail[] = true
+        @test_throws ErrorException hw_counter_window(() -> mark(:ran), b)
+        @test isempty(W) && :ran ∉ b.log
+    end
+
     @testset "multi-kernel collection: per-kernel table and limiter" begin
         f = joinpath(@__DIR__, "fixtures", "ncu", "multikernel_ncu.csv")
         @test kernel_name_stem("gpu_resort_rank_kernel_(CompilerMetadata<A, B>, Int32)") == "resort_rank_kernel"
@@ -327,6 +393,11 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test kernel_name_stem("plain") == "plain" && kernel_name_stem("gpu_") == "gpu_"
         @test kernel_name_stem("gpu_foo_(x)") == "foo" && kernel_name_stem("gpu_foo__(x)") == "foo_"
         @test kernel_name_stem("ns::(anonymous namespace)::foo(int)") == "ns::(anonymous namespace)::foo"
+        @test kernel_name_stem("ns::(anonymous namespace)::foo<(int)3>(int)") == "ns::(anonymous namespace)::foo<(int)3>"
+        @test kernel_name_stem("void foo<bar<(bool)1>, 2>(float*)") == "void foo<bar<(bool)1>, 2>"
+        @test kernel_name_stem("X::operator()(int)") == "X::operator()" && kernel_name_stem("X::operator<(int)") == "X::operator<"
+        @test kernel_name_stem("gpu_größe_kernel_(x)") == "größe_kernel"
+        @test length(kernel_name_stem("a"^100_000 * "(x)")) == 100_000
         @test isempty(GPUDiagnostics._top_stalls(Dict("nvidia_stall_long_scoreboard" => 0.0), 3))
         @test_throws ArgumentError hw_counters(f)   # several kernels: hw_counters still wants one
         hs = hw_counter_kernels(f)
@@ -365,6 +436,19 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
         @test lim(0.1, 0.2, 0.1).limiter === :occupancy_limited && lim(0.1, 0.2, 0.8).limiter === :latency_bound
         @test lim(0.1, 0.59, 0.8).limiter === :mixed && lim(0.1, 0.59, 0.8).dominant === :memory && lim(0.1, 0.59, 0.8).fraction == 0.59
         @test ismissing(hw_counter_limiter((nvidia_sm_throughput = 0.5,)).dominant)
+        @test ismissing(hw_counter_limiter((nvidia_sm_throughput = NaN, nvidia_memory_throughput = 0.5)).limiter)
+        # the SM clock the collection ran at is in the reason: the label depends on it
+        @test occursin("of peak at 2.0 of 2.66 GHz", hw_counter_limiter((nvidia_sm_throughput = 0.5, nvidia_memory_throughput = 0.5,
+            nvidia_elapsed_clock_GHz = 1.998, nvidia_max_clock_GHz = 2.655)).reason)
+        @test occursin("of peak at 2.0 GHz", hw_counter_limiter((nvidia_sm_throughput = 0.5, nvidia_memory_throughput = 0.5,
+            nvidia_elapsed_clock_GHz = 1.998)).reason)
+        mktempdir() do dir
+            csv = joinpath(dir, "clock_ncu.csv")
+            write(csv, "\"ID\",\"Kernel Name\",\"device__attribute_max_gpu_frequency_khz\",\"sm__cycles_elapsed.avg.per_second\"\n" *
+                "\"\",\"\",\"\",\"hz\"\n\"0\",\"k(int)\",\"2655000\",\"1998000000\"\n")
+            d = hw_counter_derived(only(hw_counter_kernels(csv)))
+            @test d["nvidia_elapsed_clock_GHz"] ≈ [1.998] && d["nvidia_max_clock_GHz"] ≈ [2.655]
+        end
         # time weighting: the group mean lies between its kernels' values, weighted by duration
         scan = hw_counter_kernels(f; kernel = r"^gpu_scan_tile")
         v = [x for h in scan for x in hw_counter_derived(h)["nvidia_sm_throughput"]]

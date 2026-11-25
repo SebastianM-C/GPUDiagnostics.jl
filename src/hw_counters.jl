@@ -138,7 +138,9 @@ hw_counters_available(v::Union{Backend, HWCounterCollector}; kwargs...) = hw_cou
 Build a `Cmd` wrapping a workload in rocprofv3 or Nsight Compute. Nothing is run or written
 by this function. The caller creates `dir` and runs the command. The working directory and
 environment are preserved; an `env` prefix sets [`PROFILER_ENV`](@ref) for the collector and the
-workload (child processes inherit the marker whether or not ncu injects them). `set` names a preset of
+workload (child processes inherit the marker whether or not ncu injects them; on Windows there is
+no `env` and no marker). A `cmd` built with `addenv` or `setenv` carries its whole environment, and
+so does the returned `Cmd`: printing it, as a failed `run` does, prints those variables. `set` names a preset of
 [`COUNTER_SETS`](@ref) (`:issue` when neither `set`, `metrics` nor ncu sections are given);
 `metrics` overrides the preset. `executable` overrides the tool location. A finite timeout
 uses the external `timeout` utility; `nothing` disables it. The backend extension selects
@@ -205,10 +207,15 @@ function hw_counter_command(collector::HWCounterCollector, cmd::Cmd; set::Union{
     args = _counter_command_args(collector, exe, pmc; dir, name, kernel = filter, kwargs...)
     append!(args, cmd.exec)
     timeout_s === nothing || (args = ["timeout", "-k", string(kill_after_s), string(timeout_s), args...])
-    # The marker lets the workload (and `peak_flops_probe`) know it runs under a counter collector. Set through
-    # `env`, not `addenv`: that would copy all of ENV into the Cmd, which prints it (secrets included) on failure.
-    args = ["/usr/bin/env", PROFILER_ENV * "=" * String(_counter_tool(collector)), args...]
-    return Cmd(Cmd(args); env = cmd.env, dir = cmd.dir)
+    return Cmd(Cmd(_marked(args, collector)); env = cmd.env, dir = cmd.dir)
+end
+# The marker lets the workload (and `peak_flops_probe`) know it runs under a counter collector. Set through
+# `env`, not `addenv`: that would copy all of ENV into the Cmd, which prints it (secrets included) on failure.
+function _marked(args, collector; windows::Bool = Sys.iswindows())
+    windows && return args   # no `env` there; `profiler_attached` still looks for the Nsight variables
+    # `env` reads every leading operand with a `=` as an assignment, and has no way to say otherwise.
+    occursin('=', first(args)) && throw(ArgumentError("the collector's path contains `=`: $(first(args)); use another path, or a finite `timeout_s`"))
+    return ["/usr/bin/env", PROFILER_ENV * "=" * String(_counter_tool(collector)), args...]
 end
 
 """
@@ -248,50 +255,73 @@ backend_counter_window_start(b::Backend) = throw(BackendUnsupported(b, :counter_
 
 """    backend_counter_window_stop(backend)
 
-Backend hook (`:counter_window`): close the range [`backend_counter_window_start`](@ref)
-opened. The CUDA extension calls `cuProfilerStop`.
+Backend hook (`:counter_window`): wait for the device's work and close the range
+[`backend_counter_window_start`](@ref) opened, also when the wait fails. The CUDA extension calls
+`cuProfilerStop`.
 """
 backend_counter_window_stop(b::Backend) = throw(BackendUnsupported(b, :counter_window, :hw_counter_window))
 
-const _WINDOW_DEPTH = Threads.Atomic{Int}(0)
+# Open windows per backend type and device. The first one in opens the profiling range and the last
+# one out closes it, so nested and concurrent windows on one device share a range.
+const _WINDOWS = Dict{Tuple{DataType, Int}, Int}()
+const _WINDOW_LOCK = ReentrantLock()
+_window_device(b) = supports(b, :devices) ? gpu_device(b) : 0
 
 """
     hw_counter_window(f, backend)
 
 Run `f()` inside the counter collector's profiling range and return its result: with
-`hw_counter_command(...; profile_from_start = false)`, only the launches of `f` are profiled.
-The device is synchronized before the range opens and before it closes, so the range holds
-exactly the work `f` launches. Without an attached profiler the range costs two driver calls.
+`hw_counter_command(...; profile_from_start = false)`, only launches made while a window is open
+are profiled. The device is synchronized before the range opens and before it closes, so work
+launched before the window is not in it, and all of `f`'s work is. Without an attached profiler
+the range still costs those synchronizations, which wait for every task's work on the device.
 Mark a steady-state window (after warm-up steps whose count depends on the run) instead of
-counting launches with `launch_skip`; ranges may repeat, and every one is profiled. Nested
-windows act as the outermost one.
+counting launches with `launch_skip`; ranges may repeat, and every one is profiled.
+
+Windows on one device share a range: it opens with the first and closes when the last one
+ends, so a nested window changes nothing and concurrent windows (one per task) are all
+profiled. The range covers the device, not the task: launches other tasks make meanwhile are
+profiled too. Windows on different devices are separate ranges (on a multi-GPU machine this is
+tested with a fake backend only, not under ncu). The device is the calling task's when the
+window opens; the range closes on that device even if `f` selects another one.
 
 Use it with `profile_from_start = false` only: in a collection that profiles from the start, the
-end of the window also ends profiling for the rest of the run. The range covers the current
-context, so launches that other tasks make meanwhile are profiled too.
+end of the window also ends profiling for the rest of the run.
 
 NVIDIA only (`:counter_window`) for now: no AMD equivalent is wired up, so on AMD select
 launches with the `kernel` filter.
 """
 function hw_counter_window(f, b::Backend)
     _require(b, :counter_window, :hw_counter_window)
-    Threads.atomic_add!(_WINDOW_DEPTH, 1) == 0 || return try   # nested: the outermost call owns the range
-        f()
-    finally
-        Threads.atomic_sub!(_WINDOW_DEPTH, 1)
+    key = (typeof(b), _window_device(b))
+    @lock _WINDOW_LOCK begin
+        n = get(_WINDOWS, key, 0)
+        if n == 0
+            KA.synchronize(b)
+            backend_counter_window_start(b)
+        end
+        _WINDOWS[key] = n + 1
     end
     try
-        KA.synchronize(b)
-        backend_counter_window_start(b)
-        try
-            r = f()
-            KA.synchronize(b)
-            return r
-        finally
-            backend_counter_window_stop(b)
-        end
+        r = f()
+        KA.synchronize(b)   # on the calling task's device, where it also reports a failed kernel
+        return r
     finally
-        Threads.atomic_sub!(_WINDOW_DEPTH, 1)
+        @lock _WINDOW_LOCK begin
+            n = _WINDOWS[key] - 1
+            n == 0 ? delete!(_WINDOWS, key) : (_WINDOWS[key] = n)
+            n == 0 && _close_window(b, last(key))
+        end
+    end
+end
+function _close_window(b, dev)
+    now = _window_device(b)
+    now == dev && return backend_counter_window_stop(b)
+    gpu_device!(b, dev)
+    try
+        return backend_counter_window_stop(b)
+    finally
+        gpu_device!(b, now)
     end
 end
 

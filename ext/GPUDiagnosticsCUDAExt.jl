@@ -15,7 +15,14 @@ GD.backend_counter_collector(::CUDABackend) = NsightCompute()
 # The profiling range of `ncu --profile-from-start off`; both calls are no-ops without a profiler.
 # `device_synchronize` waits for every stream of the context, not only the calling task's.
 GD.backend_counter_window_start(::CUDABackend) = (CUDA.device_synchronize(); CUDA.CUDACore.cuProfilerStart(); nothing)
-GD.backend_counter_window_stop(::CUDABackend) = (CUDA.device_synchronize(); CUDA.CUDACore.cuProfilerStop(); nothing)
+function GD.backend_counter_window_stop(::CUDABackend)
+    try
+        CUDA.device_synchronize()   # throws when a kernel failed on the device; the range must still close
+    finally
+        CUDA.CUDACore.cuProfilerStop()
+    end
+    return nothing
+end
 
 # NVML handle for the current CUDA device (NVML indexes by UUID, not the CUDA ordinal).
 _nvml() = NVML.Device(CUDA.uuid(CUDA.device()))

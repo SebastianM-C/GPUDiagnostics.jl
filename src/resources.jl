@@ -190,7 +190,7 @@ Returns a [`KernelResources`](@ref) (registers, local/spill and shared memory, `
   regenerated compile with the kernel's own options: `ptxas_registers`, `stack_frame_bytes`
   (the call-ABI / private-array frame), `spill_store_bytes`, `spill_load_bytes` (true
   register spills — the driver's local-memory figure lumps both together),
-  `cumulative_stack_bytes`, and `ptxas_functions`, the device functions assembled
+  `cumulative_stack_bytes` (absent when ptxas does not print it), and `ptxas_functions`, the device functions assembled
   out-of-line (a non-empty list beyond the runtime's exception helpers means Julia did not
   inline them; compare `CUDABackend(always_inline = true)`). `ptxas_matches_attributes`
   says whether that regenerated compile reproduced the runtime's register count.

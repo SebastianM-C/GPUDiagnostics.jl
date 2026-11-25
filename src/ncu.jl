@@ -55,16 +55,17 @@ end
 """
     NVIDIA_STALL_REASONS
 
-The warp stall reasons Nsight Compute reports on sm_120 (ncu 2025.4.1), each with what it
+The warp stall reasons Nsight Compute reports on both sm_120 and sm_80, each with what it
 means, as `reason => description`. The metric of reason `r` is
 `smsp__average_warps_issue_stalled_<r>_per_issue_active.ratio`: the average number of warps
 stalled for `r` per issued instruction, which reads as cycles per issued instruction spent in
 `r`. `selected` is the issuing cycle itself (1 by construction) and `not_selected` means the
-warp was ready but another one issued, so neither is a stall to fix. Other architectures may
-add or drop reasons; `ncu --query-metrics` lists what the installed GPU has. In a section-set
-export a reason the GPU lacks is absent, not zero; in the `:stalls` / `:limiter` presets,
-which name every reason, ncu may refuse the collection instead, so off sm_120 pass a
-`metrics` list of the reasons the GPU has.
+warp was ready but another one issued, so neither is a stall to fix. Architectures add
+reasons of their own, which are not in this table, the presets or `top_stalls` (ncu 2026.3.1
+lists `imc_miss` on sm_80 and `mio_throttle_pipe_mio` on sm_120); `ncu --query-metrics` lists
+what the installed GPU has. In a section-set export a reason the GPU lacks is absent, not
+zero; in the `:stalls` / `:limiter` presets, which name every reason here, ncu may refuse the
+collection instead on an architecture other than those two: pass a `metrics` list there.
 """
 const NVIDIA_STALL_REASONS = (
     "long_scoreboard" => "waiting on an L1TEX result (global, local, texture or surface memory): memory latency",
@@ -90,7 +91,7 @@ const _NCU_STALLS = [_stall_metric(first(r)) for r in NVIDIA_STALL_REASONS]
 # Speed of light and occupancy: the inputs of `hw_counter_limiter`.
 const _NCU_SOL = ["sm__throughput.avg.pct_of_peak_sustained_elapsed",
     "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
-    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
+    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed", "sm__cycles_elapsed.avg.per_second",
     "sm__warps_active.avg.pct_of_peak_sustained_active", "sm__maximum_warps_per_active_cycle_pct"]
 
 const _NCU_COUNTERS = Dict(
@@ -105,7 +106,8 @@ const _NCU_COUNTERS = Dict(
     :limiter => ["gpu__time_duration.sum"; _NCU_SOL; _NCU_STALLS],
 )
 # Replay passes of each preset where they were counted on sm_120: bounded FMA probe with ncu
-# 2025.4.1, and for :stalls / :limiter the GPU suite's window probe with ncu 2026.3.1.
+# 2025.4.1, and for :stalls / :limiter the GPU suite's window probe with ncu 2026.3.1. The :limiter count there
+# predates the SM clock metric, which left it at 11 passes on sm_80.
 const _NCU_PASSES = Dict(:issue => 1, :occupancy => 1, :memory => 1, :fp64 => 3, :l2 => 3, :stalls => 7, :limiter => 15)
 
 # What each NVIDIA preset answers, and how its denominators differ from the AMD twin.
@@ -147,8 +149,10 @@ const _NCU_PRESET_NOTES = Dict{Symbol, String}(
         "nvidia_sm_throughput, nvidia_memory_throughput, nvidia_dram_throughput), achieved and theoretical " *
         "occupancy (nvidia_active_occupancy, nvidia_theoretical_occupancy) and the :stalls metrics; " *
         "hw_counter_limiter turns them into a label. Memory throughput is the busiest of the memory units " *
-        "(L1, L2, DRAM), so it can be high with DRAM idle. Ratios to peak do not depend on the clock, so " *
-        "they survive clock_control = :base; durations do not.",
+        "(L1, L2, DRAM), so it can be high with DRAM idle. Each ratio is to the peak at its own unit's clock: " *
+        "a lower SM clock (clock_control = :base, ncu's own default) raises the SM throughput against the " *
+        "DRAM throughput and moves labels toward compute. nvidia_elapsed_clock_GHz and nvidia_max_clock_GHz " *
+        "say which clock the collection ran at.",
 )
 
 """
@@ -174,7 +178,7 @@ const COUNTER_SETS = Dict(
     :amd => Dict(k => CounterSet(copy(_AMD_COUNTERS[v]), ["gfx942 / rocprofv3 1.1.0 / ROCm 7.2.4"], 1,
         _AMD_PRESET_NOTES[k]) for (k, v) in
         (:issue => :sq_issue, :occupancy => :sq_waves, :memory => :l1_pipe, :fp64 => :fp64, :l2 => :l2)),
-    :nvidia => Dict(k => CounterSet(copy(v), [k in (:stalls, :limiter) ? "sm_120 / ncu 2026.3.1 / window probe (names also in an ncu 2025.4.1 --set detailed export)" :
+    :nvidia => Dict(k => CounterSet(copy(v), [k in (:stalls, :limiter) ? "sm_120 and sm_80 / ncu 2026.3.1 / window probe (names also in an ncu 2025.4.1 --set detailed export)" :
         "sm_120 / ncu 2025.4.1 / bounded FMA probe"], get(_NCU_PASSES, k, missing),
         _NCU_PRESET_NOTES[k]) for (k, v) in _NCU_COUNTERS),
 )
@@ -358,6 +362,8 @@ function _nvidia_derived(raw, d, units)
         u = get(units, "sm__cycles_elapsed.avg.per_second", missing)
         scale = get(Dict("cycle/second" => 1e-9, "cycle/nsecond" => 1.0, "hz" => 1e-9, "GHz" => 1.0), u, missing)
         out["nvidia_elapsed_clock_GHz"] = raw["sm__cycles_elapsed.avg.per_second"] * scale
+        khz = _numeric_or_missing(get(d.device, "device__attribute_max_gpu_frequency_khz", missing))
+        ismissing(khz) || khz <= 0 || (out["nvidia_max_clock_GHz"] = khz * 1e-6)
     end
     if !ismissing(d.slots)
         function instructions(c)

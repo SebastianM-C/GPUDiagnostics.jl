@@ -1,6 +1,7 @@
 # A bounded multi-kernel workload for the profiling window: warm-up launches outside the window,
 # then 2 launches of `window_fma!` and 1 of `window_copy!` inside `hw_counter_window`, and a peak
-# probe that must know it runs under the collector. Run with GPUDIAGNOSTICS_GPU=cuda.
+# probe that must know it runs under the collector. One of the launches comes after a nested window:
+# it is profiled only if that window leaves the range open. NVIDIA only.
 using KernelAbstractions, Adapt, CUDA, GPUDiagnostics
 backend = CUDABackend()
 
@@ -27,7 +28,7 @@ for _ in 1:5   # warm-up: never profiled under profile_from_start = false
     step!()
 end
 hw_counter_window(backend) do
-    step!()
+    hw_counter_window(step!, backend)
     window_fma!(backend, 256)(out, x, Int32(64); ndrange = n)
 end
 step!()        # after the window: not profiled either

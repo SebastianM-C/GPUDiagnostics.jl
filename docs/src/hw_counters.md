@@ -83,7 +83,7 @@ that counter access is enabled.
 Put the collector on `PATH`, or pass `executable = "/path/to/collector"` to both
 `hw_counter_status` and `hw_counter_command`. The command builder also uses `timeout`
 by default; set `timeout_s = nothing` if that utility is unavailable and bound the workload
-yourself.
+yourself. Off Windows it also starts the collector through `/usr/bin/env`.
 
 `supports(backend, :hw_counters)` means an implementation exists. `hw_counters_available`
 checks tool discovery only. `hw_counter_status` exposes the executable and leaves
@@ -257,7 +257,7 @@ hardware-counter collection. Capacity and metric support on other architectures 
 validation. NVIDIA metric support and replay cost also vary by GPU and profiler version.
 On a bounded sm_120 FMA probe with ncu 2025.4.1,
 issue/occupancy/memory used one pass and FP64/L2 used three; with ncu 2026.3.1, stalls used
-seven and limiter fifteen. These are validation
+seven and limiter fifteen (counted before it collected the SM clock); on sm_80, six and eleven. These are validation
 observations, not portable guarantees; query the target tool first.
 
 Commands use `timeout -k` to bound the profiler and workload if collection hangs. Set
@@ -278,8 +278,21 @@ and record the settings. See the [NVIDIA profiling guide](https://docs.nvidia.co
 **Clock control.** `clock_control = :base` locks the GPU to its base clock for the
 collection, so counter values are reproducible from run to run, but every duration in the
 collection is then a duration at base clock: compare its *shares* (one kernel's fraction of
-the collection) and its ratios to peak, never its seconds against a timed run. With the
-default `:none` the durations are at whatever clock the replay ran at, and still replays.
+the collection), never its seconds against a timed run. With the default `:none` the
+durations are at whatever clock the replay ran at, and still replays. `ncu` started by hand
+defaults to base.
+
+The ratios to peak depend on the clock too. SM throughput is relative to the SM clock and DRAM
+throughput to the memory clock, which base clocks leave alone, so a kernel looks more
+compute-heavy than it is in a run that boosts. `nvidia_elapsed_clock_GHz` and `nvidia_max_clock_GHz`
+(in `hw_counter_derived`, the `hw_counter_by_kernel` table and the limiter's `reason`) say which clock
+a collection ran at. To first order, when `nvidia_memory_throughput` equals
+`nvidia_dram_throughput`, the SM / memory ratio at another SM clock `f` is the collected one times
+`nvidia_elapsed_clock_GHz / f` (two launches on an A100: ratios 1.04 and 1.67 at 1095 MHz predict 0.81 and 1.29 at 1410 MHz,
+as measured there). When the memory throughput is higher than the DRAM one, the busiest memory unit is
+a cache whose clock moves with the SM clock or near it, and that correction overstates the change.
+Collect labels with `clock_control = :none` at the clock the run holds (or lock it with
+`nvidia-smi -lgc`), and use `:base` to compare counts between runs.
 
 ## Studying a whole step: section sets, a window, a table per kernel
 
@@ -305,7 +318,7 @@ t = hw_counter_by_kernel("prof/step_ncu.csv")   # one row per kernel, largest sh
   occupancy, memory tables, launch statistics and every stall reason in one collection,
   without listing metrics. `:detailed` with the two sections above costs 25 (ncu 2025.4.1) to
   27 (ncu 2026.3.1) replay passes per launch on sm_120, so the window matters. The `:limiter`
-  preset collects the subset the limiter label needs in 15 passes, `:stalls` in 7.
+  preset collects the subset the limiter label needs in about 15 passes, `:stalls` in 7.
 - `profile_from_start = false` with [`hw_counter_window`](@ref) profiles only the launches
   inside the window: no `launch_skip` to recount when the warm-up changes. NVIDIA only; on AMD
   select kernels with the `kernel` filter.
@@ -317,8 +330,9 @@ t = hw_counter_by_kernel("prof/step_ncu.csv")   # one row per kernel, largest sh
 - [`hw_counter_limiter`](@ref) is a rule of thumb with its thresholds as keywords: either
   throughput at or above 60 % of peak is compute- or memory-bound; both below 40 % is
   latency-bound, or occupancy-limited when achieved occupancy is below 25 %; anything between is
-  `:mixed`, which can mean balanced or only mid-range on one side. Its `reason` quotes the numbers, and `dominant` / `fraction` (the larger throughput and
-  its value) say how far from an edge a kernel is. Read it as where to look first.
+  `:mixed`, which can mean balanced or only mid-range on one side. Its `reason` quotes the numbers
+  and the SM clock, which the label depends on, and `dominant` / `fraction` (the larger throughput
+  and its value) say how far from an edge a kernel is. Read it as where to look first.
 
 Reading the stall reasons (`NVIDIA_STALL_REASONS` has all of them): each is cycles per issued
 instruction, so `long_scoreboard` at 65 means a warp waits ~65 cycles on memory per
