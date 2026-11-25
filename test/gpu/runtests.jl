@@ -364,7 +364,7 @@ end
                     stalls = [k for k in keys(t[1]) if startswith(String(k), "nvidia_stall_")]
                     @info "limiter preset" passes = get(first(hs).provenance, "passes", missing) stall_reasons = length(stalls) rows = [(r.group, r.share, r.limiter, r.limiter_reason) for r in t]
                     @test gpu_arch(backend) in ("8.0", "12.0") ? length(stalls) == length(NVIDIA_STALL_REASONS) : !isempty(stalls)
-                    @test all(r -> 0 < r.nvidia_elapsed_clock_GHz <= 1.1 * r.nvidia_max_clock_GHz, t)   # short launches read a few % high
+                    @test all(r -> 0 < r.nvidia_elapsed_clock_GHz <= 1.05 * r.nvidia_max_clock_GHz, t)   # short launches read a few % high
                     @test occursin("probe_under_profiler=ncu", logw)
                     copyrow = t[findfirst(r -> r.group == "window_copy", t)]
                     # Only the side: a 4 MiB copy is :latency_bound on an A100 (35 to 37 % of peak) and :mixed on an RTX PRO 6000.
@@ -376,11 +376,11 @@ end
                         @info "known-answer kernel" kernel = k limiter = r.limiter dominant = r.dominant fraction = r.fraction sm = r.nvidia_sm_throughput memory = r.nvidia_memory_throughput dram = r.nvidia_dram_throughput occupancy = r.nvidia_active_occupancy theoretical = r.nvidia_theoretical_occupancy top = r.top_stalls
                     end
                     @test known["cal_compute"].dominant === :compute && known["cal_memory"].dominant === :memory
-                    @test known["cal_occupancy"].limiter === :occupancy_limited   # one block: 8 warps on one SM
                     if gpu_arch(backend) == "8.0"   # the exact labels were only seen on an A100
                         @test known["cal_compute"].limiter === :compute_bound
                         @test known["cal_memory"].limiter === :memory_bound
                         @test known["cal_latency"].limiter === :latency_bound
+                        @test known["cal_occupancy"].limiter === :occupancy_limited   # one block: 8 warps on one SM
                     end
                     okw, _ = collect_window("window_stalls"; set = :stalls)
                     @test okw

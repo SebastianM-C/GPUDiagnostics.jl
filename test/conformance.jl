@@ -153,7 +153,7 @@ function conformance(backend; kernel = nothing, peak_threads = 2^12)
                 # fake backend, and test/gpu/window_probe.jl a nested window under the collector.
                 @test hw_counter_window(() -> hw_counter_window(() -> 7, backend), backend) == 7
                 @test_throws ErrorException hw_counter_window(() -> error("x"), backend)
-                @test isempty(GPUDiagnostics._WINDOWS)
+                @test all(w -> w.open == 0, values(GPUDiagnostics._WINDOWS))
             else
                 @test_throws BackendUnsupported hw_counter_window(() -> 42, backend)
             end

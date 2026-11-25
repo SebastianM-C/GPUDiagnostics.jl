@@ -1,6 +1,6 @@
 # Four kernels, launched twice each inside one profiling window, whose `hw_counter_limiter` label the
 # suite checks. Compute- and memory-bound are known by construction. The other two run the same loads
-# and differ only in how many blocks are resident, so telling them apart checks the `occupancy_low`
+# and differ in how many blocks are resident (and in hops), so telling them apart checks the `occupancy_low`
 # cutoff, not a limiter; the size of `cal_latency` was chosen after its first label. NVIDIA only.
 using KernelAbstractions, Adapt, CUDA, GPUDiagnostics
 backend = CUDABackend()
@@ -22,7 +22,7 @@ end
 # Dependent loads through a random cycle; the 32 lanes of a warp load the same element, so every
 # warp has one small request outstanding and waits for it. Launched at HALF the GPU's resident
 # blocks: at full occupancy the requests queue and the memory throughput is close to `low`
-# (40 to 41 % on an A100 at 1410 MHz, where the label is `:mixed`).
+# (41 % on an A100 at 1410 MHz, where the label is `:mixed`).
 @kernel function cal_latency!(out, @Const(next), nhops)
     i = @index(Global, Linear)
     p = Int32(mod((i - 1) ÷ 32 * 7919, length(next)) + 1)

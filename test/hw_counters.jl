@@ -8,16 +8,36 @@ GPUDiagnostics.backend_counter_collector(::CounterTestBackend{C}) where {C} = C(
 # Records what `hw_counter_window` does to the profiling range; the device is task-local, as in CUDA.jl.
 struct WindowBackend <: GPUDiagnostics.KA.Backend
     log::Vector{Any}
-    fail::Base.RefValue{Bool}
+    fail::Base.RefValue{Symbol}           # the hook that throws
+    gates::Dict{Int, Base.Event}          # device => event its range waits for before it opens
 end
-WindowBackend() = WindowBackend([], Ref(false))
-GPUDiagnostics.supports(::WindowBackend, ::Union{Val{:counter_window}, Val{:devices}}) = true
-GPUDiagnostics.gpu_device(::WindowBackend) = get(task_local_storage(), :window_device, 1)
-GPUDiagnostics.gpu_device!(b::WindowBackend, i::Integer) = (p = gpu_device(b); task_local_storage(:window_device, Int(i)); p)
-GPUDiagnostics.KA.synchronize(b::WindowBackend) = (push!(b.log, :sync); nothing)
-GPUDiagnostics.backend_counter_window_start(b::WindowBackend) =
-    b.fail[] ? error("no range") : (push!(b.log, (:start, gpu_device(b))); nothing)
-GPUDiagnostics.backend_counter_window_stop(b::WindowBackend) = (push!(b.log, (:stop, gpu_device(b))); nothing)
+WindowBackend() = WindowBackend([], Ref(:none), Dict())
+struct OtherWindowBackend <: GPUDiagnostics.KA.Backend
+    inner::WindowBackend
+end
+const _Windowed = Union{WindowBackend, OtherWindowBackend}
+_window_log(b::WindowBackend) = b
+_window_log(b::OtherWindowBackend) = b.inner
+GPUDiagnostics.supports(::_Windowed, ::Union{Val{:counter_window}, Val{:devices}}) = true
+GPUDiagnostics.gpu_device(::_Windowed) = get(task_local_storage(), :window_device, 1)
+GPUDiagnostics.gpu_device!(b::_Windowed, i::Integer) = (p = gpu_device(b); task_local_storage(:window_device, Int(i)); p)
+GPUDiagnostics.KA.synchronize(b::_Windowed) = (push!(_window_log(b).log, :sync); nothing)
+function GPUDiagnostics.backend_counter_window_start(b::_Windowed)
+    w = _window_log(b)
+    w.fail[] === :start && error("no range")
+    haskey(w.gates, gpu_device(b)) && wait(w.gates[gpu_device(b)])
+    sleep(0.02)   # another task may try to open a window meanwhile
+    push!(w.log, (:start, gpu_device(b)))
+    return nothing
+end
+function GPUDiagnostics.backend_counter_window_stop(b::_Windowed)
+    w = _window_log(b)
+    push!(w.log, (:stop, gpu_device(b)))
+    w.fail[] === :stop && error("range not closed")
+    return nothing
+end
+# A regression must fail, not hang the suite.
+_finished(ts...) = timedwait(() -> all(istaskdone, ts), 20) === :ok && all(!istaskfailed, ts)
 
 @testset "hardware counters" begin
     fx = joinpath(@__DIR__, "fixtures", "rocprof")
@@ -319,7 +339,8 @@ GPUDiagnostics.backend_counter_window_stop(b::WindowBackend) = (push!(b.log, (:s
         st = COUNTER_SETS[:nvidia][:stalls]
         @test length(st.metrics) == 18 && all(m -> m == "gpu__time_duration.sum" || startswith(m, "smsp__average_warps_issue_stalled_"), st.metrics)
         @test COUNTER_SETS[:nvidia][:limiter].metrics ⊇ st.metrics && "sm__maximum_warps_per_active_cycle_pct" in COUNTER_SETS[:nvidia][:limiter].metrics
-        @test st.passes == 7 && COUNTER_SETS[:nvidia][:limiter].passes == 15 && COUNTER_SETS[:nvidia][:fp64].passes == 3
+        @test "sm__cycles_elapsed.avg.per_second" in COUNTER_SETS[:nvidia][:limiter].metrics
+        @test st.passes == 7 && COUNTER_SETS[:nvidia][:limiter].passes == 11 && COUNTER_SETS[:nvidia][:fp64].passes == 3
         @test occursin("long_scoreboard", st.notes) && occursin("clock_control", COUNTER_SETS[:nvidia][:limiter].notes)
         @test !haskey(COUNTER_SETS[:amd], :stalls)
         # profiler marker and detection
@@ -341,14 +362,15 @@ GPUDiagnostics.backend_counter_window_stop(b::WindowBackend) = (push!(b.log, (:s
     @testset "profiling window: one range per device" begin
         b = WindowBackend()
         mark(x) = push!(b.log, x)
-        W = GPUDiagnostics._WINDOWS
+        closed() = all(w -> w.open == 0, values(GPUDiagnostics._WINDOWS))
+        ranges() = filter(x -> x isa Tuple, b.log)
         # nested: the inner window leaves the range open
         @test hw_counter_window(b) do
             hw_counter_window(() -> mark(:inner), b)
             mark(:outer)
             :r
         end === :r
-        @test b.log == [:sync, (:start, 1), :inner, :sync, :outer, :sync, (:stop, 1)] && isempty(W)
+        @test b.log == [:sync, (:start, 1), :inner, :sync, :outer, :sync, (:stop, 1)] && closed()
         # an inner failure that the outer catches leaves it open; an outer failure closes it
         empty!(b.log)
         @test_throws ErrorException hw_counter_window(b) do
@@ -359,31 +381,56 @@ GPUDiagnostics.backend_counter_window_stop(b::WindowBackend) = (push!(b.log, (:s
             mark(:after)
             error("outer")
         end
-        @test b.log == [:sync, (:start, 1), :after, (:stop, 1)] && isempty(W)
+        @test b.log == [:sync, (:start, 1), :after, (:stop, 1)] && closed()
         # concurrent on one device: open until the last one ends
         empty!(b.log)
         first_in, second_in, first_out = Base.Event(), Base.Event(), Base.Event()
         t1 = @async (hw_counter_window(() -> (notify(first_in); wait(second_in)), b); mark(:first_out); notify(first_out))
         t2 = @async (wait(first_in); hw_counter_window(() -> (notify(second_in); wait(first_out); mark(:late)), b))
-        wait(t1); wait(t2)
-        @test filter(!=(:sync), b.log) == [(:start, 1), :first_out, :late, (:stop, 1)] && isempty(W)
+        @test _finished(t1, t2)
+        @test filter(!=(:sync), b.log) == [(:start, 1), :first_out, :late, (:stop, 1)] && closed()
         # concurrent on two devices: a range each
         empty!(b.log)
         ev = [Base.Event(), Base.Event()]
         ts = map(1:2) do i
             @async (gpu_device!(b, i); hw_counter_window(() -> (notify(ev[i]); wait(ev[3 - i])), b))
         end
-        foreach(wait, ts)
-        @test sort(filter(x -> x isa Tuple, b.log)) == [(:start, 1), (:start, 2), (:stop, 1), (:stop, 2)] && isempty(W)
+        @test _finished(ts...)
+        @test sort(ranges()) == [(:start, 1), (:start, 2), (:stop, 1), (:stop, 2)] && closed()
         # `f` selects another device: the range closes on the one it opened on, and the selection stays
         empty!(b.log)
         task = @async (hw_counter_window(() -> gpu_device!(b, 2), b); gpu_device(b))
-        @test fetch(task) == 2 && filter(x -> x isa Tuple, b.log) == [(:start, 1), (:stop, 1)] && isempty(W)
+        @test fetch(task) == 2 && ranges() == [(:start, 1), (:stop, 1)] && closed()
         # a range that does not open leaves no window behind
         empty!(b.log)
-        b.fail[] = true
+        b.fail[] = :start
         @test_throws ErrorException hw_counter_window(() -> mark(:ran), b)
-        @test isempty(W) && :ran ∉ b.log
+        @test closed() && :ran ∉ b.log
+        # nor does one that does not close
+        empty!(b.log)
+        b.fail[] = :stop
+        @test_throws ErrorException hw_counter_window(() -> nothing, b)
+        b.fail[] = :none
+        @test closed()
+        hw_counter_window(() -> nothing, b)
+        @test ranges() == [(:start, 1), (:stop, 1), (:start, 1), (:stop, 1)]
+        # two tasks open at once: one range
+        empty!(b.log)
+        both = [Base.Event(), Base.Event()]
+        ts = map(i -> (@async hw_counter_window(() -> (notify(both[i]); wait(both[3 - i])), b)), 1:2)
+        @test _finished(ts...) && ranges() == [(:start, 1), (:stop, 1)] && closed()
+        # a range that is slow to open on one device does not hold up another device
+        empty!(b.log)
+        b.gates[1] = Base.Event()
+        t1 = @async hw_counter_window(() -> nothing, b)
+        t2 = @async (gpu_device!(b, 2); hw_counter_window(() -> notify(b.gates[1]), b))
+        done = _finished(t1, t2)
+        notify(b.gates[1]); delete!(b.gates, 1)   # release t1 if it is still waiting
+        @test done && sort(ranges()) == [(:start, 1), (:start, 2), (:stop, 1), (:stop, 2)]
+        # another backend type has its own range on the same device number
+        empty!(b.log)
+        hw_counter_window(() -> hw_counter_window(() -> nothing, OtherWindowBackend(b)), b)
+        @test ranges() == [(:start, 1), (:start, 1), (:stop, 1), (:stop, 1)] && closed()
     end
 
     @testset "multi-kernel collection: per-kernel table and limiter" begin
@@ -395,7 +442,15 @@ GPUDiagnostics.backend_counter_window_stop(b::WindowBackend) = (push!(b.log, (:s
         @test kernel_name_stem("ns::(anonymous namespace)::foo(int)") == "ns::(anonymous namespace)::foo"
         @test kernel_name_stem("ns::(anonymous namespace)::foo<(int)3>(int)") == "ns::(anonymous namespace)::foo<(int)3>"
         @test kernel_name_stem("void foo<bar<(bool)1>, 2>(float*)") == "void foo<bar<(bool)1>, 2>"
-        @test kernel_name_stem("X::operator()(int)") == "X::operator()" && kernel_name_stem("X::operator<(int)") == "X::operator<"
+        @test kernel_name_stem("X::operator()(int)") == "X::operator()"
+        for op in ("<", "<<", ">", ">>", "->", "<=", "<<=")
+            @test kernel_name_stem("X::operator$op(int)") == "X::operator$op"
+            @test kernel_name_stem("X::operator$op <(int)3>(int)") == "X::operator$op <(int)3>"   # demanglers put the space
+        end
+        @test kernel_name_stem("void apply_operator<(int)3>(float*)") == "void apply_operator<(int)3>"   # not an operator
+        @test kernel_name_stem("apply_operator()") == "apply_operator" && kernel_name_stem("gpu_operator()") == "operator"
+        @test kernel_name_stem("enable_if<(1<2), void>::type foo(int)") == "enable_if<(1<2), void>::type foo"
+        @test kernel_name_stem("a>b(int)") == "a>b"
         @test kernel_name_stem("gpu_größe_kernel_(x)") == "größe_kernel"
         @test length(kernel_name_stem("a"^100_000 * "(x)")) == 100_000
         @test isempty(GPUDiagnostics._top_stalls(Dict("nvidia_stall_long_scoreboard" => 0.0), 3))
@@ -436,6 +491,7 @@ GPUDiagnostics.backend_counter_window_stop(b::WindowBackend) = (push!(b.log, (:s
         @test lim(0.1, 0.2, 0.1).limiter === :occupancy_limited && lim(0.1, 0.2, 0.8).limiter === :latency_bound
         @test lim(0.1, 0.59, 0.8).limiter === :mixed && lim(0.1, 0.59, 0.8).dominant === :memory && lim(0.1, 0.59, 0.8).fraction == 0.59
         @test ismissing(hw_counter_limiter((nvidia_sm_throughput = 0.5,)).dominant)
+        @test occursin("occupancy unknown", hw_counter_limiter((nvidia_sm_throughput = 0.1, nvidia_memory_throughput = 0.2)).reason)
         @test ismissing(hw_counter_limiter((nvidia_sm_throughput = NaN, nvidia_memory_throughput = 0.5)).limiter)
         # the SM clock the collection ran at is in the reason: the label depends on it
         @test occursin("of peak at 2.0 of 2.66 GHz", hw_counter_limiter((nvidia_sm_throughput = 0.5, nvidia_memory_throughput = 0.5,
@@ -448,6 +504,8 @@ GPUDiagnostics.backend_counter_window_stop(b::WindowBackend) = (push!(b.log, (:s
                 "\"\",\"\",\"\",\"hz\"\n\"0\",\"k(int)\",\"2655000\",\"1998000000\"\n")
             d = hw_counter_derived(only(hw_counter_kernels(csv)))
             @test d["nvidia_elapsed_clock_GHz"] ≈ [1.998] && d["nvidia_max_clock_GHz"] ≈ [2.655]
+            write(csv, replace(read(csv, String), "2655000" => "0"))   # an unreported maximum is not 0 GHz
+            @test !haskey(hw_counter_derived(only(hw_counter_kernels(csv))), "nvidia_max_clock_GHz")
         end
         # time weighting: the group mean lies between its kernels' values, weighted by duration
         scan = hw_counter_kernels(f; kernel = r"^gpu_scan_tile")

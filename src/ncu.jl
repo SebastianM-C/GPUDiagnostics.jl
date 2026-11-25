@@ -106,9 +106,15 @@ const _NCU_COUNTERS = Dict(
     :limiter => ["gpu__time_duration.sum"; _NCU_SOL; _NCU_STALLS],
 )
 # Replay passes of each preset where they were counted on sm_120: bounded FMA probe with ncu
-# 2025.4.1, and for :stalls / :limiter the GPU suite's window probe with ncu 2026.3.1. The :limiter count there
-# predates the SM clock metric, which left it at 11 passes on sm_80.
-const _NCU_PASSES = Dict(:issue => 1, :occupancy => 1, :memory => 1, :fp64 => 3, :l2 => 3, :stalls => 7, :limiter => 15)
+# 2025.4.1, for :stalls the GPU suite's window probe with ncu 2026.3.1. :limiter is the same on sm_80: on sm_120 it
+# was only counted (15) before it collected the SM clock.
+const _NCU_PASSES = Dict(:issue => 1, :occupancy => 1, :memory => 1, :fp64 => 3, :l2 => 3, :stalls => 7, :limiter => 11)
+
+const _NCU_VALIDATED = Dict(
+    :stalls => ["sm_120 / ncu 2026.3.1 / window probe, 7 passes", "sm_80 / ncu 2026.3.1 / window probe, 6 passes"],
+    :limiter => ["sm_80 / ncu 2026.3.1 / window probe, 11 passes",
+        "sm_120 / ncu 2026.3.1 / window probe, 15 passes, without sm__cycles_elapsed.avg.per_second"],
+)
 
 # What each NVIDIA preset answers, and how its denominators differ from the AMD twin.
 const _NCU_PRESET_NOTES = Dict{Symbol, String}(
@@ -151,7 +157,7 @@ const _NCU_PRESET_NOTES = Dict{Symbol, String}(
         "hw_counter_limiter turns them into a label. Memory throughput is the busiest of the memory units " *
         "(L1, L2, DRAM), so it can be high with DRAM idle. Each ratio is to the peak at its own unit's clock: " *
         "a lower SM clock (clock_control = :base, ncu's own default) raises the SM throughput against the " *
-        "DRAM throughput and moves labels toward compute. nvidia_elapsed_clock_GHz and nvidia_max_clock_GHz " *
+        "DRAM throughput and can change the label. nvidia_elapsed_clock_GHz and nvidia_max_clock_GHz " *
         "say which clock the collection ran at.",
 )
 
@@ -170,7 +176,8 @@ before interpreting a collection. AMD sets are validated on gfx942 with rocprofv
 ROCm 7.2.4, and each fits one pass there; the L2 set is at the TCC block's four-counter
 capacity, and exceeding a block's capacity aborts rocprofv3 and hangs the workload (hence
 `timeout -k` in [`hw_counter_command`](@ref)). NVIDIA presets were collected on sm_120 with ncu
-2025.4.1 (`:stalls` and `:limiter` with 2026.3.1); their recorded pass counts apply to small probes only, not to arbitrary
+2025.4.1, `:stalls` and `:limiter` with 2026.3.1 on sm_80 and sm_120 (see `validated_on`, whose first
+entry `passes` belongs to); pass counts apply to small probes only, not to arbitrary
 workloads or other GPUs. Raw custom `metrics` remain available. Unsupported metrics are
 errors from the collector, never silently replaced with different measurements.
 """
@@ -178,8 +185,7 @@ const COUNTER_SETS = Dict(
     :amd => Dict(k => CounterSet(copy(_AMD_COUNTERS[v]), ["gfx942 / rocprofv3 1.1.0 / ROCm 7.2.4"], 1,
         _AMD_PRESET_NOTES[k]) for (k, v) in
         (:issue => :sq_issue, :occupancy => :sq_waves, :memory => :l1_pipe, :fp64 => :fp64, :l2 => :l2)),
-    :nvidia => Dict(k => CounterSet(copy(v), [k in (:stalls, :limiter) ? "sm_120 and sm_80 / ncu 2026.3.1 / window probe (names also in an ncu 2025.4.1 --set detailed export)" :
-        "sm_120 / ncu 2025.4.1 / bounded FMA probe"], get(_NCU_PASSES, k, missing),
+    :nvidia => Dict(k => CounterSet(copy(v), get(_NCU_VALIDATED, k, ["sm_120 / ncu 2025.4.1 / bounded FMA probe"]), get(_NCU_PASSES, k, missing),
         _NCU_PRESET_NOTES[k]) for (k, v) in _NCU_COUNTERS),
 )
 

@@ -257,7 +257,7 @@ hardware-counter collection. Capacity and metric support on other architectures 
 validation. NVIDIA metric support and replay cost also vary by GPU and profiler version.
 On a bounded sm_120 FMA probe with ncu 2025.4.1,
 issue/occupancy/memory used one pass and FP64/L2 used three; with ncu 2026.3.1, stalls used
-seven and limiter fifteen (counted before it collected the SM clock); on sm_80, six and eleven. These are validation
+seven, and limiter fifteen before it collected the SM clock; on sm_80, six and eleven (with it). These are validation
 observations, not portable guarantees; query the target tool first.
 
 Commands use `timeout -k` to bound the profiler and workload if collection hangs. Set
@@ -289,8 +289,11 @@ compute-heavy than it is in a run that boosts. `nvidia_elapsed_clock_GHz` and `n
 a collection ran at. To first order, when `nvidia_memory_throughput` equals
 `nvidia_dram_throughput`, the SM / memory ratio at another SM clock `f` is the collected one times
 `nvidia_elapsed_clock_GHz / f` (two launches on an A100: ratios 1.04 and 1.67 at 1095 MHz predict 0.81 and 1.29 at 1410 MHz,
-as measured there). When the memory throughput is higher than the DRAM one, the busiest memory unit is
-a cache whose clock moves with the SM clock or near it, and that correction overstates the change.
+as measured there). When the memory throughput is higher than the DRAM one, the busiest memory unit
+is a cache, whose clock may move with the SM clock, and the correction may overstate the change;
+that case was not measured. The correction gives the ratio, so which side dominates, not the
+label: the label uses the throughputs themselves. Launches of tens of microseconds read a clock a few
+percent off.
 Collect labels with `clock_control = :none` at the clock the run holds (or lock it with
 `nvidia-smi -lgc`), and use `:base` to compare counts between runs.
 
@@ -318,7 +321,7 @@ t = hw_counter_by_kernel("prof/step_ncu.csv")   # one row per kernel, largest sh
   occupancy, memory tables, launch statistics and every stall reason in one collection,
   without listing metrics. `:detailed` with the two sections above costs 25 (ncu 2025.4.1) to
   27 (ncu 2026.3.1) replay passes per launch on sm_120, so the window matters. The `:limiter`
-  preset collects the subset the limiter label needs in about 15 passes, `:stalls` in 7.
+  preset collects the subset the limiter label needs in 11 passes on sm_80, `:stalls` in 6 there and 7 on sm_120.
 - `profile_from_start = false` with [`hw_counter_window`](@ref) profiles only the launches
   inside the window: no `launch_skip` to recount when the warm-up changes. NVIDIA only; on AMD
   select kernels with the `kernel` filter.

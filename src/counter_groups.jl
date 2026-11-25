@@ -12,7 +12,8 @@ one trailing underscore (a Julia `!` becomes `_`): `"gpu_resort_rank_kernel_(Com
 the launches of one Julia kernel compiled for different argument types. Kernels that are told
 apart by their argument types alone (a `foreachindex` loop, a broadcast) therefore share one
 group, and so do `foo` and `foo!`: pass `group = identity` (or your own function) to keep them
-separate. C++ template arguments stay in the name."""
+separate. C++ template arguments stay in the name; a parenthesis in a C++ return type
+(`decltype(f()) foo(int)`) is taken for the parameter list."""
 function kernel_name_stem(name::AbstractString)
     s = chopsuffix(chopprefix(strip(_without_parameters(name)), "gpu_"), "_")
     return isempty(s) ? String(name) : String(s)
@@ -20,20 +21,31 @@ end
 
 # The name up to its parameter list: the first `(` outside template arguments that is not part of
 # the name itself (an anonymous namespace, a C++ operator).
-const _NAME_TOKENS = ("(anonymous namespace)", "operator()", "operator<<", "operator<", "operator->", "operator>>", "operator>")
+const _NAME_TOKENS = ("(anonymous namespace)", "operator()", "operator<<", "operator<")   # a `>` outside template arguments is skipped anyway
 function _without_parameters(name::AbstractString)
-    depth = 0
+    depth = parens = 0   # open template brackets, and parentheses inside them, where `<` and `>` compare
     i = firstindex(name)
+    previous = ' '
     while i <= lastindex(name)
         c = name[i]
-        if c == '(' || c == 'o'
+        if c == '(' || (c == 'o' && !(isletter(previous) || isdigit(previous) || previous == '_'))
             rest = SubString(name, i)
             k = findfirst(t -> startswith(rest, t), _NAME_TOKENS)
-            k === nothing || (i += ncodeunits(_NAME_TOKENS[k]); continue)
+            if k !== nothing
+                i += ncodeunits(_NAME_TOKENS[k])
+                previous = ' '
+                continue
+            end
         end
-        c == '(' && depth == 0 && return SubString(name, firstindex(name), prevind(name, i))
-        c == '<' && (depth += 1)
-        c == '>' && (depth = max(0, depth - 1))
+        if depth == 0
+            c == '(' && return SubString(name, firstindex(name), prevind(name, i))
+            c == '<' && (depth = 1)
+        elseif c == '(' || c == ')'
+            parens = max(0, parens + (c == '(' ? 1 : -1))
+        elseif parens == 0 && (c == '<' || c == '>')
+            depth += c == '<' ? 1 : -1
+        end
+        previous = c
         i = nextind(name, i)
     end
     return SubString(name)
@@ -82,7 +94,7 @@ function _limiter(means::AbstractDict; bound::Real = 0.6, low::Real = 0.4, occup
     top = isempty(stalls) ? missing : first(first(stalls))
     stall_text = ismissing(top) ? "" : string(", top stall ", top, " ", round(last(first(stalls)); digits = 1), " cycles/issue")
     (ismissing(sm) || ismissing(mem)) && return (limiter = missing, dominant = missing, fraction = missing, top_stall = top,
-        reason = "no speed-of-light counters: collect the :limiter preset or an ncu section set (NVIDIA only)")
+        reason = "no finite speed-of-light counters: collect the :limiter preset or an ncu section set (NVIDIA only)")
     clock = get(means, "nvidia_elapsed_clock_GHz", missing)
     max_clock = get(means, "nvidia_max_clock_GHz", missing)
     sol = string("SM ", _pct(sm), ", memory ", _pct(mem), " of peak", ismissing(clock) ? "" :
@@ -98,7 +110,7 @@ function _limiter(means::AbstractDict; bound::Real = 0.6, low::Real = 0.4, occup
             return result(:occupancy_limited, string(", achieved occupancy ", _pct(occ),
                 ismissing(theo) ? "" : string(" of a theoretical ", _pct(theo))))
         end
-        return result(:latency_bound, "")
+        return result(:latency_bound, ismissing(occ) ? ", achieved occupancy unknown" : "")
     end
     return result(:mixed, " (between the thresholds)")
 end
@@ -128,21 +140,25 @@ between `low` and `bound`. The kernel may be balanced (compute 54 %, memory 59 %
 side without reaching its peak (compute 13 %, memory 50 %); compare the two throughputs to tell.
 
 The default thresholds are conventions, not measurements. Held against unprofiled timings on an
-A100 (sm_80, SM clock locked to its 1410 MHz maximum), they agree at the extremes:
+A100 (sm_80, SM clock locked to its 1410 MHz maximum), the labels agree at the extremes:
 
 - a copy with 0 to 512 FMAs per element is `:memory_bound` up to 32 (1.02× the time without FMAs)
   and `:compute_bound` from 64 (1.24×). The larger throughput was never between 42 % and 84 %, so
-  any `bound` in that range gives the same labels: 60 % itself is untested;
+  any `bound` in that range gives the same labels for both sweeps: 60 % itself is untested;
 - a pointer chase is `:occupancy_limited` up to 1/4 of the GPU's resident blocks,
   `:latency_bound` at 1/2 and 3/4 (1.15× and 1.26× the 1/16 time) and `:mixed` at full occupancy (1.37×, 41 %
   memory throughput). The time rises smoothly, with no step at `occupancy_low` or `low`, and the
-  1/4 and full-occupancy launches sit on those cutoffs (25 % occupancy, 41 % throughput);
-- a 4 MiB copy is `:latency_bound` at 37 %, against `:mixed` on an RTX PRO 6000 (52 %).
+  1/4 and full-occupancy launches sit on those cutoffs (25 % occupancy, 41 % throughput).
+
+Small launches are less clear, and none was timed unprofiled: in the GPU suite a 4 MiB copy is
+`:latency_bound` on the A100 (35 to 37 % memory throughput, clock not locked) and `:mixed` on an RTX
+PRO 6000 (52 %), and a small FMA kernel is at 61 to 62 % SM throughput on the A100, just above `bound`.
 
 The label depends on the SM clock: SM throughput is relative to the SM clock and DRAM throughput
 to the memory clock. At 1095 MHz (the base clock, with `clock_control = :base` or locked) the copy with 32 FMAs
 became `:compute_bound` and the full-occupancy chase `:latency_bound`. Compare labels collected at the
-same clock, the one the run holds; `reason` quotes it when it was collected.
+same clock, the one the run holds; `reason` quotes it when it was collected (launches of tens of
+microseconds read a few percent off, so it can exceed the maximum).
 
 `reason` quotes the numbers the label came from. It is a starting point, not a diagnosis: read the
 stall reasons and the throughputs before acting on it.

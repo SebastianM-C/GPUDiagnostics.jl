@@ -2,7 +2,7 @@
     CounterSet
 
 A profiler preset: native `metrics`, the `validated_on` architecture/tool descriptions,
-`passes` (known only in that validation context), and `notes`. Presets express intent;
+`passes` (known only in the first of those validation contexts), and `notes`. Presets express intent;
 they do not promise identical counters or collection cost on different architectures.
 """
 struct CounterSet
@@ -248,8 +248,9 @@ end
 """    backend_counter_window_start(backend)
 
 Backend hook (`:counter_window`): open the profiling range of an attached counter collector,
-the call [`hw_counter_window`](@ref) makes before the workload; [`backend_counter_window_stop`](@ref)
-closes it. The CUDA extension calls `cuProfilerStart`, a no-op without a profiler.
+the call [`hw_counter_window`](@ref) makes before the workload, after `KA.synchronize`; wait here
+for whatever work of the device that does not cover (other tasks' streams).
+[`backend_counter_window_stop`](@ref) closes the range. The CUDA extension calls `cuProfilerStart`, a no-op without a profiler.
 """
 backend_counter_window_start(b::Backend) = throw(BackendUnsupported(b, :counter_window, :hw_counter_window))
 
@@ -261,10 +262,16 @@ Backend hook (`:counter_window`): wait for the device's work and close the range
 """
 backend_counter_window_stop(b::Backend) = throw(BackendUnsupported(b, :counter_window, :hw_counter_window))
 
-# Open windows per backend type and device. The first one in opens the profiling range and the last
-# one out closes it, so nested and concurrent windows on one device share a range.
-const _WINDOWS = Dict{Tuple{DataType, Int}, Int}()
-const _WINDOW_LOCK = ReentrantLock()
+# The open windows on one device. The first one in opens the profiling range and the last one out
+# closes it, so nested and concurrent windows share a range. The lock is per device: opening and
+# closing wait for the device, and must not make another device's windows wait too.
+mutable struct _DeviceWindows
+    const lock::ReentrantLock
+    open::Int
+end
+const _WINDOWS = Dict{Tuple{DataType, Int}, _DeviceWindows}()
+const _WINDOWS_LOCK = ReentrantLock()
+_device_windows(b, dev) = @lock _WINDOWS_LOCK get!(() -> _DeviceWindows(ReentrantLock(), 0), _WINDOWS, (typeof(b), dev))
 _window_device(b) = supports(b, :devices) ? gpu_device(b) : 0
 
 """
@@ -274,7 +281,7 @@ Run `f()` inside the counter collector's profiling range and return its result: 
 `hw_counter_command(...; profile_from_start = false)`, only launches made while a window is open
 are profiled. The device is synchronized before the range opens and before it closes, so work
 launched before the window is not in it, and all of `f`'s work is. Without an attached profiler
-the range still costs those synchronizations, which wait for every task's work on the device.
+the range still costs those synchronizations (on CUDA of the whole context, so of every task's work).
 Mark a steady-state window (after warm-up steps whose count depends on the run) instead of
 counting launches with `launch_skip`; ranges may repeat, and every one is profiled.
 
@@ -293,24 +300,23 @@ launches with the `kernel` filter.
 """
 function hw_counter_window(f, b::Backend)
     _require(b, :counter_window, :hw_counter_window)
-    key = (typeof(b), _window_device(b))
-    @lock _WINDOW_LOCK begin
-        n = get(_WINDOWS, key, 0)
-        if n == 0
+    dev = _window_device(b)
+    windows = _device_windows(b, dev)
+    @lock windows.lock begin
+        if windows.open == 0
             KA.synchronize(b)
             backend_counter_window_start(b)
         end
-        _WINDOWS[key] = n + 1
+        windows.open += 1
     end
     try
         r = f()
         KA.synchronize(b)   # on the calling task's device, where it also reports a failed kernel
         return r
     finally
-        @lock _WINDOW_LOCK begin
-            n = _WINDOWS[key] - 1
-            n == 0 ? delete!(_WINDOWS, key) : (_WINDOWS[key] = n)
-            n == 0 && _close_window(b, last(key))
+        @lock windows.lock begin
+            windows.open -= 1
+            windows.open == 0 && _close_window(b, dev)
         end
     end
 end
