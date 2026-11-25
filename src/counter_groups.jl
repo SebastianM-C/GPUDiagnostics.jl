@@ -98,14 +98,19 @@ dispatches), `limiter` is
   yet).
 
 `dominant` (`:compute` or `:memory`) is the larger of the two throughputs and `fraction` its
-value: the label has hard edges, so a kernel at 59 % and one at 62 % differ in `limiter` and
-not in `dominant` / `fraction`; compare those. On an A100 (sm_80) the labels agreed with
-unprofiled timings on a triad swept from memory-bound to compute-bound and on a pointer chase
+value: the label has hard edges, so a kernel at 59 % and one at 62 % differ in `limiter`
+although their `fraction`s are close; compare those. `:mixed` only says that the larger throughput is
+between `low` and `bound`. The kernel may be balanced (compute 54 %, memory 59 %) or lean on one
+side without reaching its peak (compute 13 %, memory 50 %); compare the two throughputs to tell.
+
+The default thresholds are conventions, not measurements. On an A100 (sm_80) the labels agreed
+with unprofiled timings on a triad swept from memory-bound to compute-bound and on a pointer chase
 up to 3/4 occupancy (1.20× its unloaded time per hop); the chase at full occupancy (1.28×) sits
-in between at 41 % memory throughput and is `:mixed`. The 60 % cutoff was not probed closely:
-the triad's throughputs jump past it. Expect edge cases. `reason` quotes the numbers the label came
-from. It is a starting point, not a diagnosis: the default thresholds are choices (40 % and
-60 % of peak), not measurements; read the stall reasons and the throughputs before acting on it. Throughputs are ratios to the
+in between at 41 % memory throughput and is `:mixed`. The larger throughput was never between 41 %
+and 85 % there, so any `bound` from 42 % to 84 % gives those same labels: the sweep supports the
+labels at the extremes and says nothing about the 60 % default. `reason` quotes the numbers the
+label came from. It is a starting point, not a diagnosis: read the stall reasons and the
+throughputs before acting on it. Throughputs are ratios to the
 peak at the clock the kernel ran at, so the label survives `clock_control = :base`.
 """
 hw_counter_limiter(h::HWCounters; kwargs...) = _limiter(first(_group_means([h])); kwargs...)
