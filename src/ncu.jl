@@ -8,32 +8,91 @@ or [`hw_counter_status`](@ref) when no CUDA runtime is loaded.
 struct NsightCompute <: HWCounterCollector end
 _counter_vendor(::NsightCompute) = :nvidia
 _counter_tool(::NsightCompute) = :ncu
-_collector_keywords(::NsightCompute) = (:launch_skip, :launch_count, :clock_control, :cache_control, :replay_mode, :target_processes)
+_collector_keywords(::NsightCompute) = (:launch_skip, :launch_count, :clock_control, :cache_control, :replay_mode,
+    :target_processes, :section_set, :sections, :profile_from_start)
+# Whether the call collects ncu sections, which can stand in for a metric list.
+_collects_sections(::HWCounterCollector, kwargs) = false
+_collects_sections(::NsightCompute, kwargs) =
+    get(kwargs, :section_set, nothing) !== nothing || !isempty(something(get(kwargs, :sections, nothing), ()))
+
+_section_name(s::Union{Symbol, AbstractString}, what) =
+    (t = String(s); isempty(t) || occursin(r"[\s,]", t) ? throw(ArgumentError("invalid ncu $what $(repr(s))")) : t)
 
 function _counter_command_args(::NsightCompute, exe, metrics; dir, name, kernel,
         launch_skip::Integer = 0, launch_count::Union{Nothing, Integer} = nothing,
         clock_control::Symbol = :none, cache_control::Symbol = :all, replay_mode::Symbol = :kernel,
-        target_processes::Symbol = :application)
+        target_processes::Symbol = :application, section_set::Union{Nothing, Symbol, AbstractString} = nothing,
+        sections = String[], profile_from_start::Bool = true)
     launch_skip >= 0 || throw(ArgumentError("launch_skip must be non-negative"))
     launch_count === nothing || launch_count > 0 || throw(ArgumentError("launch_count must be positive"))
     clock_control in (:none, :base, :boost) || throw(ArgumentError("invalid clock_control"))
     cache_control in (:none, :all) || throw(ArgumentError("invalid cache_control"))
     replay_mode in (:kernel, :application) || throw(ArgumentError("replay_mode must be :kernel or :application"))
     target_processes in (:application, :all) || throw(ArgumentError("target_processes must be :application or :all"))
+    sections = something(sections, String[])
+    sections isa Union{AbstractVector, Tuple} || throw(ArgumentError("sections must be a vector of ncu section identifiers"))
     # ncu's own default is `all`. `:application` injects only the launched process (`env`/`bash -c` exec into it, so those
     # wrappers are fine); `:all` follows every child — needed when the GPU work runs in a
     # subprocess, and otherwise a way to inject precompile workers and the telemetry sampler.
-    args = String[exe, "--target-processes", target_processes === :all ? "all" : "application-only",
-        "--metrics", join(metrics, ','),
-        "--clock-control", String(clock_control), "--cache-control", String(cache_control),
+    args = String[exe, "--target-processes", target_processes === :all ? "all" : "application-only"]
+    # Sections and a metric list add up: ncu collects the union, and the raw page exports all of it.
+    section_set === nothing || append!(args, ["--set", _section_name(section_set, "section set")])
+    for s in sections
+        append!(args, ["--section", _section_name(s, "section")])
+    end
+    isempty(metrics) || append!(args, ["--metrics", join(metrics, ',')])
+    profile_from_start || append!(args, ["--profile-from-start", "off"])
+    append!(args, ["--clock-control", String(clock_control), "--cache-control", String(cache_control),
         "--replay-mode", String(replay_mode), "--launch-skip", string(launch_skip),
         "--csv", "--page", "raw", "--print-units", "base",
-        "--log-file", joinpath(dir, name * "_ncu.csv"), "--export", joinpath(dir, name)]
+        "--log-file", joinpath(dir, name * "_ncu.csv"), "--export", joinpath(dir, name)])
     kernel === nothing || append!(args, ["--kernel-name", "regex:" * kernel])
     launch_count === nothing || append!(args, ["--launch-count", string(launch_count)])
     push!(args, "--")
     return args
 end
+
+"""
+    NVIDIA_STALL_REASONS
+
+The warp stall reasons Nsight Compute reports on both sm_120 and sm_80, each with what it
+means, as `reason => description`. The metric of reason `r` is
+`smsp__average_warps_issue_stalled_<r>_per_issue_active.ratio`: the average number of warps
+stalled for `r` per issued instruction, which reads as cycles per issued instruction spent in
+`r`. `selected` is the issuing cycle itself (1 by construction) and `not_selected` means the
+warp was ready but another one issued, so neither is a stall to fix. Architectures add
+reasons of their own, which are not in this table, the presets or `top_stalls` (ncu 2026.3.1
+lists `imc_miss` on sm_80 and `mio_throttle_pipe_mio` on sm_120); `ncu --query-metrics` lists
+what the installed GPU has. In a section-set export a reason the GPU lacks is absent, not
+zero; in the `:stalls` / `:limiter` presets, which name every reason here, ncu may refuse the
+collection instead on an architecture other than those two: pass a `metrics` list there.
+"""
+const NVIDIA_STALL_REASONS = (
+    "long_scoreboard" => "waiting on an L1TEX result (global, local, texture or surface memory): memory latency",
+    "lg_throttle" => "the local/global memory instruction queue of the LSU is full: too many memory instructions in flight",
+    "membar" => "waiting at a memory fence, including the one a sequentially consistent atomic carries",
+    "barrier" => "waiting at a block barrier (`@synchronize`) for the other warps of the block",
+    "short_scoreboard" => "waiting on an MIO result: shared memory or a special-function (MUFU) instruction",
+    "mio_throttle" => "the MIO instruction queue is full: shared memory, special math or dynamic branches",
+    "math_pipe_throttle" => "the math pipe the next instruction needs is busy: the warp is compute-bound",
+    "wait" => "a fixed-latency dependency between instructions",
+    "tex_throttle" => "the texture unit's queue is full",
+    "drain" => "waiting for memory stores to drain at the end of the warp",
+    "branch_resolving" => "waiting for a branch target to be computed",
+    "dispatch_stall" => "the dispatcher could not issue the selected instruction",
+    "no_instruction" => "no instruction fetched: an instruction-cache miss or a branch to cold code",
+    "sleeping" => "the warp is sleeping (`nanosleep`) or yielded",
+    "misc" => "a stall ncu does not attribute to another reason",
+    "not_selected" => "ready, but another warp issued: enough parallelism, not a stall to fix",
+    "selected" => "the cycle the warp issued in (1 by construction)",
+)
+_stall_metric(r) = "smsp__average_warps_issue_stalled_" * r * "_per_issue_active.ratio"
+const _NCU_STALLS = [_stall_metric(first(r)) for r in NVIDIA_STALL_REASONS]
+# Speed of light and occupancy: the inputs of `hw_counter_limiter`.
+const _NCU_SOL = ["sm__throughput.avg.pct_of_peak_sustained_elapsed",
+    "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
+    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed", "sm__cycles_elapsed.avg.per_second",
+    "sm__warps_active.avg.pct_of_peak_sustained_active", "sm__maximum_warps_per_active_cycle_pct"]
 
 const _NCU_COUNTERS = Dict(
     :issue => ["gpu__time_duration.sum", "smsp__inst_executed.sum", "smsp__thread_inst_executed.sum"],
@@ -43,6 +102,18 @@ const _NCU_COUNTERS = Dict(
         "smsp__sass_thread_inst_executed_op_dadd_pred_on.sum", "smsp__sass_thread_inst_executed_op_dmul_pred_on.sum",
         "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active"],
     :l2 => ["gpu__time_duration.sum", "lts__t_sector_hit_rate.pct"],
+    :stalls => ["gpu__time_duration.sum"; _NCU_STALLS],
+    :limiter => ["gpu__time_duration.sum"; _NCU_SOL; _NCU_STALLS],
+)
+# Replay passes of each preset where they were counted on sm_120: bounded FMA probe with ncu
+# 2025.4.1, for :stalls the GPU suite's window probe with ncu 2026.3.1. :limiter is the same on sm_80: on sm_120 it
+# was only counted (15) before it collected the SM clock.
+const _NCU_PASSES = Dict(:issue => 1, :occupancy => 1, :memory => 1, :fp64 => 3, :l2 => 3, :stalls => 7, :limiter => 11)
+
+const _NCU_VALIDATED = Dict(
+    :stalls => ["sm_120 / ncu 2026.3.1 / window probe, 7 passes", "sm_80 / ncu 2026.3.1 / window probe, 6 passes"],
+    :limiter => ["sm_80 / ncu 2026.3.1 / window probe, 11 passes",
+        "sm_120 / ncu 2026.3.1 / window probe, 15 passes, without sm__cycles_elapsed.avg.per_second"],
 )
 
 # What each NVIDIA preset answers, and how its denominators differ from the AMD twin.
@@ -69,20 +140,44 @@ const _NCU_PRESET_NOTES = Dict{Symbol, String}(
     :l2 => "lts__t_sector_hit_rate.pct: L2 hit rate over 32 B SECTOR lookups (nvidia_l2_sector_hit_rate). " *
         "Sectors are not AMD's TCC requests, so the two hit rates have different denominators and are " *
         "not directly comparable. Three replay passes on sm_120.",
+    :stalls => "Why warps do not issue: smsp__average_warps_issue_stalled_<reason>_per_issue_active.ratio for " *
+        "every reason of NVIDIA_STALL_REASONS (→ nvidia_stall_<reason>), the average number of warps stalled " *
+        "for that reason per issued instruction, i.e. cycles per issued instruction. Read the largest one " *
+        "after `selected` (1 by construction) and `not_selected` (a ready warp that lost the pick): " *
+        "long_scoreboard is memory latency (a strided or dependent load), lg_throttle a full LSU queue " *
+        "(many narrow loads; vectorize or coalesce), membar a fence (an atomic with sequentially consistent " *
+        "ordering where a relaxed one suffices), barrier a block barrier, math_pipe_throttle a busy math pipe. " *
+        "The ratios are per issued instruction, so they compare kernels with different instruction counts; " *
+        "a large ratio in a kernel that runs for microseconds still costs nothing. A stall reason says what " *
+        "warps waited on, not that the wait limits the kernel: hold it against the throughputs (:limiter).",
+    :limiter => "What limits the kernel: speed of light (sm__throughput, gpu__compute_memory_throughput and " *
+        "gpu__dram_throughput as fractions of their sustained peak over the elapsed cycles → " *
+        "nvidia_sm_throughput, nvidia_memory_throughput, nvidia_dram_throughput), achieved and theoretical " *
+        "occupancy (nvidia_active_occupancy, nvidia_theoretical_occupancy) and the :stalls metrics; " *
+        "hw_counter_limiter turns them into a label. Memory throughput is the busiest of the memory units " *
+        "(L1, L2, DRAM), so it can be high with DRAM idle. Each ratio is to the peak at its own unit's clock: " *
+        "a lower SM clock (clock_control = :base, ncu's own default) raises the SM throughput against the " *
+        "DRAM throughput and can change the label. nvidia_elapsed_clock_GHz and nvidia_max_clock_GHz " *
+        "say which clock the collection ran at.",
 )
 
 """
     COUNTER_SETS
 
 Intent-based presets: `COUNTER_SETS[:amd][:issue]` / `COUNTER_SETS[:nvidia][:issue]`,
-plus `:occupancy`, `:memory`, `:fp64`, and `:l2`. Each value is a [`CounterSet`](@ref) whose
+plus `:occupancy`, `:memory`, `:fp64`, and `:l2` for both vendors, and on NVIDIA `:stalls`
+(warp stall reasons, see [`NVIDIA_STALL_REASONS`](@ref)) and `:limiter` (speed of light,
+occupancy and stalls: the inputs of [`hw_counter_limiter`](@ref)). AMD has no per-reason stall
+counters; its `:occupancy` preset splits wave time into issuing, waiting on the arbiter and
+waiting on data. Each value is a [`CounterSet`](@ref) whose
 `notes` say what the preset answers, how its raw values must be read (which counters are
 per-wave, per-thread, event counts or quad-cycles) and the trap specific to it — read them
 before interpreting a collection. AMD sets are validated on gfx942 with rocprofv3 1.1.0,
 ROCm 7.2.4, and each fits one pass there; the L2 set is at the TCC block's four-counter
 capacity, and exceeding a block's capacity aborts rocprofv3 and hangs the workload (hence
 `timeout -k` in [`hw_counter_command`](@ref)). NVIDIA presets were collected on sm_120 with ncu
-2025.4.1; their recorded pass counts apply to a bounded FMA probe only, not to arbitrary
+2025.4.1, `:stalls` and `:limiter` with 2026.3.1 on sm_80 and sm_120 (see `validated_on`, whose first
+entry `passes` belongs to); pass counts apply to small probes only, not to arbitrary
 workloads or other GPUs. Raw custom `metrics` remain available. Unsupported metrics are
 errors from the collector, never silently replaced with different measurements.
 """
@@ -90,7 +185,7 @@ const COUNTER_SETS = Dict(
     :amd => Dict(k => CounterSet(copy(_AMD_COUNTERS[v]), ["gfx942 / rocprofv3 1.1.0 / ROCm 7.2.4"], 1,
         _AMD_PRESET_NOTES[k]) for (k, v) in
         (:issue => :sq_issue, :occupancy => :sq_waves, :memory => :l1_pipe, :fp64 => :fp64, :l2 => :l2)),
-    :nvidia => Dict(k => CounterSet(copy(v), ["sm_120 / ncu 2025.4.1 / bounded FMA probe"], k in (:fp64, :l2) ? 3 : 1,
+    :nvidia => Dict(k => CounterSet(copy(v), get(_NCU_VALIDATED, k, ["sm_120 / ncu 2025.4.1 / bounded FMA probe"]), get(_NCU_PASSES, k, missing),
         _NCU_PRESET_NOTES[k]) for (k, v) in _NCU_COUNTERS),
 )
 
@@ -137,7 +232,7 @@ function _ncu_dim_product(value)
     return m === nothing ? missing : prod(parse.(Int, m.captures))
 end
 
-function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = Dict(), provenance = Dict(), required_metrics = nothing)
+function _parse_ncu(file; device_overrides = Dict())
     header, records = _ncu_records(file)
     long = "Metric Name" in header
     long && foreach(c -> _csv_column(header, c, file), ("Metric Unit", "Metric Value"))
@@ -225,7 +320,7 @@ function _parse_ncu(file; kernel = nothing, slots = nothing, device_overrides = 
         dispatches[i] = HWDispatch(d.id, d.process_id, d.device_id, d.context_id, d.queue_id,
             d.kernel, d.start_s, duration, d.resources, d.device, d.slots)
     end
-    return _build_counters(NsightCompute(), file, dispatches, rows, units; kernel, slots, provenance, required_metrics)
+    return NsightCompute(), dispatches, rows, units
 end
 
 # A metadata cell: numeric where it parses as a number, the string otherwise, `missing` for the
@@ -261,10 +356,20 @@ function _nvidia_derived(raw, d, units)
     percent("nvidia_active_occupancy", "sm__warps_active.avg.pct_of_peak_sustained_active")
     percent("nvidia_l2_sector_hit_rate", "lts__t_sector_hit_rate.pct")
     percent("nvidia_fp64_pipe_peak_fraction", "sm__pipe_fp64_cycles_active.avg.pct_of_peak_sustained_active")
+    percent("nvidia_sm_throughput", "sm__throughput.avg.pct_of_peak_sustained_elapsed")
+    percent("nvidia_memory_throughput", "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed")
+    percent("nvidia_dram_throughput", "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed")
+    percent("nvidia_theoretical_occupancy", "sm__maximum_warps_per_active_cycle_pct")
+    for (r, _) in NVIDIA_STALL_REASONS   # warps per issued instruction: a ratio, its unit cell varies by version
+        c = _stall_metric(r)
+        haskey(raw, c) && (out["nvidia_stall_" * r] = raw[c])
+    end
     if haskey(raw, "sm__cycles_elapsed.avg.per_second")
         u = get(units, "sm__cycles_elapsed.avg.per_second", missing)
         scale = get(Dict("cycle/second" => 1e-9, "cycle/nsecond" => 1.0, "hz" => 1e-9, "GHz" => 1.0), u, missing)
         out["nvidia_elapsed_clock_GHz"] = raw["sm__cycles_elapsed.avg.per_second"] * scale
+        khz = _numeric_or_missing(get(d.device, "device__attribute_max_gpu_frequency_khz", missing))
+        ismissing(khz) || khz <= 0 || (out["nvidia_max_clock_GHz"] = khz * 1e-6)
     end
     if !ismissing(d.slots)
         function instructions(c)

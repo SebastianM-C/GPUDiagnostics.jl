@@ -153,8 +153,7 @@ function _rocprof_devices(path)
     return devices
 end
 
-function _parse_rocprof(file; kernel = nothing, slots = nothing,
-        device_overrides = Dict(), provenance = Dict(), required_metrics = nothing)
+function _parse_rocprof(file; device_overrides = Dict())
     header, records = _read_csv(file)
     for c in ("Dispatch_Id", "Kernel_Name", "Counter_Name", "Counter_Value")
         _csv_column(header, c, file)
@@ -201,7 +200,7 @@ function _parse_rocprof(file; kernel = nothing, slots = nothing,
         rows[i][counter] = _counter_number(getv("Counter_Value"))
     end
     # Preserve tool file order, including distinct processes/devices with the same dispatch ID.
-    return _build_counters(RocprofV3(), file, dispatches, rows, Dict(); kernel, slots, provenance, required_metrics)
+    return RocprofV3(), dispatches, rows, Dict{String, Union{Missing, String}}()
 end
 
 # Per architecture family, how the SQ block reports: the unit of its wave-cycle counters and the

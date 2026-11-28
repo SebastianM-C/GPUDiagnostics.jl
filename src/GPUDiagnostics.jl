@@ -89,7 +89,9 @@ export FEATURES, supports, capabilities, BackendUnsupported,
     CounterSet, COUNTER_SETS, HWDispatch, HWCounters, HWCounterAvailability,
     HWCounterCollector, RocprofV3, NsightCompute,
     hw_counter_command, hw_counter_export_command, hw_counters, hw_counter_derived,
-    hw_counter_summary, hw_counter_status, hw_counters_available
+    hw_counter_summary, hw_counter_status, hw_counters_available, hw_counter_kernels,
+    hw_counter_window, hw_counter_by_kernel, hw_counter_limiter, kernel_name_stem,
+    NVIDIA_STALL_REASONS, PROFILER_ENV, profiler_attached
 
 include("capabilities.jl")   # supports/capabilities trait + BackendUnsupported; declared per backend by ext/
 include("device_api.jl")   # generics + CPU fallbacks + LaunchTimer; vendor methods in ext/ (hooks: backend_*)
@@ -102,6 +104,7 @@ include("counter_csv.jl")
 include("hw_counters.jl")
 include("rocprof.jl")           # AMD raw parser and architecture-qualified normalization
 include("ncu.jl")
+include("counter_groups.jl")    # per-kernel tables over a multi-kernel collection, limiter labels
 include("report.jl")            # diagnostics_dict (flat TOML-safe dicts), show methods, Tables.jl on GPUTelemetry
 include("probes.jl")            # launch-overhead probe, host environment snapshot (cgroup quota, versions)
 

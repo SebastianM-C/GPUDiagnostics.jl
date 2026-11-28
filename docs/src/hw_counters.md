@@ -83,7 +83,7 @@ that counter access is enabled.
 Put the collector on `PATH`, or pass `executable = "/path/to/collector"` to both
 `hw_counter_status` and `hw_counter_command`. The command builder also uses `timeout`
 by default; set `timeout_s = nothing` if that utility is unavailable and bound the workload
-yourself.
+yourself. Off Windows it also starts the collector through `/usr/bin/env`.
 
 `supports(backend, :hw_counters)` means an implementation exists. `hw_counters_available`
 checks tool discovery only. `hw_counter_status` exposes the executable and leaves
@@ -240,6 +240,8 @@ tool is not found; `GPUDIAGNOSTICS_COUNTER_TOOL` points at one outside `PATH` an
 | `:memory` | TA / TD busy, TCP stalls, L1 miss → is the in-order vector-memory pipe the wall | DRAM bytes → achieved bandwidth |
 | `:fp64` | FMA / ADD / MUL / TRANS F64 per wave → `fp64_flop_per_slot` against the algorithmic count | DFMA / DADD / DMUL per thread → `fp64_flop_per_slot` |
 | `:l2` | TCC hits / misses, fabric and HBM reads → does the working set live in L2 or HBM | L2 sector hit rate → `nvidia_l2_sector_hit_rate` |
+| `:stalls` | — (no per-reason counters; `:occupancy` splits waiting on data from waiting on the arbiter) | cycles per issued instruction spent in each warp stall reason → `nvidia_stall_<reason>` |
+| `:limiter` | — | speed of light (SM, memory, DRAM throughput as fractions of peak), achieved and theoretical occupancy, and the stalls → `hw_counter_limiter` |
 
 Each `CounterSet.notes` carries the long form: what the counters are (per-wave, per-thread,
 event counts, quad-cycles), the derived keys, the validation and the trap specific to that
@@ -247,13 +249,15 @@ preset. Print `COUNTER_SETS[:amd][:memory].notes` before interpreting a collecti
 
 `COUNTER_SETS[vendor][intent]` is a `CounterSet` with native metrics, validation context,
 known pass count (or `missing`), and notes. Intents are `:issue`, `:occupancy`, `:memory`,
-`:fp64`, and `:l2`. Use `metrics = ["native_metric", ...]` for a custom collection.
+`:fp64`, and `:l2` on both vendors, plus `:stalls` and `:limiter` on NVIDIA. Use
+`metrics = ["native_metric", ...]` for a custom collection.
 AMD presets fit one pass on gfx942 with rocprofv3 1.1.0 / ROCm 7.2.4; parser and derived
 quantity tests use saved MI300X captures. Passing a GPU execution test does not validate
 hardware-counter collection. Capacity and metric support on other architectures require
 validation. NVIDIA metric support and replay cost also vary by GPU and profiler version.
 On a bounded sm_120 FMA probe with ncu 2025.4.1,
-issue/occupancy/memory used one pass and FP64/L2 used three. These are validation
+issue/occupancy/memory used one pass and FP64/L2 used three; with ncu 2026.3.1, stalls used
+seven, and limiter fifteen before it collected the SM clock; on sm_80, six and eleven (with it). These are validation
 observations, not portable guarantees; query the target tool first.
 
 Commands use `timeout -k` to bound the profiler and workload if collection hangs. Set
@@ -270,6 +274,76 @@ its duration is not an ordinary concurrent launch duration. For application-mana
 cache priming, consider `replay_mode = :application, cache_control = :none`. This reruns
 the application, so ensure repeating its side effects is acceptable. Keep workloads small
 and record the settings. See the [NVIDIA profiling guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html).
+
+**Clock control.** `clock_control = :base` locks the GPU to its base clock for the
+collection, so counter values are reproducible from run to run, but every duration in the
+collection is then a duration at base clock: compare its *shares* (one kernel's fraction of
+the collection), never its seconds against a timed run. With the default `:none` the
+durations are at whatever clock the replay ran at, and still replays. `ncu` started by hand
+defaults to base.
+
+The ratios to peak depend on the clock too. SM throughput is relative to the SM clock and DRAM
+throughput to the memory clock, which base clocks leave alone, so a kernel looks more
+compute-heavy than it is in a run that boosts. `nvidia_elapsed_clock_GHz` and `nvidia_max_clock_GHz`
+(in `hw_counter_derived`, the `hw_counter_by_kernel` table and the limiter's `reason`) say which clock
+a collection ran at. To first order, when `nvidia_memory_throughput` equals
+`nvidia_dram_throughput`, the SM / memory ratio at another SM clock `f` is the collected one times
+`nvidia_elapsed_clock_GHz / f` (two launches on an A100: ratios 1.04 and 1.67 at 1095 MHz predict 0.81 and 1.29 at 1410 MHz,
+as measured there). When the memory throughput is higher than the DRAM one, the busiest memory unit
+is a cache, whose clock may move with the SM clock, and the correction may overstate the change;
+that case was not measured. The correction gives the ratio, so which side dominates, not the
+label: the label uses the throughputs themselves. Launches of tens of microseconds read a clock a few
+percent off.
+Collect labels with `clock_control = :none` at the clock the run holds (or lock it with
+`nvidia-smi -lgc`), and use `:base` to compare counts between runs.
+
+## Studying a whole step: section sets, a window, a table per kernel
+
+To find what limits a step that launches ~100 kernels, profile a window of steady-state
+steps with ncu's own sections and reduce the collection per kernel:
+
+```julia
+# the workload (run.jl): warm up unprofiled, then mark the window
+run_steps!(state, 6000)
+hw_counter_window(backend) do
+    run_steps!(state, 2)
+end
+
+# the driver
+cmd = hw_counter_command(NsightCompute(), `julia --project run.jl`; dir = "prof", name = "step",
+    section_set = :detailed, sections = ["WarpStateStats", "SchedulerStats"],
+    profile_from_start = false, timeout_s = 7200)
+run(cmd)
+t = hw_counter_by_kernel("prof/step_ncu.csv")   # one row per kernel, largest share first
+```
+
+- `section_set` / `sections` pass ncu's `--set` / `--section` through: speed of light,
+  occupancy, memory tables, launch statistics and every stall reason in one collection,
+  without listing metrics. `:detailed` with the two sections above costs 25 (ncu 2025.4.1) to
+  27 (ncu 2026.3.1) replay passes per launch on sm_120, so the window matters. The `:limiter`
+  preset collects the subset the limiter label needs in 11 passes on sm_80, `:stalls` in 6 there and 7 on sm_120.
+- `profile_from_start = false` with [`hw_counter_window`](@ref) profiles only the launches
+  inside the window: no `launch_skip` to recount when the warm-up changes. NVIDIA only; on AMD
+  select kernels with the `kernel` filter.
+- [`hw_counter_kernels`](@ref) splits a multi-kernel collection into one `HWCounters` per
+  kernel name; [`hw_counter_by_kernel`](@ref) groups them by
+  [`kernel_name_stem`](@ref) (one Julia kernel compiled for several argument types is one
+  group) and returns a Tables.jl table: dispatches, profiled time and its `share`, every
+  derived column as a duration-weighted mean, the top stall reasons and a `limiter` label.
+- [`hw_counter_limiter`](@ref) is a rule of thumb with its thresholds as keywords: either
+  throughput at or above 60 % of peak is compute- or memory-bound; both below 40 % is
+  latency-bound, or occupancy-limited when achieved occupancy is below 25 %; anything between is
+  `:mixed`, which can mean balanced or only mid-range on one side. Its `reason` quotes the numbers
+  and the SM clock, which the label depends on, and `dominant` / `fraction` (the larger throughput
+  and its value) say how far from an edge a kernel is. Read it as where to look first.
+
+Reading the stall reasons (`NVIDIA_STALL_REASONS` has all of them): each is cycles per issued
+instruction, so `long_scoreboard` at 65 means a warp waits ~65 cycles on memory per
+instruction it issues. The largest stall says what warps wait on, the throughputs say whether
+that wait limits the kernel. In the study that motivated these functions, the top stall made
+the diagnosis three times: `membar` on atomics with sequentially consistent ordering (fixed by
+relaxed ordering), `long_scoreboard` on a strided histogram read (a cell-major layout
+halved that kernel), and `lg_throttle` on a gather issuing many narrow loads.
 
 ## Reading the counters
 

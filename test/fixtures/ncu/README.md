@@ -12,3 +12,15 @@ context, and stream identifiers were replaced with fixed test values. Host,
 process-name, path, and topology fields and tool log messages were removed.
 The marketing name was replaced by a generic label. Numeric counters, units,
 durations, and kernel name are unchanged.
+
+`multikernel_ncu.csv` is a trimmed raw-page export of an Nsight Compute 2025.4.1
+collection on a GPU with compute capability 12.0 (the `--set detailed --section
+WarpStateStats --section SchedulerStats` collection of issue #53), `--profile-from-start
+off` around one 3D particle resort and one full sort of the public ParticleMesh.jl project
+(96³ cells, Float32). It keeps the 21 launches of four
+kernels (`resort_rank_kernel`, `gather_all_kernel`, five specializations of
+`scan_tile_kernel`, `tail_key_kernel`) and only the identity and geometry columns, the
+duration, the launch attributes and replay pass count (25), the speed-of-light and
+occupancy metrics, and the 17 warp stall ratios. The process identifier was replaced by a
+fixed value; host and process names, device attributes and topology were removed. Values,
+units and kernel names are unchanged.

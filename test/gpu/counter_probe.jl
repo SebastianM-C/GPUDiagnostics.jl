@@ -1,7 +1,7 @@
 # A bounded collection workload; filter the profiler to counter_probe and skip
 # the first matching launch. Run with GPUDIAGNOSTICS_GPU=cuda or rocm.
 using KernelAbstractions, Adapt, Test
-vendor = get(ENV, "GPUDIAGNOSTICS_GPU", "cuda")
+vendor = lowercase(get(ENV, "GPUDIAGNOSTICS_GPU", "cuda"))
 if vendor == "cuda"
     using CUDA
     backend = CUDABackend()

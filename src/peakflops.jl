@@ -83,7 +83,10 @@ attained it — `chains` per thread, `n_threads`, `workgroup`, `n_iters` per cha
 fastest of `trials` launches at that geometry) — plus `capacity` (the device's resident-thread
 capacity the launch sizes were derived from, `missing` when the backend cannot report it) and
 the sweep that chose the geometry as three parallel vectors `sweep_chains`, `sweep_n_threads`,
-`sweep_flops` (one trial per point). `Float64(p)` is `p.flops`.
+`sweep_flops` (one trial per point). `under_profiler` is the counter collector the probe ran
+under ([`profiler_attached`](@ref)), `nothing` normally: under replay or serialization the
+rate is not a peak, and [`diagnostics_dict`](@ref) writes the key only in that case.
+`Float64(p)` is `p.flops`.
 """
 struct PeakProbe
     eltype::Symbol
@@ -98,7 +101,9 @@ struct PeakProbe
     sweep_chains::Vector{Int}
     sweep_n_threads::Vector{Int}
     sweep_flops::Vector{Float64}
+    under_profiler::Union{Nothing, String}
 end
+PeakProbe(args::Vararg{Any, 12}) = PeakProbe(args..., nothing)   # the 0.5 constructor
 Base.Float64(p::PeakProbe) = p.flops
 
 # Resident-thread capacity of the current device, or `missing` when the backend has no
@@ -186,7 +191,8 @@ function peak_flops_probe(backend::Backend, ::Type{T} = Float64; chains = _PEAK_
     k = argmax(sf)
     f, n_iters, best = _peak_point(backend, T, sc[k], st[k], Int(workgroup), Int(trials), target_seconds, buffers)
     f = max(f, sf[k])   # best-of over everything this geometry ran
-    return PeakProbe(nameof(T), f, sc[k], st[k], Int(workgroup), n_iters, best, Int(trials), capacity, sc, st, sf)
+    return PeakProbe(nameof(T), f, sc[k], st[k], Int(workgroup), n_iters, best, Int(trials), capacity, sc, st, sf,
+        profiler_attached())
 end
 
 """

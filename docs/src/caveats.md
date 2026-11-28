@@ -28,7 +28,12 @@ therefore reports the arithmetic as written, not as issued.
 ## `fp64_util` is normalised to full-rate issue slots
 
 The GPM `fp64_util` column is the fraction of the SM's full-rate FP64 issue slots: a saturated
-FP64 FMA chain reads ≈ 0.9 on an H100 but only ≈ 1.5 % on a 1/64-rate consumer board.
+FP64 FMA chain reads ≈ 0.9 on an H100 but only ≈ 1.5 % on a 1/64-rate consumer board. The same
+holds on every part with a reduced FP64 path, datacenter ones included: an RTX PRO 6000
+Blackwell (CC 12.0, driver 580) read 0.012 with an FP64 kernel at 84 % of the measured FP64
+peak, and a B300 (CC 10.3) about 0.012 with ncu's FP64 pipe fraction at 0.89. Read it as
+"FP64 issue relative to a full-rate part"; the pipe's own fraction of its peak is
+`nvidia_fp64_pipe_peak_fraction` from the ncu `:fp64` preset.
 
 ## `compute_util` means different things per vendor
 
